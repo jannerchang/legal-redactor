@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+output/
+data/
+samples/
+*.json
+*.pdf
+*.docx
+build/
+*.egg-info/
+tests/
+test_new_rules.py
+scratch_test_samples.py
+
