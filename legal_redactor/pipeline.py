@@ -232,6 +232,10 @@ def _parse_company_name(name: str, known_locations: set[str] | None = None) -> t
     if admin_match:
         core = core[admin_match.end():]
 
+    # 2.5. 去掉括号中的行政区划（如 (河北)、（石家庄）等，不论出现在何处）
+    core = re.sub(r"[（(](?:[\u4e00-\u9fa5]{2,6}?(?:省|市|区|县|新)?)[）)]", "", core)
+    core = core.strip(" ：:，,。；;\n\t（）()")
+
     # 3. 从 core 中分离品牌和业务描述
     biz_descriptor = ''
     brand = core
@@ -726,14 +730,21 @@ class RedactionPipeline:
                         if b not in sample_blacklist:
                             prefix = counters.next("group_prefix")
                             mappings.append(MappingEntry(type="organization", original=b, masked=prefix, role=None, source="fallback_org_brand", confidence=c.confidence, restore_by_default=True))
-                            if c.text != b:
-                                mappings.append(MappingEntry(type="organization", original=c.text, masked=f"{prefix}公司", role=None, source=c.source, confidence=c.confidence, restore_by_default=True))
+                            
+                            # ── 彻底消除带噪声前缀的公司名（如“严重违反公司”） ──
+                            cleaned_c = _clean_organization_text(c.text)
+                            if cleaned_c and not _is_false_org(cleaned_c) and cleaned_c != b:
+                                mappings.append(MappingEntry(type="organization", original=cleaned_c, masked=f"{prefix}公司", role=None, source=c.source, confidence=c.confidence, restore_by_default=True))
                         else:
-                            prefix = counters.next("group_prefix")
-                            mappings.append(MappingEntry(type="organization", original=c.text, masked=f"{prefix}公司", role=None, source=c.source, confidence=c.confidence, restore_by_default=True))
+                            cleaned_c = _clean_organization_text(c.text)
+                            if cleaned_c and not _is_false_org(cleaned_c):
+                                prefix = counters.next("group_prefix")
+                                mappings.append(MappingEntry(type="organization", original=cleaned_c, masked=f"{prefix}公司", role=None, source=c.source, confidence=c.confidence, restore_by_default=True))
                     else:
-                        prefix = counters.next("group_prefix")
-                        mappings.append(MappingEntry(type="organization", original=c.text, masked=f"{prefix}公司", role=None, source=c.source, confidence=c.confidence, restore_by_default=True))
+                        cleaned_c = _clean_organization_text(c.text)
+                        if cleaned_c and not _is_false_org(cleaned_c):
+                            prefix = counters.next("group_prefix")
+                            mappings.append(MappingEntry(type="organization", original=cleaned_c, masked=f"{prefix}公司", role=None, source=c.source, confidence=c.confidence, restore_by_default=True))
 
         if _candidate_allowed("person", profile):
             for name, surname, source, confidence in person_entries:
