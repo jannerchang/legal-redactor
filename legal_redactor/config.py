@@ -212,6 +212,7 @@ class PipelineConfig:
     enable_local_llm: bool = True
     local_llm: LocalLLMConfig = field(default_factory=LocalLLMConfig)
     redaction_profile: RedactionProfile = field(default_factory=RedactionProfile.standard)
+    enable_sample_library: bool = True
 
     @property
     def profile(self) -> str:

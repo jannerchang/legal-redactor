@@ -172,7 +172,7 @@ class HebeiAdminDivisionDetector:
         confidence: float,
     ) -> None:
         value = (text or "").strip()
-        if not value:
+        if not value or len(value) < 2:
             return
         previous = terms.get(value)
         if previous is not None and previous.confidence >= confidence:

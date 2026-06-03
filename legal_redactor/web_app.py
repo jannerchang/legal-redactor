@@ -5,7 +5,7 @@ import json
 import os
 import re
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 
 from .config import PipelineConfig
@@ -102,6 +102,10 @@ def index() -> str:
               </select>
               <input type="hidden" name="enable_llm" value="1">
             </div>
+            <label style="display:flex; align-items:center; gap:8px; margin-top:12px; margin-bottom:12px; cursor:pointer;">
+              <input type="checkbox" name="enable_samples" value="1" checked style="width:auto; margin:0;">
+              <span>使用样本库（利用历史黑名单与正样本）</span>
+            </label>
             <label>分析模型</label>
             <select name="llm_mode">
               <option value="max-effect" selected>Qwen3 30B (最高准确率)</option>
@@ -110,6 +114,9 @@ def index() -> str:
             </select>
             <label>或自定义模型</label>
             <input type="text" name="model" placeholder="如 qwen3:8b / qwen2.5:7b" style="max-width:260px">
+            <label>已有映射表（保持替换一致性，选填，支持粘贴JSON或上传文件）</label>
+            <textarea name="base_map_json" rows="3" placeholder="粘贴已有映射表 JSON（可选）"></textarea>
+            <input type="file" name="base_map_file" accept=".json,.enc">
             <button type="submit" class="btn">一键脱敏</button>
           </form>
         </section>
@@ -500,6 +507,9 @@ async def redact_page(
     llm_mode: str = Form(default="max-effect"),
     enable_llm: str | None = Form(default=None),
     model: str = Form(default=""),
+    enable_samples: str | None = Form(default=None),
+    base_map_json: str = Form(default=""),
+    base_map_file: UploadFile | None = File(default=None),
     file: UploadFile | None = File(default=None),
     files: list[UploadFile] = File(default=[]),
 ) -> str:
@@ -508,17 +518,26 @@ async def redact_page(
     except ValueError as exc:
         return _page("上传失败", str(exc))
 
+    base_redaction_map = None
+    if base_map_json.strip() or (base_map_file and base_map_file.filename):
+        try:
+            map_text = await _read_restore_map_text(base_map_json, base_map_file)
+            base_redaction_map = redaction_map_from_json(map_text)
+        except Exception as exc:
+            return _page("已有映射表解析失败", f"解析错误: {exc}")
+
     config = PipelineConfig.from_llm_mode(
         llm_mode if enable_llm else "off",
         profile_name=profile,
         model=model or None,
     )
+    config = replace(config, enable_sample_library=bool(enable_samples))
     pipeline = RedactionPipeline(config=config)
     if len(documents) > 1:
-        result = pipeline.redact_many([(item.source_file, item.text) for item in documents])
+        result = pipeline.redact_many([(item.source_file, item.text) for item in documents], base_redaction_map=base_redaction_map)
         return _render_batch_redaction_result("脱敏结果", result.documents, result.redaction_map, result.review_candidates, result.leaks, result.warnings)
     
-    result = pipeline.redact(documents[0].text, source_file=documents[0].source_file)
+    result = pipeline.redact(documents[0].text, source_file=documents[0].source_file, base_redaction_map=base_redaction_map)
     return _render_redaction_result("脱敏结果", result.original_text, result.redacted_text, result.redaction_map, result.review_candidates, result.leaks, result.warnings)
 
 

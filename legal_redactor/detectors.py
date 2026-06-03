@@ -103,7 +103,7 @@ PROJECT_RE = re.compile(
 )
 LOCATION_RE = re.compile(
     r"(?!(?:余名|多名|整个|那么|这个|那个|某某|几个|本案|该案|上述|本市|本省|本区|省市|市区|县城|城镇|乡镇|村庄|本村|该村))"
-    r"(?![个些么这那某每各全数余多近共约将整前在往到去赴与和同及当该此被原])"
+    r"(?![个些么这那某每各全数余多近共约将整前在往到去赴与和同及当该此被原住])"
     r"[\u4e00-\u9fa5]{2,6}?(?:省|自治区|市|自治州|盟|(?<!小|校|厂|园|战|军|市|省|街|工|林|矿|片)区|县|旗|镇|乡|街道|(?<!名)村|社区)"
 )
 ADDRESS_KEY_RE = re.compile(
@@ -189,6 +189,11 @@ def parse_party_line(line: str, line_start: int = 0) -> PartyLine | None:
         return None
 
     entity_type = classify_entity(entity, role)
+    if entity_type == "person" and _is_false_person(entity):
+        return None
+    if entity_type == "organization" and _is_false_org(entity):
+        return None
+
     return PartyLine(
         role=role,
         entity=entity,
@@ -280,7 +285,7 @@ def _clean_org_simple(value: str) -> str:
     
     # 剥离前导常见动词、介词、代词、语气词或连词（加盖、本案、系、然、由、为、费用由、关于等）
     _noise_prefix = re.compile(
-        r"^(?:和|及|与|、|，|,|；|;|的|为|由|在|系|然|费用由|费用|加盖|本案|程中|导致|配合|协助|不服|认为|诉称|辩称|判决|裁定|关于|向|致|对|由其|将其|由该|将该|该|此)"
+        r"^(?:和|及|与|、|，|,|；|;|的|为|由|在|系|然|费用由|费用|加盖|本案|程中|导致|配合|协助|不服|认为|诉称|辩称|判决|裁定|关于|向|致|对|由其|将其|由该|将该|该|此|通知|请追加|身份系代表|去跟|见|解(?=[\u4e00-\u9fa5]{2,4}(?:公司|集团|有限)))"
     )
     
     # 循环剥离直到没有前导噪声词
@@ -428,9 +433,36 @@ _FALSE_PERSON_WORDS = frozenset({
     "执行", "裁决", "判令", "承担", "案情", "起诉状", "答辩状", "委托书", "代理词",
     # ── 新增口语与泛称实体、动词、方位词排除，彻底消除人名幻觉 ──
     "单位", "毕业", "订立", "成立", "设立", "责任", "见过", "帮忙", "结算", "开庭", 
-    "开庭后", "劳动者", "代表", "表示", "工作", "任职", "离职", "入职", "集团", "中心", 
+    "开庭后", "劳动者", "代表", "表示", "工作", "任职", "离职", "入职", "集团", "中心", "都用", 
     "部门", "块", "圈", "后", "没见", "见过章"
 })
+
+
+def _clean_person_name(value: str) -> str:
+    """清理人名：剥离首尾多余括号及不匹配的标点，裁剪多余的尾随助词/连词/介词/动作词"""
+    value = value.strip(" ：:，,。；;\n\t（）()")
+    value = _clean_unbalanced_brackets(value)
+    # 剥离末尾可能被误匹配进去的助词、连词、介词或动作词
+    while len(value) >= 2 and value[-1] in "及辩诉称和与等某已在于男女将被原":
+        value = value[:-1]
+    return value.strip()
+
+
+def _is_false_person(value: str) -> bool:
+    """判定是否为伪人名（非合法实体，如长句误抓、动词短语等）"""
+    if len(value) < 2 or len(value) > 20:
+        return True
+    if any(char.isdigit() or char in "0123456789０１２３４５６７８９.%‰万亿元" for char in value):
+        return True
+    # 汉字姓名如果没有点“·”，通常不应超过4个字
+    if len(value) > 4 and "·" not in value and "•" not in value:
+        return True
+    if any(w in value for w in _FALSE_PERSON_WORDS):
+        return True
+    # 排除包含常见助词、连词、语气代词等误匹配
+    if any(p in value for p in ("的", "了", "在", "是", "去", "给", "有", "我", "你", "他", "们", "这", "那", "个", "对", "后", "做", "用")):
+        return True
+    return False
 
 
 def detect_fallback_person_candidates(text: str) -> list[Candidate]:
@@ -459,10 +491,11 @@ def detect_fallback_person_candidates(text: str) -> list[Candidate]:
 
     for pattern in _FALLBACK_PERSON_PATTERNS:
         for match in pattern.finditer(text):
-            value = match.group(1).strip()
-            if not value:
+            raw_value = match.group(1).strip()
+            if not raw_value:
                 continue
-            if any(w in value for w in _FALSE_PERSON_WORDS):
+            value = _clean_person_name(raw_value)
+            if _is_false_person(value):
                 continue
             # 必须像中文名：2-4个汉字，无明显非名字特征
             if not re.fullmatch(r"[一-龥]{2,4}", value):
@@ -476,7 +509,7 @@ def detect_fallback_person_candidates(text: str) -> list[Candidate]:
             if not is_surname:
                 continue
 
-            start = match.start(1)
+            start = match.start(1) + raw_value.find(value)
             candidates.append(
                 Candidate(
                     type="person",
@@ -569,7 +602,8 @@ def _is_false_org(value: str) -> bool:
         "购买", "销售", "生产", "加工", "制造", "维修", "安装", "运输", "承包", 
         "租赁", "出租", "派遣", "支付", "履行", "不服", "认为", "陈述", "答辩",
         "进行", "支持", "协助", "配合", "加盖", "盖章", "签章", "签字",
-        "损害", "不接受", "返还", "交跟", "去跟"
+        "损害", "不接受", "返还", "交跟", "去跟", "发放", "归属", "使用",
+        "核对", "核实", "审查", "交给", "转给"
     )
     
     # 去掉法律后缀后，检查剩余部分
@@ -578,7 +612,8 @@ def _is_false_org(value: str) -> bool:
             core = value[:-len(sfx)]
             # ── 过滤由常用代词、语气词或国家/通用指代代词构成的伪字号 ──
             if core in ("我", "你", "他", "本", "该", "贵", "此", "来我", "我去", "我区", "你区", "来", "中国", "中华", "全国", "地方", "本地", "其实", "确实", "事实", "真实", "证实", "落实", "实", "但是", "可是", "若是", "总是", "但", "并", "且", "及", "或", "已", "曾", "即", "就", "也", "都", "而",
-                        "上", "下", "前", "后", "两", "两家", "三", "三家", "双", "各", "各家", "某", "某家", "一", "用", "指", "往", "去", "来", "分", "联", "劳动者", "单位"):
+                        "上", "下", "前", "后", "两", "两家", "三", "三家", "双", "各", "各家", "某", "某家", "一", "用", "指", "往", "去", "来", "分", "联", "劳动者", "单位",
+                        "两个", "三家", "二公司", "三公司", "多个", "几家", "见两个", "两个公司", "三家公司"):
                 return True
             # ── 过滤包含法律诉讼/日常动作动词构成的动词短语公司（如 "严重违反公司" -> "严重违反"） ──
             if any(verb in core for verb in _action_verbs):
@@ -593,7 +628,7 @@ def _is_false_org(value: str) -> bool:
             break
     else:
         # 如果不带公司/集团后缀，直接检查 core 级别的非地理/动作词
-        if any(noise in value for noise in ("我", "你", "他", "本", "该", "贵", "此", "两", "两家", "各", "各家", "某", "一")):
+        if any(noise in value for noise in ("我", "你", "他", "本", "该", "贵", "此", "两", "两家", "各", "各家", "某", "一", "两个", "几家", "见两个")):
             return True
         if any(verb in value for verb in _action_verbs):
             return True
@@ -874,7 +909,7 @@ def _trim_address(value: str) -> str:
 
 def _clean_location_text(value: str) -> str:
     value = _clean_candidate_text(value)
-    value = re.sub(r"^(?:住所地|住所|住址|户籍地|经常居住地|送达地址|地址|所在地|位于|住|地)", "", value)
+    value = re.sub(r"^(?:项目地点|项目|地点|住所地|住所|住址|户籍地|经常居住地|送达地址|地址|所在地|位于|住|地)", "", value)
     return value.strip(" ：:，,。；;\n\t")
 
 def _looks_like_placeholder_address(value: str) -> bool:
@@ -1031,6 +1066,7 @@ def _clean_organization_text(value: str) -> str:
         r"^.*?调函邮寄", r"^.*?邮寄", r"^.*?发送", r"^.*?送达",
         r"^.*?往返", r"^.*?签订的", r"^.*?签署的", r"^.*?签订", r"^.*?签署",
         r"^.*?其实", r"^.*?确实", r"^.*?事实", r"^.*?真实", r"^.*?证实", r"^.*?落实",
+        r"^.*?通知", r"^.*?请追加", r"^.*?身份系代表", r"^.*?解(?=[\u4e00-\u9fa5]{2,4}(?:公司|集团|有限))", r"^.*?见",
     ]
     prefix_stopwords.sort(key=len, reverse=True)
     pattern = re.compile("|".join(prefix_stopwords))
@@ -1190,6 +1226,7 @@ _NON_GEO_CHARS = frozenset(
     "在由向对从至到为与和或含包自"
     "购买使用需求满足达超低高属于价格数量"
     "导致办请找等候住"
+    "未无非没"
 )
 
 _LOCATION_SUFFIXES = ("省", "自治区", "市", "自治州", "盟", "区", "县", "旗", "镇", "乡", "街道", "村", "社区")
@@ -1200,6 +1237,10 @@ def _looks_like_false_location(text: str, start: int, end: int, raw: str) -> boo
 
     过滤：涉及所辖市、将全省、各县市、及市、除特殊企业及市 等。
     """
+    # —— 排除含有常见动作、事务等非地名的高频名词和动词 ——
+    if any(kw in raw for kw in ("产权", "进行", "项目", "工程", "施工", "合同", "协议", "纠纷", "案件", "单位", "劳动者", "原告", "被告", "第三人", "本院", "回迁", "拆迁", "撤销", "设立", "注销", "地址", "地点", "位置")):
+        return True
+
     # —— 匹配内容本身是通用表述 ——
     raw_stripped = re.sub(
         r"^(?:涉及所辖|涉及|所辖|各县|各|全|将|及|涉|除特殊企业及|除|等|本|该|此|上|前|后|下)",

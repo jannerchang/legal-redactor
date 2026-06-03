@@ -18,7 +18,10 @@ from .detectors import (
     _is_false_org,
     _clean_organization_text,
     _FALSE_PERSON_WORDS,
-    _clean_unbalanced_brackets
+    _clean_unbalanced_brackets,
+    _clean_location_text,
+    _clean_person_name,
+    _is_false_person
 )
 from .hebei_admin import HebeiAdminDivisionDetector
 from .models import BatchRedactionResult, Candidate, Leak, MappingEntry, RedactedDocument, RedactionMap, RedactionResult
@@ -302,8 +305,8 @@ def extract_and_map_geonames(text: str, get_loc_prefix, profile, sample_blacklis
     )
 
     for c in candidates:
-        full = c.text
-        if full in sample_blacklist or full in seen_orgs_and_exclusions:
+        full = _clean_location_text(c.text)
+        if not full or full in sample_blacklist or full in seen_orgs_and_exclusions:
             continue
         
         m = decomp_pattern.match(full)
@@ -442,7 +445,7 @@ class RedactionPipeline:
     def _profile(self) -> RedactionProfile:
         return self.config.redaction_profile
 
-    def redact(self, text: str, source_file: str | None = None, mode: str | None = None, prov_mapping: dict[str, str] | None = None) -> RedactionResult:
+    def redact(self, text: str, source_file: str | None = None, mode: str | None = None, prov_mapping: dict[str, str] | None = None, base_redaction_map: RedactionMap | None = None) -> RedactionResult:
         if mode is not None:
             config = replace(self.config, redaction_profile=RedactionProfile.from_preset(mode))
             self.config = config
@@ -469,7 +472,22 @@ class RedactionPipeline:
             return location_prefixes[core]
 
         # 0. 加载本地样本库的精准匹配词与黑名单
-        _, sample_blacklist = load_all_samples()
+        if self.config.enable_sample_library:
+            _, sample_blacklist = load_all_samples()
+        else:
+            sample_blacklist = set()
+
+        base_mappings = []
+        if base_redaction_map and base_redaction_map.mappings:
+            base_mappings = list(base_redaction_map.mappings)
+            for m in base_mappings:
+                if m.type == "location" and m.masked:
+                    core = _get_location_core(m.original)
+                    prefix_match = re.match(r"^([A-Z]|[\u4e00-\u9fa5]+)", m.masked)
+                    if prefix_match:
+                        pfx = prefix_match.group(1)
+                        if pfx != "某" and len(pfx) == 1:
+                            location_prefixes[core] = pfx
 
         high_conf_spans = []
 
@@ -564,7 +582,7 @@ class RedactionPipeline:
         if self.config.enable_local_llm and self.config.local_llm.enabled:
             from .llm import LegalEntityAuditor
             auditor = LegalEntityAuditor(self.config.local_llm)
-            analysis = auditor.audit_and_verify(scan_text, verify_list)
+            analysis = auditor.audit_and_verify(scan_text, verify_list, enable_samples=self.config.enable_sample_library)
             if analysis.get("error"):
                 warnings.append(str(analysis["error"]))
 
@@ -675,19 +693,22 @@ class RedactionPipeline:
             "南宫"
         )
         for person in analysis.get("persons", []):
-            name = person.get("name")
+            raw_name = person.get("name")
             surname = person.get("surname")
-            if not name or not surname or name in sample_blacklist:
+            if not raw_name or not surname or raw_name in sample_blacklist:
                 continue
-            name = _clean_unbalanced_brackets(name).strip()
+            name = _clean_person_name(raw_name)
+            if _is_false_person(name):
+                continue
             # ── 过滤明显的大模型抽取幻觉/长句误切 ──
             if len(name) > 6 or len(name) < 2:
                 continue
             if any(char in name for char in "，。；、：:,\r\n"):
                 continue
-            if any(word in name for word in ("的", "了", "在", "是", "去", "给", "有", "我", "你", "他", "们", "这", "那", "个", "谁", "对", "后")):
+            # 过滤包含数字、百分号或万元币值特征的伪名字
+            if any(char.isdigit() or char in "0123456789０１２３４５６７８９.%‰" for char in name):
                 continue
-            if any(w in name for w in _FALSE_PERSON_WORDS):
+            if "元" in name and ("万" in name or "亿" in name):
                 continue
             # 必须符合常见的汉人名字长度（2-4字）且姓氏在常用百家姓中，或者少数民族带点人名（如 阿不都·艾山）
             is_valid_han = len(name) <= 4 and (name[0] in common_surnames or (len(name) > 2 and name[:2] in common_surnames))
@@ -718,7 +739,7 @@ class RedactionPipeline:
                     b, _, _ = _parse_company_name(c.text)
                     if b:
                         b = _clean_organization_text(b)
-                        # 针对“实壹州”等前缀剪裁优化
+                        # 针对特定前缀残余字符进行裁剪优化
                         if b.startswith("实") and len(b) >= 2:
                             for prefix in ("确", "其", "证", "落", "真", "事"):
                                 if prefix + b in text:
@@ -756,6 +777,11 @@ class RedactionPipeline:
         # 5. 去重并应用 Mapping (按原文长度倒序)
         unique_mappings = []
         seen_orig = set()
+        for m in base_mappings:
+            if m.original not in seen_orig:
+                seen_orig.add(m.original)
+                unique_mappings.append(m)
+
         for m in sorted(mappings, key=lambda x: len(x.original), reverse=True):
             if m.original in sample_blacklist:
                 continue
@@ -780,7 +806,7 @@ class RedactionPipeline:
             warnings=warnings,
         )
 
-    def redact_many(self, documents: list[tuple[str, str]], mode: str | None = None) -> BatchRedactionResult:
+    def redact_many(self, documents: list[tuple[str, str]], mode: str | None = None, base_redaction_map: RedactionMap | None = None) -> BatchRedactionResult:
         if mode is not None:
             self.config = replace(self.config, redaction_profile=RedactionProfile.from_preset(mode))
 
@@ -800,7 +826,7 @@ class RedactionPipeline:
         warnings = []
         prov_mapping = {}
         for source_name, original_text in documents:
-            res = self.redact(original_text, source_file=source_name, prov_mapping=prov_mapping)
+            res = self.redact(original_text, source_file=source_name, prov_mapping=prov_mapping, base_redaction_map=base_redaction_map)
             all_mappings.extend(res.redaction_map.mappings)
             if res.warnings:
                 warnings.extend(res.warnings)
@@ -808,6 +834,12 @@ class RedactionPipeline:
         # 统一汇总去重，生成统一共享的高质量映射表 (按原文长度倒序)
         unique_mappings = []
         seen_orig = set()
+        if base_redaction_map and base_redaction_map.mappings:
+            for m in base_redaction_map.mappings:
+                if m.original not in seen_orig:
+                    seen_orig.add(m.original)
+                    unique_mappings.append(m)
+
         for m in sorted(all_mappings, key=lambda x: len(x.original), reverse=True):
             if m.original not in seen_orig:
                 seen_orig.add(m.original)

@@ -33,26 +33,20 @@ def get_context_paragraphs(text: str, max_chars: int = 8000) -> str:
 class LegalEntityAuditor:
     config: LocalLLMConfig
 
-    def audit_and_verify(self, text: str, candidates: list[dict]) -> dict[str, Any]:
+    def audit_and_verify(self, text: str, candidates: list[dict], enable_samples: bool = True) -> dict[str, Any]:
         """合并审计提取与疑似候选词验证，单次调用 LLM。
 
         Args:
             text: 原文
             candidates: 待验证的正则/启发式候选列表，每项含 {"text", "type", "context"}
-
-        Returns:
-            JSON字典，包含：
-            - locations: 提取的地名
-            - companies: 提取的机构
-            - persons: 提取的人名
-            - reject: 判定为误匹配应剔除的候选文本列表
+            enable_samples: 是否注入历史样本作为 few-shot
         """
         if not self.config.enabled:
             return {"locations": [], "companies": [], "persons": [], "reject": []}
 
         # 段落对齐切片，提取高质量上下文
         audit_text = get_context_paragraphs(text, max_chars=8000)
-        prompt = self._build_merged_prompt(audit_text, candidates)
+        prompt = self._build_merged_prompt(audit_text, candidates, enable_samples=enable_samples)
 
         try:
             payload = self._call_ollama(prompt)
@@ -133,9 +127,9 @@ class LegalEntityAuditor:
         except JSONDecodeError:
             return {"locations": [], "companies": [], "persons": [], "reject": [], "error": "JSON decode failed"}
 
-    def _build_merged_prompt(self, text: str, candidates: list[dict]) -> str:
+    def _build_merged_prompt(self, text: str, candidates: list[dict], enable_samples: bool = True) -> str:
         from ._samples import get_few_shot_examples
-        few_shot_str = get_few_shot_examples()
+        few_shot_str = get_few_shot_examples() if enable_samples else ""
         few_shot_part = f"\n{few_shot_str}\n\n" if few_shot_str else ""
 
         candidate_lines = []
