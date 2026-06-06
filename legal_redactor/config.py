@@ -166,8 +166,9 @@ class RedactionProfile:
             )
         return profile
 
-MAX_EFFECT_LLM_MODEL = "qwen3:30b"
+MAX_EFFECT_LLM_MODEL = "batiai/qwen3.6-27b:iq4"
 MAX_EFFECT_FALLBACK_MODELS = (
+    "qwen3:30b",
     "qwen2.5:7b-instruct-q8_0",
 )
 BALANCED_LLM_MODEL = "qwen2.5:7b-instruct-q8_0"
@@ -193,7 +194,7 @@ class LocalLLMConfig:
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    strategy: str = "ensemble"
+    strategy: str = "linear"
     replacement_order: str = "longest_first"
     semantic_llm_first: bool = False
     preserve_core_facts: bool = True

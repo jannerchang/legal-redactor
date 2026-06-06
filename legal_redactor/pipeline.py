@@ -34,7 +34,8 @@ GENERIC_BRAND_BLACKLIST = {
     "开发", "建设", "工程", "集团", "贸易", "商贸", "物业", "投资", "科技",
     "信息", "网络", "电子商务", "电子", "新材料", "服务", "咨询", "代理",
     "管理", "资产", "金融", "工业", "农业", "商业", "联合", "发展", "实业",
-    "劳务", "建筑", "装饰", "物流", "运输", "环保", "能源", "置业", "产业"
+    "劳务", "建筑", "装饰", "物流", "运输", "环保", "能源", "置业", "产业",
+    "燃气", "水务", "热力", "供热", "供水", "排水", "电力", "交通", "运输"
 }
 
 # 全国法院省份及兵团简称
@@ -449,6 +450,13 @@ class RedactionPipeline:
         if mode is not None:
             config = replace(self.config, redaction_profile=RedactionProfile.from_preset(mode))
             self.config = config
+        if self.config.strategy == "linear":
+            return self._redact_linear(
+                text,
+                source_file=source_file,
+                prov_mapping=prov_mapping,
+                base_redaction_map=base_redaction_map,
+            )
 
         profile = self._profile
         warnings: list[str] = []
@@ -562,7 +570,7 @@ class RedactionPipeline:
             fallback_persons.extend(c for c in detect_fallback_person_candidates(scan_text) if c.text not in sample_blacklist and not overlaps_high_conf(c.start, c.end))
 
         # 3. 如果启用了本地 LLM，在调用前构造待验证的候选列表
-        analysis = {"locations": [], "companies": [], "persons": [], "reject": []}
+        analysis = {"locations": [], "companies": [], "persons": [], "reject": [], "calibrate": {}}
         verify_list = []
         seen_entities = set()
         for c in fallback_persons:
@@ -585,6 +593,46 @@ class RedactionPipeline:
             analysis = auditor.audit_and_verify(scan_text, verify_list, enable_samples=self.config.enable_sample_library)
             if analysis.get("error"):
                 warnings.append(str(analysis["error"]))
+
+        # Extract calibrations mapping (candidates -> cleaned entities)
+        calibrations = analysis.get("calibrate", {})
+        if not isinstance(calibrations, dict):
+            calibrations = {}
+
+        # Apply calibrations only when the corrected entity can be located in the source.
+        def calibrate_candidate_list(cand_list):
+            calibrated = []
+            for c in cand_list:
+                if c.text in calibrations:
+                    calibrated_text = calibrations[c.text].strip()
+                    if not calibrated_text or len(calibrated_text) < 2:
+                        continue
+                    start_idx = c.text.find(calibrated_text)
+                    if start_idx != -1:
+                        new_start = c.start + start_idx
+                        new_end = new_start + len(calibrated_text)
+                        calibrated.append(replace(c, text=calibrated_text, start=new_start, end=new_end))
+                    else:
+                        context_start = max(0, c.start - 80)
+                        context_end = min(len(scan_text), c.end + 80)
+                        nearby_idx = scan_text.find(calibrated_text, context_start, context_end)
+                        if nearby_idx != -1:
+                            calibrated.append(
+                                replace(
+                                    c,
+                                    text=calibrated_text,
+                                    start=nearby_idx,
+                                    end=nearby_idx + len(calibrated_text),
+                                )
+                            )
+                        else:
+                            calibrated.append(c)
+                else:
+                    calibrated.append(c)
+            return calibrated
+
+        fallback_persons = calibrate_candidate_list(fallback_persons)
+        fallback_orgs = calibrate_candidate_list(fallback_orgs)
 
         # 4. 汇总处理地名/机构/人名
         known_orgs = set()
@@ -799,6 +847,162 @@ class RedactionPipeline:
             original_text=text,
             redacted_text=redacted_text,
             redaction_map=redaction_map,
+            candidates=[],
+            review_candidates=[],
+            leaks=leaks,
+            mode=profile.name,
+            warnings=warnings,
+        )
+
+    def _redact_linear(
+        self,
+        text: str,
+        source_file: str | None = None,
+        prov_mapping: dict[str, str] | None = None,
+        base_redaction_map: RedactionMap | None = None,
+    ) -> RedactionResult:
+        from .linear_engine import LinearRuleEngine
+
+        profile = self._profile
+        warnings: list[str] = []
+        counters = TypeCounters()
+        prov_mapping = prov_mapping if prov_mapping is not None else {}
+
+        boundary_match = re.search(r"本院(?:经审理|经审查|审理)?认为", text)
+        scan_text = text[: boundary_match.start()] if boundary_match else text
+
+        if self.config.enable_sample_library:
+            _, sample_blacklist = load_all_samples()
+        else:
+            sample_blacklist = set()
+
+        base_mappings = list(base_redaction_map.mappings) if base_redaction_map else []
+        location_prefixes: dict[str, str] = {}
+        for mapping in base_mappings:
+            if mapping.type != "location" or not mapping.masked:
+                continue
+            core = _get_location_core(mapping.original)
+            match = re.match(r"^([\u4e00-\u9fa5])", mapping.masked)
+            if match and match.group(1) != "某":
+                location_prefixes[core] = match.group(1)
+
+        def get_location_prefix(name: str) -> str:
+            core = _get_location_core(name)
+            if core not in location_prefixes:
+                location_prefixes[core] = counters.next("location")
+            return location_prefixes[core]
+
+        mappings: list[MappingEntry] = []
+        if self.config.enable_regex:
+            for candidate in detect_standard_regex_candidates(text):
+                if candidate.text in sample_blacklist or not _candidate_allowed(candidate.type, profile):
+                    continue
+                masked = (
+                    map_case_number(candidate.text, prov_mapping)
+                    if candidate.type == "case_number"
+                    else "***"
+                )
+                mappings.append(
+                    MappingEntry(
+                        type=candidate.type,
+                        original=candidate.text,
+                        masked=masked,
+                        role=None,
+                        source=candidate.source,
+                        confidence=candidate.confidence,
+                        restore_by_default=False,
+                    )
+                )
+
+        admin_candidates = []
+        admin_spans: list[tuple[int, int]] = []
+        if self.config.enable_hebei_admin_db and self.hebei_admin_detector:
+            detected_admin = sorted(
+                self.hebei_admin_detector.detect(scan_text),
+                key=lambda candidate: (candidate.start, -candidate.length),
+            )
+            for candidate in detected_admin:
+                if candidate.text in sample_blacklist:
+                    continue
+                if candidate.type == "grassroots_org":
+                    allowed = profile.redact_locations or profile.redact_organizations
+                else:
+                    allowed = _candidate_allowed(candidate.type, profile)
+                if not allowed:
+                    continue
+                admin_spans.append((candidate.start, candidate.end))
+                mappings.append(
+                    MappingEntry(
+                        type=candidate.type,
+                        original=candidate.text,
+                        masked=mask_hebei_text(candidate.text, get_location_prefix),
+                        role=None,
+                        source="hebei_admin_db",
+                        confidence=candidate.confidence,
+                        restore_by_default=True,
+                    )
+                )
+
+        if self.config.enable_heuristic_ner and profile.redact_locations:
+            for candidate in detect_heuristic_ner_candidates(scan_text):
+                if candidate.type != "location" or candidate.text in sample_blacklist:
+                    continue
+                if any(
+                    not (candidate.end <= start or candidate.start >= end)
+                    for start, end in admin_spans
+                ):
+                    continue
+                if len(candidate.text) > 8 or any(
+                    noise in candidate.text
+                    for noise in ("银行", "保险", "公司", "集团", "法院", "检察院")
+                ):
+                    continue
+                admin_candidates.append(candidate)
+
+        analysis = {"locations": [], "companies": [], "persons": [], "reject": []}
+        if self.config.enable_local_llm and self.config.local_llm.enabled:
+            from .llm import LegalEntityAuditor
+
+            auditor = LegalEntityAuditor(self.config.local_llm)
+            analysis = auditor.audit_and_verify(
+                scan_text,
+                [],
+                enable_samples=self.config.enable_sample_library,
+            )
+            if analysis.get("error"):
+                warnings.append(str(analysis["error"]))
+
+        engine = LinearRuleEngine(
+            counters=counters,
+            profile=profile,
+            sample_blacklist=sample_blacklist,
+            get_location_prefix=get_location_prefix,
+        )
+        mappings.extend(engine.discover(scan_text, admin_candidates, analysis))
+
+        unique_mappings: list[MappingEntry] = []
+        seen_originals: set[str] = set()
+        for mapping in base_mappings:
+            if mapping.original in seen_originals:
+                continue
+            seen_originals.add(mapping.original)
+            unique_mappings.append(mapping)
+        for mapping in sorted(mappings, key=lambda item: len(item.original), reverse=True):
+            if mapping.original in seen_originals or mapping.original in sample_blacklist:
+                continue
+            seen_originals.add(mapping.original)
+            unique_mappings.append(mapping)
+
+        redacted_text = remove_court_signatures(self.apply_mappings(text, unique_mappings))
+        leaks = self.scan_high_risk_leaks(redacted_text)
+        return RedactionResult(
+            original_text=text,
+            redacted_text=redacted_text,
+            redaction_map=RedactionMap.create(
+                mappings=unique_mappings,
+                mode=profile.name,
+                source_file=source_file,
+            ),
             candidates=[],
             review_candidates=[],
             leaks=leaks,

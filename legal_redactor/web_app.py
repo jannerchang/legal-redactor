@@ -108,7 +108,7 @@ def index() -> str:
             </label>
             <label>分析模型</label>
             <select name="llm_mode">
-              <option value="max-effect" selected>Qwen3 30B (最高准确率)</option>
+              <option value="max-effect" selected>Qwen3.6 27B (最高准确率)</option>
               <option value="balanced">Qwen2.5 7B (快速)</option>
               <option value="off">关闭 (仅使用正则与启发式规则)</option>
             </select>
