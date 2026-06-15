@@ -4,14 +4,8 @@
   # 标准脱敏
   python -m legal_redactor samples/labor_dispute.txt
 
-  # 最小脱敏
-  python -m legal_redactor --profile minimal samples/document.txt
-
   # 还原
   python -m legal_redactor --restore output/redaction_map.json output/redacted.txt
-
-  # 完整还原（含高敏字段）
-  python -m legal_redactor --restore --restore-all output/redaction_map.json output/redacted.txt
 
   # 启动 Web 界面
   python -m legal_redactor --web
@@ -24,9 +18,9 @@ import sys
 from pathlib import Path
 
 from .config import PipelineConfig
-from .io import is_encrypted_map, load_redaction_map, load_redaction_map_encrypted, read_document, write_document
+from .io import load_redaction_map_auto, read_document, write_document
 from .pipeline import RedactionPipeline
-from .restore import restore_text
+from .restore import restore_docx, restore_text
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -36,8 +30,8 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例：
-  python -m legal_redactor --profile minimal samples/doc.txt
-  python -m legal_redactor --profile strong --batch samples/*.txt
+  python -m legal_redactor samples/doc.txt
+  python -m legal_redactor --batch samples/*.txt
   python -m legal_redactor --web
         """,
     )
@@ -45,15 +39,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "inputs",
         nargs="*",
         help="要脱敏的文件路径（支持 .txt / .md / .docx / .pdf）",
-    )
-    parser.add_argument(
-        "--profile", "-p",
-        choices=("minimal", "standard", "strong"),
-        default="standard",
-        help="脱敏策略（默认 standard）：\n"
-             "  minimal  - 仅地名+人名+身份证+手机号\n"
-             "  standard - 最小 + 机构/公司/项目 + 银行账号/信用代码\n"
-             "  strong   - 全部：含案号/地址/金额/日期",
     )
     parser.add_argument(
         "--batch", "-b",
@@ -70,7 +55,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--model",
         type=str,
         default=None,
-        help="自定义 Ollama 模型名，如 qwen3:8b / qwen2.5:7b",
+        help="自定义 Ollama 模型名，如 qwen3.5:9b",
     )
     parser.add_argument(
         "--output-dir", "-o",
@@ -100,11 +85,6 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="还原模式：第一个参数是 redaction_map.json，第二个是脱敏后的文件",
     )
-    parser.add_argument(
-        "--restore-all",
-        action="store_true",
-        help="还原所有字段（含身份证、手机号等高敏字段）",
-    )
     return parser
 
 
@@ -119,7 +99,7 @@ def main(argv: list[str] | None = None) -> None:
         if len(args.inputs) < 2:
             print("还原模式需要两个参数：redaction_map.json 脱敏文件.txt")
             sys.exit(1)
-        _do_restore(args.inputs[0], args.inputs[1], args.restore_all, args.output_dir)
+        _do_restore(args.inputs[0], args.inputs[1], args.output_dir)
         return
 
     if not args.inputs:
@@ -131,7 +111,7 @@ def main(argv: list[str] | None = None) -> None:
 
 def _do_redact(args: argparse.Namespace) -> None:
     input_paths = [Path(p) for p in args.inputs]
-    config = PipelineConfig.from_llm_mode(args.llm, profile_name=args.profile, model=args.model)
+    config = PipelineConfig.from_llm_mode(args.llm, profile_name="standard", model=args.model)
     pipeline = RedactionPipeline(config=config)
     output_dir = Path(args.output_dir)
 
@@ -165,30 +145,31 @@ def _do_redact(args: argparse.Namespace) -> None:
             _print_warnings_and_leaks(result.warnings, result.leaks)
 
 
-def _do_restore(map_path: str, redacted_path: str, restore_all: bool, output_dir: str) -> None:
-    """还原脱敏文本。先试明文 JSON，失败再试解密。"""
+def _do_restore(map_path: str, redacted_path: str, output_dir: str) -> None:
+    """还原脱敏文档。映射表支持明文 JSON 或本机加密格式。"""
     try:
-        redaction_map = load_redaction_map(map_path)
-        print(f"[还原] 已加载明文映射表：{map_path}")
-    except Exception as json_exc:
-        try:
-            redaction_map = load_redaction_map_encrypted(map_path)
-            print(f"[还原] 已解密映射表：{map_path}")
-        except Exception as crypto_exc:
-            print(f"无法读取映射表：{map_path}")
-            print(f"  明文解析：{json_exc}")
-            print(f"  解密：{crypto_exc}")
-            print(f"  提示：请确认映射表与脱敏时在同一台机器生成。")
-            sys.exit(1)
-
-    redacted_text = read_document(redacted_path)
-    restored = restore_text(redacted_text, redaction_map, restore_all=restore_all)
+        redaction_map = load_redaction_map_auto(map_path)
+        print(f"[还原] 已加载映射表：{map_path}")
+    except Exception as exc:
+        print(f"无法读取映射表：{map_path}")
+        print(f"  {exc}")
+        print("  提示：如果是加密映射表，请确认映射表与脱敏时在同一台机器生成。")
+        sys.exit(1)
 
     p = Path(redacted_path)
     out_path = Path(output_dir) / f"{p.stem}.restored{p.suffix}"
+    if p.suffix.lower() == ".docx":
+        replacements = restore_docx(redacted_path, out_path, redaction_map)
+        print(f"[还原完成] {out_path}")
+        print(f"  替换次数：{replacements}")
+        print(f"  还原条目：{len(redaction_map.mappings)}（全部）")
+        return
+
+    redacted_text = read_document(redacted_path)
+    restored = restore_text(redacted_text, redaction_map)
     write_document(str(out_path), restored)
     print(f"[还原完成] {out_path}")
-    print(f"  还原条目：{len(redaction_map.mappings)}（{'全部' if restore_all else '默认可还原'}）")
+    print(f"  还原条目：{len(redaction_map.mappings)}（全部）")
 
 
 def _print_warnings_and_leaks(warnings: list[str], leaks: list) -> None:
@@ -218,7 +199,7 @@ def _redacted_filename(source_file: str) -> str:
 
 
 def _session_name(args: argparse.Namespace) -> str:
-    parts = [args.profile, f"llm_{args.llm}"]
+    parts = ["standard", f"llm_{args.llm}"]
     if args.batch:
         parts.insert(0, "batch")
     return "_".join(parts)

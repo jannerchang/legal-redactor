@@ -8,6 +8,29 @@ from typing import Any
 CN_TZ = timezone(timedelta(hours=8))
 
 
+_MAPPING_TYPE_ORDER = {
+    "organization": 0,
+    "individual_business": 0,
+    "project": 0,
+    "location": 1,
+    "grassroots_org": 1,
+    "person": 2,
+}
+
+
+def sort_mapping_entries(mappings: list["MappingEntry"]) -> list["MappingEntry"]:
+    """Sort mappings for display/export without changing replacement semantics."""
+    return sorted(
+        mappings,
+        key=lambda entry: (
+            _MAPPING_TYPE_ORDER.get(entry.type, 9),
+            -len(entry.original or ""),
+            entry.original or "",
+            entry.masked or "",
+        ),
+    )
+
+
 @dataclass
 class Candidate:
     type: str
@@ -70,7 +93,7 @@ class RedactionMap:
             created_at=datetime.now(CN_TZ).isoformat(timespec="seconds"),
             mode=mode,
             source_file=source_file,
-            mappings=mappings,
+            mappings=sort_mapping_entries(mappings),
         )
 
     def to_dict(self) -> dict[str, Any]:

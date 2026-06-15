@@ -93,6 +93,13 @@ def load_redaction_map_encrypted(path: str | Path) -> RedactionMap:
     return redaction_map_from_json(decrypt(data))
 
 
+def load_redaction_map_auto(path: str | Path) -> RedactionMap:
+    """自动读取明文或加密映射表。"""
+    if is_encrypted_map(path):
+        return load_redaction_map_encrypted(path)
+    return load_redaction_map(path)
+
+
 def is_encrypted_map(path: str | Path) -> bool:
     """判断文件是否为加密格式（不以 '{' 开头）。"""
     try:
@@ -123,4 +130,3 @@ def save_redaction_map_auto(path: str | Path, redaction_map: RedactionMap) -> No
             file=sys.stderr,
         )
         save_redaction_map(path, redaction_map)
-

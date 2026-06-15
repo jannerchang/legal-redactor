@@ -25,7 +25,7 @@ from .detectors import (
 )
 from .hebei_admin import HebeiAdminDivisionDetector
 from .models import BatchRedactionResult, Candidate, Leak, MappingEntry, RedactedDocument, RedactionMap, RedactionResult
-from ._samples import load_all_samples
+from ._samples import load_all_samples, load_trusted_sample_mappings
 
 
 
@@ -274,6 +274,52 @@ def _candidate_allowed(entity_type: str, config: RedactionProfile) -> bool:
     return True
 
 
+def _span_inside_any(span: tuple[int, int], containers: list[tuple[int, int]]) -> bool:
+    start, end = span
+    return any(start >= c_start and end <= c_end for c_start, c_end in containers)
+
+
+def _find_all_spans(text: str, needle: str) -> list[tuple[int, int]]:
+    if not needle:
+        return []
+    spans: list[tuple[int, int]] = []
+    start = text.find(needle)
+    while start >= 0:
+        spans.append((start, start + len(needle)))
+        start = text.find(needle, start + 1)
+    return spans
+
+
+def _filter_locations_inside_organizations(
+    text: str,
+    mappings: list[MappingEntry],
+    protected_texts: set[str] | None = None,
+) -> list[MappingEntry]:
+    """Drop location mappings that only occur inside organization or rejected phrases."""
+    organization_spans: list[tuple[int, int]] = []
+    for mapping in mappings:
+        if mapping.type not in {"organization", "individual_business"}:
+            continue
+        organization_spans.extend(_find_all_spans(text, mapping.original))
+    if protected_texts:
+        for protected in protected_texts:
+            if protected and len(protected) >= 2:
+                organization_spans.extend(_find_all_spans(text, protected))
+    if not organization_spans:
+        return mappings
+
+    filtered: list[MappingEntry] = []
+    for mapping in mappings:
+        if mapping.type not in {"location", "grassroots_org"}:
+            filtered.append(mapping)
+            continue
+        spans = _find_all_spans(text, mapping.original)
+        if spans and all(_span_inside_any(span, organization_spans) for span in spans):
+            continue
+        filtered.append(mapping)
+    return filtered
+
+
 def extract_and_map_geonames(text: str, get_loc_prefix, profile, sample_blacklist, hebei_admin_detector=None) -> list[MappingEntry]:
     if not _candidate_allowed("location", profile):
         return []
@@ -482,8 +528,14 @@ class RedactionPipeline:
         # 0. 加载本地样本库的精准匹配词与黑名单
         if self.config.enable_sample_library:
             _, sample_blacklist = load_all_samples()
+            sample_mappings = [
+                mapping
+                for mapping in load_trusted_sample_mappings()
+                if mapping.original in text and _candidate_allowed(mapping.type, profile)
+            ]
         else:
             sample_blacklist = set()
+            sample_mappings = []
 
         base_mappings = []
         if base_redaction_map and base_redaction_map.mappings:
@@ -758,6 +810,9 @@ class RedactionPipeline:
                 continue
             if "元" in name and ("万" in name or "亿" in name):
                 continue
+            # 含"某"字的是已脱敏占位符，不应二次匹配
+            if "某" in name:
+                continue
             # 必须符合常见的汉人名字长度（2-4字）且姓氏在常用百家姓中，或者少数民族带点人名（如 阿不都·艾山）
             is_valid_han = len(name) <= 4 and (name[0] in common_surnames or (len(name) > 2 and name[:2] in common_surnames))
             is_valid_minority = "·" in name and len(name) <= 15
@@ -830,12 +885,21 @@ class RedactionPipeline:
                 seen_orig.add(m.original)
                 unique_mappings.append(m)
 
+        for m in sorted(sample_mappings, key=lambda x: len(x.original), reverse=True):
+            if m.original in sample_blacklist:
+                continue
+            if m.original not in seen_orig:
+                seen_orig.add(m.original)
+                unique_mappings.append(m)
+
         for m in sorted(mappings, key=lambda x: len(x.original), reverse=True):
             if m.original in sample_blacklist:
                 continue
             if m.original not in seen_orig:
                 seen_orig.add(m.original)
                 unique_mappings.append(m)
+
+        unique_mappings = _filter_locations_inside_organizations(text, unique_mappings, sample_blacklist)
 
         redacted_text = self.apply_mappings(text, unique_mappings)
         redacted_text = remove_court_signatures(redacted_text)
@@ -873,8 +937,14 @@ class RedactionPipeline:
 
         if self.config.enable_sample_library:
             _, sample_blacklist = load_all_samples()
+            sample_mappings = [
+                mapping
+                for mapping in load_trusted_sample_mappings()
+                if mapping.original in text and _candidate_allowed(mapping.type, profile)
+            ]
         else:
             sample_blacklist = set()
+            sample_mappings = []
 
         base_mappings = list(base_redaction_map.mappings) if base_redaction_map else []
         location_prefixes: dict[str, str] = {}
@@ -954,23 +1024,13 @@ class RedactionPipeline:
                     continue
                 if len(candidate.text) > 8 or any(
                     noise in candidate.text
-                    for noise in ("银行", "保险", "公司", "集团", "法院", "检察院")
+                    for noise in (
+                        "银行", "保险", "公司", "集团", "法院", "检察院",
+                        "农业农村", "产业开发", "技术开发",
+                    )
                 ):
                     continue
                 admin_candidates.append(candidate)
-
-        analysis = {"locations": [], "companies": [], "persons": [], "reject": []}
-        if self.config.enable_local_llm and self.config.local_llm.enabled:
-            from .llm import LegalEntityAuditor
-
-            auditor = LegalEntityAuditor(self.config.local_llm)
-            analysis = auditor.audit_and_verify(
-                scan_text,
-                [],
-                enable_samples=self.config.enable_sample_library,
-            )
-            if analysis.get("error"):
-                warnings.append(str(analysis["error"]))
 
         engine = LinearRuleEngine(
             counters=counters,
@@ -978,6 +1038,42 @@ class RedactionPipeline:
             sample_blacklist=sample_blacklist,
             get_location_prefix=get_location_prefix,
         )
+        rule_candidates = engine.collect_candidates(scan_text, admin_candidates, {})
+        review_candidates = [
+            candidate
+            for candidate in rule_candidates
+            if candidate.source in {"fallback_person", "heuristic_ner", "linear_full_org"}
+            or candidate.confidence < 0.9
+        ]
+
+        analysis = {"locations": [], "companies": [], "persons": [], "reject": []}
+        if self.config.enable_local_llm and self.config.local_llm.enabled:
+            from .llm import LegalEntityAuditor
+
+            if review_candidates:
+                auditor = LegalEntityAuditor(self.config.local_llm)
+                verify_list = [
+                    {
+                        "text": candidate.text,
+                        "type": candidate.type,
+                        "context": candidate.metadata.get(
+                            "context",
+                            scan_text[
+                                max(0, candidate.start - 60):
+                                min(len(scan_text), candidate.end + 60)
+                            ],
+                        ),
+                    }
+                    for candidate in review_candidates
+                ]
+                analysis = auditor.audit_and_verify(
+                    scan_text,
+                    verify_list,
+                    enable_samples=self.config.enable_sample_library,
+                )
+                if analysis.get("error"):
+                    warnings.append(str(analysis["error"]))
+
         mappings.extend(engine.discover(scan_text, admin_candidates, analysis))
 
         unique_mappings: list[MappingEntry] = []
@@ -987,11 +1083,18 @@ class RedactionPipeline:
                 continue
             seen_originals.add(mapping.original)
             unique_mappings.append(mapping)
+        for mapping in sorted(sample_mappings, key=lambda item: len(item.original), reverse=True):
+            if mapping.original in seen_originals or mapping.original in sample_blacklist:
+                continue
+            seen_originals.add(mapping.original)
+            unique_mappings.append(mapping)
         for mapping in sorted(mappings, key=lambda item: len(item.original), reverse=True):
             if mapping.original in seen_originals or mapping.original in sample_blacklist:
                 continue
             seen_originals.add(mapping.original)
             unique_mappings.append(mapping)
+
+        unique_mappings = _filter_locations_inside_organizations(text, unique_mappings, sample_blacklist)
 
         redacted_text = remove_court_signatures(self.apply_mappings(text, unique_mappings))
         leaks = self.scan_high_risk_leaks(redacted_text)
@@ -1004,7 +1107,7 @@ class RedactionPipeline:
                 source_file=source_file,
             ),
             candidates=[],
-            review_candidates=[],
+            review_candidates=review_candidates,
             leaks=leaks,
             mode=profile.name,
             warnings=warnings,
@@ -1048,6 +1151,9 @@ class RedactionPipeline:
             if m.original not in seen_orig:
                 seen_orig.add(m.original)
                 unique_mappings.append(m)
+
+        joined_text = "\n\n".join(original_text for _, original_text in documents)
+        unique_mappings = _filter_locations_inside_organizations(joined_text, unique_mappings)
                 
         unified_redaction_map = RedactionMap.create(
             mappings=unique_mappings,

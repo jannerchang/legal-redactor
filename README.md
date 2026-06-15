@@ -3,6 +3,13 @@
 完全本地运行的中文法律文书脱敏工具。系统按照人工处理文书的方式，
 从前向后阅读，读到明确实体后生成全文替换规则。
 
+这是一个适合交给 Codex / GPT-5.5（reasoning low）的纯 vibe coding/部署系统：
+使用者不需要会写代码或读代码，只要描述目标和确认结果；代码、案件材料、映射表
+和还原结果都留在本机或私网机器上，agent 负责按文档配置服务、检查连通性、
+绑定 Discord thread，并通过 MCP 调用受控还原工具。推荐让 agent 直接执行部署步骤，
+尤其是 Home Mac 上的 Hermes MCP 配置、Office Mac 私网 API、Tailscale ACL 和本地
+JSON 配置，避免手动复制 token/IP 到仓库文件。
+
 详细设计见 [线性阅读重构说明](docs/LINEAR_REFACTOR.md)。
 
 ## 工作原理
@@ -44,12 +51,8 @@
 
 ## 脱敏策略
 
-两档可量化预设，每类实体独立开关：
-
-| 策略 | 内容 |
-|------|------|
-| `minimal` | 仅最核心标识：人名 + 地名 + 身份证号 + 手机号 |
-| `standard`（默认） | 深度去标识化：minimal + 机构/公司/项目 + 银行账号 + 信用代码 + 邮箱地址 + 案号省份简称映射 |
+系统只采用一套统一标准，不需要选择档位。它覆盖人名、地名、机构/公司/项目、
+身份证号、手机号、银行账号、信用代码、邮箱地址和案号省份简称映射。
 
 ### 法院名与案号的特殊过滤规则
 
@@ -74,34 +77,93 @@ cd legal-redactor
 ```
 
 支持拖拽 txt/md 文件到文本框、上传 docx、多文件批量处理（统一映射表）。
+脱敏时可以选填案件文件夹名和 Discord 帖子链接；填写后，脱敏文本和加密映射表
+会保存到本地案件库，供后续 Hermes/Discord 还原工作流使用。
 
 ### 命令行
 
 ```bash
-# 标准脱敏（默认，含案号省简称替换与信用代码）
-.venv/bin/python -m legal_redactor --profile standard 文件.txt
-
-# 最小脱敏（仅人名地名人身份证手机号）
-.venv/bin/python -m legal_redactor --profile minimal 文件.txt
+# 按统一标准脱敏
+.venv/bin/python -m legal_redactor 文件.txt
 
 # 纯规则（关闭本地 LLM 辅助验证）
-.venv/bin/python -m legal_redactor --profile standard --llm off 文件.txt
+.venv/bin/python -m legal_redactor --llm off 文件.txt
 
 # 指定输出目录
 .venv/bin/python -m legal_redactor -o output/2026-05 文件.txt
 ```
+
+还原不设档位，始终按映射表一次性还原全部条目。
+
+### Word 一键还原
+
+如果整理案件资料时需要把脱敏后的 Word 文档按映射表还原，并继续保留表格、
+段落和原有格式，可以直接执行：
+
+```bash
+.venv/bin/python scripts/restore_docx.py 脱敏后.docx output/standard_llm_max-effect/redaction_map.enc
+```
+
+默认会在同目录输出 `脱敏后.restored.docx`。也可以指定输出路径：
+
+```bash
+.venv/bin/python scripts/restore_docx.py 脱敏后.docx redaction_map.enc --out 还原后.docx
+```
+
+同样也可以使用统一命令：
+
+```bash
+.venv/bin/python -m legal_redactor --restore redaction_map.enc 脱敏后.docx -o output/restored
+```
+
+该方式会直接在 Word 文档内部替换占位符，覆盖正文、表格、页眉和页脚。
+如果 Word 将一个占位符拆成多个格式片段，还原文字会沿用占位符起始片段的格式。
+
+### Hermes / Discord 远程还原
+
+本功能用于 Home Mac 上的 Hermes/Discord 和 Office Mac 上的本地脱敏系统协作：
+
+- Web 脱敏时可绑定案件文件夹和 Discord 帖子链接，生成 `manifest.json`。
+- Office Mac 只在本地保存原始材料、脱敏文件和加密映射表。
+- Home Mac 的 Hermes 通过 MCP adapter 调用 Office 私网 API。
+- 还原结果写回 Office Mac 的案件目录 `restored/`，MCP 响应不返回映射表或还原全文。
+- 私网地址、token、案件根目录放在本机 JSON 配置中，不提交到 Git。
+- 可选配置 Discord bot token 后，脱敏结果页可一键把脱敏文件作为附件发送到已填写的 Discord 帖子。
+
+Office Mac 可以启动只面向私网的还原 API：
+
+```bash
+cp config/api.example.json ~/.config/legal-redactor/api.local.json
+# 编辑 ~/.config/legal-redactor/api.local.json，填入本机案件根目录、API token；
+# 如需一键发帖，再填入 discord_bot_token。
+LEGAL_REDACTOR_API_CONFIG=~/.config/legal-redactor/api.local.json \
+  .venv/bin/python -m uvicorn legal_redactor.remote_api:app --host 127.0.0.1 --port 8787
+```
+
+Home Mac 上的 Hermes 可通过本地 MCP adapter 调用：
+
+```bash
+cp config/mcp.example.json ~/.config/legal-redactor/mcp.local.json
+# 编辑 ~/.config/legal-redactor/mcp.local.json，填入 Office API 私网地址和 token。
+LEGAL_REDACTOR_MCP_CONFIG=~/.config/legal-redactor/mcp.local.json \
+  .venv/bin/python -m legal_redactor.mcp_adapter
+```
+
+Hermes 工具调用只传 Discord thread id 和判决稿；Office Mac 根据本地
+`manifest.json` 找到案件映射表并保存还原结果。详细部署见
+[`docs/deploy/hermes-office-restore.md`](docs/deploy/hermes-office-restore.md)。
 
 ## 本地 LLM
 
 需安装 Ollama 并拉取模型：
 
 ```bash
-ollama pull qwen3:30b   # 最大效果
-ollama pull qwen3:8b    # 也可用 8B 极速运行
+ollama pull qwen3.5:9b                 # 默认候选审核模型
+ollama pull batiai/qwen3.6-27b:iq4    # 疑难候选升级模型
 ```
 
-LLM 不可用时自动降级为纯规则模式，不影响主流程。LLM 只补充原文中真实
-存在的精确实体，不负责控制全文替换。
+默认由 Qwen3.5 9B 审核低置信候选；调用失败时升级到 27B。两者均不可用时
+自动降级为纯规则模式。LLM 不负责控制全文替换。
 
 ## 量化样本
 
@@ -131,6 +193,7 @@ config = PipelineConfig(strategy="legacy")
 - 不调用任何云端 API，不向任何外部网络上传原文
 - 脱敏映射表默认采用 AES-128-GCM 加密存储，密钥自动生成保存在 `~/.config/legal-redactor/key`
 - 映射表可用于受控恢复，是否恢复由调用方明确决定
+- 远程还原 API 必须通过私网和 bearer token 访问；API/MCP 响应不返回映射表内容
 
 ## 支持格式
 

@@ -6,6 +6,10 @@ output/
 data/
 samples/
 *.json
+!config/*.example.json
+config/*.local.json
+config/*secret*.json
+config/*token*.json
 *.pdf
 *.docx
 build/
@@ -13,4 +17,6 @@ build/
 tests/
 test_new_rules.py
 scratch_test_samples.py
-
+.ff-state/
+.claude/
+.codex/

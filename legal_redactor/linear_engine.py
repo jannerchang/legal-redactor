@@ -15,7 +15,9 @@ from typing import Callable, Iterable
 from .counters import TypeCounters
 from .detectors import (
     _clean_organization_text,
+    _is_false_person,
     _is_false_org,
+    _looks_like_false_location,
     detect_fallback_person_candidates,
     detect_party_candidates,
     detect_title_candidates,
@@ -134,6 +136,13 @@ def _strip_leading_locations(value: str, known_locations: dict[str, str]) -> tup
     return prefix, remaining
 
 
+def _has_explicit_bare_brand_alias(text: str, brand: str) -> bool:
+    if not brand:
+        return False
+    escaped = re.escape(brand)
+    return bool(re.search(rf"(?:以下简称|简称|下称)[“\"'「『（(]?\s*{escaped}\s*[”\"'」』）)]?", text))
+
+
 @dataclass
 class LinearRuleEngine:
     counters: TypeCounters
@@ -154,7 +163,8 @@ class LinearRuleEngine:
         llm_analysis: dict | None = None,
     ) -> list[MappingEntry]:
         self.source_text = text
-        candidates = self._collect_candidates(text, admin_candidates, llm_analysis or {})
+        candidates = self.collect_candidates(text, admin_candidates, llm_analysis or {})
+        candidates = self._apply_llm_verdicts(candidates, text, llm_analysis or {})
         for candidate in sorted(candidates, key=lambda item: (item.start, -item.length, -item.confidence)):
             if candidate.text in self.sample_blacklist:
                 continue
@@ -166,7 +176,7 @@ class LinearRuleEngine:
                 self.accept_organization(candidate)
         return self.mappings
 
-    def _collect_candidates(
+    def collect_candidates(
         self,
         text: str,
         admin_candidates: Iterable[Candidate],
@@ -202,6 +212,53 @@ class LinearRuleEngine:
 
         candidates.extend(self._llm_candidates(text, analysis))
         return self._deduplicate_candidates(candidates)
+
+    @staticmethod
+    def _apply_llm_verdicts(
+        candidates: list[Candidate],
+        text: str,
+        analysis: dict,
+    ) -> list[Candidate]:
+        rejected = {
+            value for value in analysis.get("reject", [])
+            if isinstance(value, str)
+        }
+        calibrations = analysis.get("calibrate", {})
+        if not isinstance(calibrations, dict):
+            calibrations = {}
+
+        reviewed: list[Candidate] = []
+        for candidate in candidates:
+            if candidate.text in rejected:
+                continue
+            calibrated = calibrations.get(candidate.text)
+            if not isinstance(calibrated, str):
+                reviewed.append(candidate)
+                continue
+            calibrated = calibrated.strip()
+            if len(calibrated) < 2:
+                continue
+            nearby_start = max(0, candidate.start - 80)
+            nearby_end = min(len(text), candidate.end + 80)
+            start = text.find(calibrated, nearby_start, nearby_end)
+            if start < 0:
+                reviewed.append(candidate)
+                continue
+            reviewed.append(
+                Candidate(
+                    type=candidate.type,
+                    text=calibrated,
+                    start=start,
+                    end=start + len(calibrated),
+                    source="linear_llm_calibrated",
+                    confidence=0.95,
+                    risk_level=candidate.risk_level,
+                    auto_redact=True,
+                    role=candidate.role,
+                    metadata=candidate.metadata,
+                )
+            )
+        return reviewed
 
     def _llm_candidates(self, text: str, analysis: dict) -> list[Candidate]:
         candidates: list[Candidate] = []
@@ -253,6 +310,8 @@ class LinearRuleEngine:
         if not getattr(self.profile, "redact_locations", True):
             return
         value = candidate.text.strip()
+        if _looks_like_false_location(self.source_text, candidate.start, candidate.end, value):
+            return
         core = _location_core(value)
         if len(core) < 2:
             return
@@ -269,7 +328,12 @@ class LinearRuleEngine:
         if not getattr(self.profile, "redact_persons", True):
             return
         value = candidate.text.strip()
-        if value in self.known_people or not re.fullmatch(r"[\u4e00-\u9fa5]{2,4}", value):
+        if (
+            value in self.known_people
+            or not re.fullmatch(r"[\u4e00-\u9fa5]{2,4}", value)
+            or _is_false_person(value)
+            or any(word in value for word in ("当事", "应予", "应当", "予以"))
+        ):
             return
         self.known_people.add(value)
         masked = f"{value[0]}某{self.counters.next(f'person_{value[0]}')}"
@@ -320,7 +384,8 @@ class LinearRuleEngine:
         brand_mask = self.counters.next("group_prefix")
         full_mask = f"{location_mask}{brand_mask}{industry}{_simple_legal_suffix(legal_suffix)}"
         self._add("organization", value, full_mask, candidate)
-        self._add("organization", brand, brand_mask, candidate)
+        if _has_explicit_bare_brand_alias(self.source_text, brand):
+            self._add("organization", brand, brand_mask, candidate)
 
         company_alias = f"{brand}公司"
         if company_alias in self.source_text:

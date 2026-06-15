@@ -4,16 +4,23 @@ import html
 import json
 import os
 import re
+import urllib.error
 import urllib.parse
+import urllib.request
+import base64
+import tempfile
 from dataclasses import dataclass, replace
 from io import BytesIO
+from pathlib import Path
 
 from .config import PipelineConfig
+from .cases import CaseError, InvalidDiscordThreadError, default_case_root, parse_discord_thread_id, persist_case_redaction
 from .counters import TypeCounters
 from .io import is_encrypted_map, load_redaction_map_encrypted, redaction_map_from_json, redaction_map_to_json
+from .local_config import config_value, load_json_config
 from .models import MappingEntry, RedactedDocument, RedactionMap
 from .pipeline import RedactionPipeline
-from .restore import preview_restore
+from .restore import preview_restore, restore_docx
 
 try:
     from fastapi import FastAPI, File, Form, Request, UploadFile
@@ -77,6 +84,36 @@ async def save_to_local(request: Request) -> JSONResponse:
         return JSONResponse({"status": "error", "message": f"保存失败: {str(exc)}"}, status_code=500)
 
 
+@app.post("/api/suggest-case-location")
+async def suggest_case_location(request: Request) -> JSONResponse:
+    body = await request.json()
+    filenames = body.get("filenames", [])
+    suggestion = _suggest_case_location_from_filenames(filenames)
+    return JSONResponse(suggestion)
+
+
+@app.post("/api/discord/send-redacted")
+async def send_redacted_to_discord(request: Request) -> JSONResponse:
+    body = await request.json()
+    thread_url = str(body.get("discord_thread_url", "")).strip()
+    filename = Path(str(body.get("filename", "redacted.txt"))).name or "redacted.txt"
+    content = str(body.get("content", ""))
+    message = str(body.get("message", "")).strip()
+    if not thread_url:
+        return JSONResponse({"status": "error", "message": "缺少 Discord 帖子链接"}, status_code=400)
+    if not content:
+        return JSONResponse({"status": "error", "message": "没有可发送的脱敏内容"}, status_code=400)
+    try:
+        thread_id = parse_discord_thread_id(thread_url)
+    except InvalidDiscordThreadError as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
+    try:
+        result = _post_discord_thread_file(thread_id, filename, content, message)
+    except RuntimeError as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
+    return JSONResponse({"status": "success", **result})
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     from ._samples import load_all_samples
@@ -85,21 +122,16 @@ def index() -> str:
 
     return _page(
         "本地法律文书脱敏系统",
-        sample_info + """
+        sample_info + f"""
         <section>
           <h2>脱敏</h2>
           <form action="/redact" method="post" enctype="multipart/form-data">
             <label>粘贴文本</label>
             <textarea name="text" id="text-input" rows="12" placeholder="粘贴文书原文，或拖拽 txt/md/docx/pdf 文件到此处"></textarea>
             <label>或上传 txt / md / docx / pdf（可多选）</label>
-            <input type="file" name="files" accept=".txt,.md,.docx,.pdf" multiple>
+            <input type="file" id="source-files" name="files" accept=".txt,.md,.docx,.pdf" multiple>
             <div class="row">
-              <label>脱敏策略</label>
-              <select name="profile">
-                <option value="standard" selected>标准：人名+地名+机构+敏感编号</option>
-                <option value="minimal">最小：仅人名+地名+身份证+手机号</option>
-                <option value="strong">强脱敏：全部含案号+地址+金额+日期</option>
-              </select>
+              <p class="hint">统一标准脱敏：人名、地名、机构名称及敏感编号按同一套规则处理。</p>
               <input type="hidden" name="enable_llm" value="1">
             </div>
             <label style="display:flex; align-items:center; gap:8px; margin-top:12px; margin-bottom:12px; cursor:pointer;">
@@ -109,14 +141,25 @@ def index() -> str:
             <label>分析模型</label>
             <select name="llm_mode">
               <option value="max-effect" selected>Qwen3.6 27B (最高准确率)</option>
-              <option value="balanced">Qwen2.5 7B (快速)</option>
+              <option value="balanced">Qwen3.5 9B (快速准确)</option>
               <option value="off">关闭 (仅使用正则与启发式规则)</option>
             </select>
             <label>或自定义模型</label>
-            <input type="text" name="model" placeholder="如 qwen3:8b / qwen2.5:7b" style="max-width:260px">
+            <input type="text" name="model" placeholder="如 qwen3.5:9b" style="max-width:260px">
             <label>已有映射表（保持替换一致性，选填，支持粘贴JSON或上传文件）</label>
             <textarea name="base_map_json" rows="3" placeholder="粘贴已有映射表 JSON（可选）"></textarea>
             <input type="file" name="base_map_file" accept=".json,.enc">
+            <fieldset>
+              <legend>案件工作流（选填）</legend>
+              <label>案件文件夹名</label>
+              <input type="text" id="case-folder-input" name="case_folder" placeholder="例如：2025 8765">
+              <label>Discord 帖子链接</label>
+              <input type="url" name="discord_thread_url" placeholder="https://discord.com/channels/...">
+              <label>案件库根目录</label>
+              <input type="text" id="case-root-input" name="case_root" value="{html.escape(str(default_case_root()))}">
+              <input type="hidden" id="upload-source-dir-input" name="upload_source_dir" value="">
+              <p class="hint">选择已在本机案件目录中的文件后，系统会尝试自动填入案件文件夹名和案件库根目录；映射表不会上传到 Discord。</p>
+            </fieldset>
             <button type="submit" class="btn">一键脱敏</button>
           </form>
         </section>
@@ -125,13 +168,17 @@ def index() -> str:
           <form action="/restore/preview" method="post" enctype="multipart/form-data">
             <label>粘贴脱敏后的文本</label>
             <textarea name="text" rows="6" placeholder="粘贴脱敏后的文书"></textarea>
-            <label>或上传脱敏文本</label>
-            <input type="file" name="file" accept=".txt,.md">
+            <label>或上传脱敏文本 / Word</label>
+            <input type="file" name="file" accept=".txt,.md,.docx">
+            <label style="display:flex; align-items:center; gap:8px; margin-top:12px; margin-bottom:12px; cursor:pointer;">
+              <input type="checkbox" name="restore_docx_format" value="1" checked style="width:auto; margin:0;">
+              <span>如果上传的是 Word，输出保留格式的 .docx</span>
+            </label>
             <label>粘贴或上传映射表（支持加密文件）</label>
             <textarea name="map_json" rows="4" placeholder="粘贴 redaction_map.json"></textarea>
             <input type="file" name="map_file" accept=".json,.enc">
-            <label><input type="checkbox" name="restore_all" value="1"> 完整还原（含身份证、手机号等高敏字段）</label>
-            <button type="submit" class="btn btn-secondary">预览还原</button>
+            <p class="hint">映射表中的全部条目将一次性还原。</p>
+            <button type="submit" class="btn btn-secondary">全部还原</button>
           </form>
         </section>
         """,
@@ -140,7 +187,6 @@ def index() -> str:
 @app.post("/analyze", response_class=HTMLResponse)
 async def analyze_page(
     text: str = Form(default=""),
-    profile: str = Form(default="standard"),
     llm_mode: str = Form(default="max-effect"),
     enable_llm: str | None = Form(default=None),
     file: UploadFile | None = File(default=None),
@@ -151,6 +197,7 @@ async def analyze_page(
     except ValueError as exc:
         return _page("上传失败", str(exc))
         
+    profile = "standard"
     config = PipelineConfig.from_llm_mode(llm_mode if enable_llm else "off", profile_name=profile)
     pipeline = RedactionPipeline(config=config)
     
@@ -279,7 +326,7 @@ async def redact_confirmed_page(request: Request) -> str:
     form = await request.form()
     bundle_json = form.get("bundle_json", "")
     analysis_json = form.get("analysis_json", "")
-    profile = form.get("profile", "standard")
+    profile = "standard"
     llm_mode = form.get("llm_mode", "max-effect")
     round_num = int(form.get("round", "0"))
     previous_map_json = form.get("previous_map_json", "{}")
@@ -503,12 +550,15 @@ async def redact_confirmed_page(request: Request) -> str:
 @app.post("/redact", response_class=HTMLResponse)
 async def redact_page(
     text: str = Form(default=""),
-    profile: str = Form(default="standard"),
     llm_mode: str = Form(default="max-effect"),
     enable_llm: str | None = Form(default=None),
     model: str = Form(default=""),
     enable_samples: str | None = Form(default=None),
     base_map_json: str = Form(default=""),
+    case_folder: str = Form(default=""),
+    discord_thread_url: str = Form(default=""),
+    case_root: str = Form(default=""),
+    upload_source_dir: str = Form(default=""),
     base_map_file: UploadFile | None = File(default=None),
     file: UploadFile | None = File(default=None),
     files: list[UploadFile] = File(default=[]),
@@ -528,17 +578,46 @@ async def redact_page(
 
     config = PipelineConfig.from_llm_mode(
         llm_mode if enable_llm else "off",
-        profile_name=profile,
+        profile_name="standard",
         model=model or None,
     )
     config = replace(config, enable_sample_library=bool(enable_samples))
     pipeline = RedactionPipeline(config=config)
+    source_files = [item.source_file for item in documents]
+    inferred_case_location = _resolve_case_location(upload_source_dir, source_files)
+    inferred_source_dir = str(inferred_case_location.get("matched_dir") or "")
+    effective_case_folder = case_folder.strip() or str(inferred_case_location.get("case_folder") or "")
+    effective_case_root = case_root.strip() or str(inferred_case_location.get("case_root") or "")
     if len(documents) > 1:
         result = pipeline.redact_many([(item.source_file, item.text) for item in documents], base_redaction_map=base_redaction_map)
-        return _render_batch_redaction_result("脱敏结果", result.documents, result.redaction_map, result.review_candidates, result.leaks, result.warnings)
+        warnings = list(result.warnings)
+        try:
+            _persist_optional_case_redaction(effective_case_root, effective_case_folder, discord_thread_url, result.documents, result.redaction_map)
+        except CaseError as exc:
+            return _page("案件保存失败", f"保存错误: {exc}")
+        except Exception as exc:
+            return _page("案件保存失败", f"保存错误: {exc}")
+        if effective_case_folder and discord_thread_url.strip():
+            warnings.append(f"已保存到案件库：{effective_case_folder}")
+        return _render_batch_redaction_result("脱敏结果", result.documents, result.redaction_map, result.review_candidates, result.leaks, warnings, save_dir=inferred_source_dir, discord_thread_url=discord_thread_url)
     
     result = pipeline.redact(documents[0].text, source_file=documents[0].source_file, base_redaction_map=base_redaction_map)
-    return _render_redaction_result("脱敏结果", result.original_text, result.redacted_text, result.redaction_map, result.review_candidates, result.leaks, result.warnings)
+    warnings = list(result.warnings)
+    redacted_doc = RedactedDocument(
+        source_file=documents[0].source_file,
+        original_text=result.original_text,
+        redacted_text=result.redacted_text,
+        leaks=result.leaks,
+    )
+    try:
+        _persist_optional_case_redaction(effective_case_root, effective_case_folder, discord_thread_url, [redacted_doc], result.redaction_map)
+    except CaseError as exc:
+        return _page("案件保存失败", f"保存错误: {exc}")
+    except Exception as exc:
+        return _page("案件保存失败", f"保存错误: {exc}")
+    if effective_case_folder and discord_thread_url.strip():
+        warnings.append(f"已保存到案件库：{effective_case_folder}")
+    return _render_redaction_result("脱敏结果", result.original_text, result.redacted_text, result.redaction_map, result.review_candidates, result.leaks, warnings, save_dir=inferred_source_dir, discord_thread_url=discord_thread_url)
 
 
 @app.post("/redact/apply-map", response_class=HTMLResponse)
@@ -546,14 +625,13 @@ async def apply_map_page(
     original_text: str = Form(...),
     map_json: str = Form(...),
     original_bundle_json: str = Form(default=""),
-    mode: str = Form(default="standard"),
 ) -> str:
     try:
         redaction_map = redaction_map_from_json(map_json)
     except Exception as exc:
         return _page("映射表解析失败", f"错误详情: {exc}")
 
-    pipeline = RedactionPipeline(config=PipelineConfig(redaction_profile=RedactionProfile.from_preset(mode)))
+    pipeline = RedactionPipeline(config=PipelineConfig(redaction_profile=RedactionProfile.from_preset("standard")))
     if original_bundle_json.strip():
         documents = _documents_from_bundle_json(original_bundle_json)
         redacted_documents = []
@@ -597,6 +675,8 @@ async def apply_edited_map_page(request: Request) -> str:
     form = await request.form()
     original_text = form.get("original_text", "")
     original_bundle_json = form.get("original_bundle_json", "")
+    save_dir = str(form.get("save_dir", ""))
+    discord_thread_url = str(form.get("discord_thread_url", ""))
     map_version = form.get("map_version", "1.0")
     map_created_at = form.get("map_created_at", "")
     map_mode = form.get("map_mode", "normal")
@@ -623,10 +703,10 @@ async def apply_edited_map_page(request: Request) -> str:
     if documents:
         redacted_documents = _apply_map_to_documents(pipeline, documents, redaction_map)
         leaks = [lk for d in redacted_documents for lk in d.leaks]
-        return _render_batch_redaction_result("编辑映射后结果", redacted_documents, redaction_map, [], leaks, ["已手动调整映射表。"])
+        return _render_batch_redaction_result("编辑映射后结果", redacted_documents, redaction_map, [], leaks, ["已手动调整映射表。"], save_dir=save_dir, discord_thread_url=discord_thread_url)
     redacted_text = pipeline.apply_redaction_map(original_text, redaction_map)
     leaks = pipeline.scan_high_risk_leaks(redacted_text)
-    return _render_redaction_result("编辑映射后结果", original_text, redacted_text, redaction_map, [], leaks, ["已手动调整映射表。"])
+    return _render_redaction_result("编辑映射后结果", original_text, redacted_text, redaction_map, [], leaks, ["已手动调整映射表。"], save_dir=save_dir, discord_thread_url=discord_thread_url)
 
 
 @app.post("/redact/save-sample", response_class=HTMLResponse)
@@ -818,7 +898,7 @@ def edit_samples_page() -> str:
 
 @app.post("/samples/update/{idx}")
 async def update_sample_entry(idx: int, request: Request) -> JSONResponse:
-    from ._samples import _auto_sample_path
+    from ._samples import _auto_sample_path, save_sample_auto
     filepath = _auto_sample_path()
     body = await request.json()
     if not filepath.exists():
@@ -834,35 +914,25 @@ async def update_sample_entry(idx: int, request: Request) -> JSONResponse:
         elif action == "modify":
             e["new_original"] = body.get("original", e.get("new_original", ""))
             e["new_masked"] = body.get("masked", e.get("new_masked", ""))
-        entries[idx] = e
-        data["entries"] = entries
-        filepath.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        save_sample_auto([e], source=e.get("source", "samples_edit"))
         return JSONResponse({"msg": "已保存"})
     return JSONResponse({"msg": "索引无效"}, status_code=400)
 
 
 @app.post("/samples/add")
 async def add_sample_entry(request: Request) -> JSONResponse:
-    from ._samples import _auto_sample_path
+    from ._samples import _auto_sample_path, save_sample_auto
     body = await request.json()
     action = body.get("action", "add")
     orig = body.get("original", "").strip()
     masked = body.get("masked", "").strip()
     if not orig:
         return JSONResponse({"msg": "原文不能为空"}, status_code=400)
-    filepath = _auto_sample_path()
-    data = {}
-    if filepath.exists():
-        data = json.loads(filepath.read_text(encoding="utf-8"))
-    entries = data.get("entries", [])
     if action == "delete":
-        entries.append({"action": "delete", "type": "manual", "original": orig})
+        save_sample_auto([{"action": "delete", "type": "manual", "original": orig}], source="samples_edit")
     else:
-        entries.append({"action": "add", "type": "manual", "original": orig, "masked": masked})
-    data["entries"] = entries
-    data["total"] = len(entries)
-    filepath.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    return JSONResponse({"msg": f"已添加 {len(entries)} 条"})
+        save_sample_auto([{"action": "add", "type": "manual", "original": orig, "masked": masked}], source="samples_edit")
+    return JSONResponse({"msg": "已添加"})
 
 
 @app.get("/samples/delete/{idx}", response_class=HTMLResponse)
@@ -897,20 +967,29 @@ async def restore_preview_page(
     file: UploadFile | None = File(default=None),
     map_json: str = Form(default=""),
     map_file: UploadFile | None = File(default=None),
-    restore_all: str | None = Form(default=None),
+    restore_docx_format: str | None = Form(default=None),
 ) -> str:
     try:
         redacted_text = text.strip()
+        redacted_docx_bytes: bytes | None = None
+        redacted_filename = ""
         if file and file.filename:
             data = await file.read()
-            redacted_text = _decode_text_bytes(data, file.filename)
+            redacted_filename = file.filename
+            if _suffix_for_filename(file.filename) == ".docx":
+                redacted_docx_bytes = data
+                redacted_text = _docx_bytes_to_text(data)
+            else:
+                redacted_text = _decode_text_bytes(data, file.filename)
         map_text = await _read_restore_map_text(map_json, map_file)
 
         if not map_text or not redacted_text:
-            return _page("参数缺失", '<nav><a href="/">返回</a></nav><section class="warning"><p>请粘贴脱敏文本和映射表。</p></section>')
+            return _page("参数缺失", '<nav><a href="/">返回</a></nav><section class="warning"><p>请粘贴或上传脱敏文本/Word，并提供映射表。</p></section>')
 
         redaction_map = redaction_map_from_json(map_text)
-        preview = preview_restore(redacted_text, redaction_map, restore_all=bool(restore_all))
+        if redacted_docx_bytes is not None and restore_docx_format:
+            return _render_docx_restore_result(redacted_docx_bytes, redacted_filename, redaction_map)
+        preview = preview_restore(redacted_text, redaction_map)
     except Exception as exc:
         return _page("还原错误", f'<nav><a href="/">返回</a></nav><section class="warning"><p>{html.escape(str(exc))}</p></section>')
 
@@ -919,10 +998,6 @@ async def restore_preview_page(
     restored_rows = "".join(
         f"<tr><td>{html.escape(i.type)}</td><td>{html.escape(i.masked)}</td><td>{html.escape(i.original)}</td></tr>"
         for i in preview.restored_entries
-    )
-    skipped_rows = "".join(
-        f"<tr><td>{html.escape(i.type)}</td><td>{html.escape(i.masked)}</td><td>{html.escape(i.original)}</td></tr>"
-        for i in preview.skipped_entries
     )
     return _page("还原预览", f"""
         <nav><a href="/">返回首页</a></nav>
@@ -961,8 +1036,47 @@ async def restore_preview_page(
         </section>
         <section>
           <h2>已还原</h2><table><thead><tr><th>类型</th><th>占位符</th><th>原文</th></tr></thead><tbody>{restored_rows}</tbody></table>
-          <h2>已跳过（高敏字段）</h2><table><thead><tr><th>类型</th><th>占位符</th><th>原文</th></tr></thead><tbody>{skipped_rows}</tbody></table>
           <details><summary>差异预览</summary><pre>{html.escape(preview.diff)}</pre></details>
+        </section>
+    """)
+
+
+def _render_docx_restore_result(
+    redacted_docx_bytes: bytes,
+    redacted_filename: str,
+    redaction_map: RedactionMap,
+) -> str:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        input_path = temp_path / "redacted.docx"
+        output_path = temp_path / "restored.docx"
+        input_path.write_bytes(redacted_docx_bytes)
+        replacements = restore_docx(input_path, output_path, redaction_map)
+        restored_bytes = output_path.read_bytes()
+
+    stem = Path(redacted_filename or "restored.docx").stem
+    restored_filename = f"{stem}.restored.docx"
+    restored_url = _binary_download(
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        restored_bytes,
+    )
+    restored_rows = "".join(
+        f"<tr><td>{html.escape(i.type)}</td><td>{html.escape(i.masked)}</td><td>{html.escape(i.original)}</td></tr>"
+        for i in redaction_map.mappings
+    )
+    return _page("Word 还原完成", f"""
+        <nav><a href="/">返回首页</a></nav>
+        <div class="downloads">
+          <a download="{html.escape(restored_filename)}" href="{restored_url}" class="btn" data-no-intercept="true">下载还原 Word</a>
+        </div>
+        <section class="info-card">
+          <h2>还原完成</h2>
+          <p>已按映射表生成保留格式的 Word 文档。</p>
+          <p class="hint">替换次数：{replacements}；映射条目：{len(redaction_map.mappings)}。</p>
+        </section>
+        <section>
+          <h2>映射表条目</h2>
+          <table><thead><tr><th>类型</th><th>占位符</th><th>原文</th></tr></thead><tbody>{restored_rows}</tbody></table>
         </section>
     """)
 
@@ -975,13 +1089,18 @@ def _render_redaction_result(
     review_candidates: list,
     leaks: list,
     warnings: list[str],
+    save_dir: str = "",
+    discord_thread_url: str = "",
 ) -> str:
-    default_dir = os.path.expanduser("~/Desktop")
+    default_dir = save_dir.strip() or os.path.expanduser("~/Desktop")
     map_json = redaction_map_to_json(redaction_map)
     leaks_html = "".join(f"<li><strong>{html.escape(lk.type)}</strong>: <mark>{html.escape(lk.text)}</mark></li>" for lk in leaks)
     warnings_html = "".join(f"<li>{html.escape(w)}</li>" for w in warnings)
-    redacted_url = _data_download("redacted.txt", "text/plain", redacted_text)
+    redacted_filename = "redacted.txt"
+    redacted_filename_json = json.dumps(redacted_filename, ensure_ascii=False)
+    redacted_url = _data_download(redacted_filename, "text/plain", redacted_text)
     map_url = _data_download("redaction_map.json", "application/json", map_json)
+    discord_section = _discord_send_section(discord_thread_url, redacted_filename, "redacted-output", "discord-message")
     review_html = "".join(
         "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.2f}</td><td>{}</td></tr>".format(
             html.escape(c.type), html.escape(c.text), html.escape(c.source),
@@ -993,7 +1112,7 @@ def _render_redaction_result(
         f"""
         <nav><a href="/">返回首页</a></nav>
         <div class="downloads">
-          <a download="redacted.txt" href="{redacted_url}" class="btn">下载脱敏文本</a>
+          <a download="{html.escape(redacted_filename)}" href="{redacted_url}" class="btn">下载脱敏文本</a>
           <a download="redaction_map.json" href="{map_url}" class="btn btn-secondary">下载 redaction_map</a>
           <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制脱敏文本</button>
         </div>
@@ -1011,21 +1130,24 @@ def _render_redaction_result(
               </div>
             </div>
             <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px;">
-              <button type="button" class="btn btn-sm" onclick="saveToLocalPath([{{filename: 'redacted.txt', content: document.getElementById('redacted-output').value}}], this)">保存脱敏文本</button>
+              <button type="button" class="btn btn-sm" onclick="saveToLocalPath([{{filename: {html.escape(redacted_filename_json)}, content: document.getElementById('redacted-output').value}}], this)">保存脱敏文本</button>
               <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'redaction_map.json', content: document.getElementById('mapping-json-output').value}}], this)">保存映射表</button>
-              <button type="button" class="btn btn-sm" style="background: #e18c12; border-color: #e18c12; color: #fff;" onclick="saveToLocalPath([{{filename: 'redacted.txt', content: document.getElementById('redacted-output').value}}, {{filename: 'redaction_map.json', content: document.getElementById('mapping-json-output').value}}], this)">一键保存全部</button>
+              <button type="button" class="btn btn-sm" style="background: #e18c12; border-color: #e18c12; color: #fff;" onclick="saveToLocalPath([{{filename: {html.escape(redacted_filename_json)}, content: document.getElementById('redacted-output').value}}, {{filename: 'redaction_map.json', content: document.getElementById('mapping-json-output').value}}], this)">一键保存全部</button>
             </div>
           </div>
           <script>
             (function(){{
               var savedDir = localStorage.getItem('last_local_save_dir');
-              if (savedDir) {{
+              var hasPreferredDir = {json.dumps(bool(save_dir.strip()))};
+              if (savedDir && !hasPreferredDir) {{
                 var inp = document.getElementById('local-save-dir');
                 if (inp) inp.value = savedDir;
               }}
             }})();
           </script>
         </section>
+
+        {discord_section}
         
         {f'<section class="warning"><h2>高危泄漏</h2><ul>{leaks_html}</ul></section>' if leaks_html else ''}
         {f'<section class="notice"><h2>运行提示</h2><ul>{warnings_html}</ul></section>' if warnings_html else ''}
@@ -1047,6 +1169,8 @@ def _render_redaction_result(
             <textarea name="original_text" class="hidden-raw">{html.escape(original_text)}</textarea>
             <textarea name="original_bundle_json" class="hidden-raw"></textarea>
             <textarea id="mapping-json-output" name="original_mapping_json" class="hidden-raw">{html.escape(map_json)}</textarea>
+            <input type="hidden" name="save_dir" value="{html.escape(save_dir)}">
+            <input type="hidden" name="discord_thread_url" value="{html.escape(discord_thread_url)}">
             <input type="hidden" name="map_version" value="{html.escape(redaction_map.version)}">
             <input type="hidden" name="map_created_at" value="{html.escape(redaction_map.created_at)}">
             <input type="hidden" name="map_mode" value="{html.escape(redaction_map.mode)}">
@@ -1072,17 +1196,16 @@ def _render_batch_redaction_result(
     review_candidates: list,
     leaks: list,
     warnings: list[str],
+    save_dir: str = "",
+    discord_thread_url: str = "",
 ) -> str:
-    default_dir = os.path.expanduser("~/Desktop")
+    default_dir = save_dir.strip() or os.path.expanduser("~/Desktop")
     
     # 构建各个独立文件的脱敏文本列表供 JS 使用
     individual_files = []
-    for d in documents:
-        base, ext = os.path.splitext(d.source_file)
-        if not ext:
-            ext = ".txt"
-        out_name = f"{base}_redacted{ext}"
-        individual_files.append({"filename": out_name, "content": d.redacted_text})
+    for index, document in enumerate(documents, start=1):
+        out_name = f"document-{index}.redacted.txt"
+        individual_files.append({"filename": out_name, "content": document.redacted_text})
     individual_files_json = json.dumps(individual_files, ensure_ascii=False)
     
     map_json = redaction_map_to_json(redaction_map)
@@ -1091,7 +1214,10 @@ def _render_batch_redaction_result(
     leaks_html = "".join(f"<li><strong>{html.escape(lk.type)}</strong>: <mark>{html.escape(lk.text)}</mark></li>" for lk in leaks)
     warnings_html = "".join(f"<li>{html.escape(w)}</li>" for w in warnings)
     map_url = _data_download("redaction_map.json", "application/json", map_json)
-    redacted_url = _data_download("batch_redacted.txt", "text/plain", combined_redacted)
+    combined_filename = "batch.redacted.txt"
+    combined_filename_json = json.dumps(combined_filename, ensure_ascii=False)
+    redacted_url = _data_download(combined_filename, "text/plain", combined_redacted)
+    discord_section = _discord_send_section(discord_thread_url, combined_filename, "redacted-output", "discord-message-batch")
     doc_sections = "".join(
         f'<article class="doc-result">'
         f'<h3>{html.escape(d.source_file)}</h3>'
@@ -1105,7 +1231,7 @@ def _render_batch_redaction_result(
         f"""
         <nav><a href="/">返回首页</a></nav>
         <div class="downloads">
-          <a download="batch_redacted.txt" href="{redacted_url}" class="btn">下载合并脱敏文本</a>
+          <a download="{combined_filename}" href="{redacted_url}" class="btn">下载合并脱敏文本</a>
           <a download="redaction_map.json" href="{map_url}" class="btn btn-secondary">下载统一映射表</a>
           <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制合并文本</button>
         </div>
@@ -1125,22 +1251,25 @@ def _render_batch_redaction_result(
               </div>
             </div>
             <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px;">
-              <button type="button" class="btn btn-sm" onclick="saveToLocalPath([{{filename: 'batch_redacted.txt', content: document.getElementById('redacted-output').value}}], this)">保存合并文本</button>
+              <button type="button" class="btn btn-sm" onclick="saveToLocalPath([{{filename: {html.escape(combined_filename_json)}, content: document.getElementById('redacted-output').value}}], this)">保存合并文本</button>
               <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'redaction_map.json', content: document.getElementById('mapping-json-output').value}}], this)">保存统一映射表</button>
-              <button type="button" class="btn btn-sm" style="background: #e18c12; border-color: #e18c12; color: #fff;" onclick="saveToLocalPath([{{filename: 'batch_redacted.txt', content: document.getElementById('redacted-output').value}}, {{filename: 'redaction_map.json', content: document.getElementById('mapping-json-output').value}}].concat(_individualRedactedFiles), this)">一键保存全部</button>
+              <button type="button" class="btn btn-sm" style="background: #e18c12; border-color: #e18c12; color: #fff;" onclick="saveToLocalPath([{{filename: {html.escape(combined_filename_json)}, content: document.getElementById('redacted-output').value}}, {{filename: 'redaction_map.json', content: document.getElementById('mapping-json-output').value}}].concat(_individualRedactedFiles), this)">一键保存全部</button>
             </div>
           </div>
           <script>
             var _individualRedactedFiles = {individual_files_json};
             (function(){{
               var savedDir = localStorage.getItem('last_local_save_dir');
-              if (savedDir) {{
+              var hasPreferredDir = {json.dumps(bool(save_dir.strip()))};
+              if (savedDir && !hasPreferredDir) {{
                 var inp = document.getElementById('local-save-dir');
                 if (inp) inp.value = savedDir;
               }}
             }})();
           </script>
         </section>
+
+        {discord_section}
         
         {f'<section class="warning"><h2>高危泄漏</h2><ul>{leaks_html}</ul></section>' if leaks_html else ''}
         {f'<section class="notice"><h2>运行提示</h2><ul>{warnings_html}</ul></section>' if warnings_html else ''}
@@ -1151,6 +1280,8 @@ def _render_batch_redaction_result(
             <textarea name="original_text" class="hidden-raw"></textarea>
             <textarea name="original_bundle_json" class="hidden-raw">{html.escape(bundle_json)}</textarea>
             <textarea id="mapping-json-output" name="original_mapping_json" class="hidden-raw">{html.escape(map_json)}</textarea>
+            <input type="hidden" name="save_dir" value="{html.escape(save_dir)}">
+            <input type="hidden" name="discord_thread_url" value="{html.escape(discord_thread_url)}">
             <input type="hidden" name="map_version" value="{html.escape(redaction_map.version)}">
             <input type="hidden" name="map_created_at" value="{html.escape(redaction_map.created_at)}">
             <input type="hidden" name="map_mode" value="{html.escape(redaction_map.mode)}">
@@ -1166,6 +1297,205 @@ def _render_batch_redaction_result(
         </section>
         """,
     )
+
+
+def _discord_send_section(discord_thread_url: str, filename: str, textarea_id: str, message_id: str) -> str:
+    thread_url = discord_thread_url.strip()
+    if not thread_url:
+        return ""
+    default_message = "脱敏文件已生成，请见附件。"
+    status_id = f"{message_id}-status"
+    return (
+        f'<section class="local-save-section" style="border-left: 4px solid #5865f2; background: linear-gradient(135deg, var(--surface) 0%, rgba(88, 101, 242, 0.04) 100%); padding: 18px 24px; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 18px; box-shadow: var(--shadow);">'
+        f'<div style="display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 14px;">'
+        f'<div style="flex: 1; min-width: 280px;">'
+        f'<h3 style="margin: 0 0 8px 0; font-size: 14px; font-weight: 600; color: var(--ink);">发送到 Discord 帖子</h3>'
+        f'<p class="hint" style="margin: 0 0 8px 0;">只发送脱敏文本附件，不发送映射表。</p>'
+        f'<textarea id="{html.escape(message_id, quote=True)}" rows="3" style="width: 100%; min-height: 70px; resize: vertical;">{html.escape(default_message)}</textarea>'
+        f'</div>'
+        f'<div style="display: flex; align-items: flex-start; justify-content: flex-end; flex-direction: column; gap: 8px; min-height: 120px;">'
+        f'<button type="button" class="btn discord-send-button" '
+        f'data-thread-url="{html.escape(thread_url, quote=True)}" '
+        f'data-filename="{html.escape(filename, quote=True)}" '
+        f'data-textarea-id="{html.escape(textarea_id, quote=True)}" '
+        f'data-message-id="{html.escape(message_id, quote=True)}" '
+        f'data-status-id="{html.escape(status_id, quote=True)}">'
+        f'一键发送到 Discord</button>'
+        f'<span id="{html.escape(status_id, quote=True)}" class="hint" style="min-height: 18px;"></span>'
+        f'</div></div></section>'
+    )
+
+
+def _persist_optional_case_redaction(
+    case_root: str,
+    case_folder: str,
+    discord_thread_url: str,
+    documents: list[RedactedDocument],
+    redaction_map: RedactionMap,
+) -> None:
+    has_case_folder = bool(case_folder.strip())
+    has_thread_url = bool(discord_thread_url.strip())
+    if not has_case_folder and not has_thread_url:
+        return
+    if not has_case_folder or not has_thread_url:
+        raise CaseError("案件文件夹名和 Discord 帖子链接必须同时填写")
+    root = case_root.strip() or str(default_case_root())
+    persist_case_redaction(root, case_folder, discord_thread_url, documents, redaction_map)
+
+
+def _resolve_case_location(upload_source_dir: str, source_files: list[str]) -> dict[str, object]:
+    source_dir = upload_source_dir.strip()
+    if source_dir:
+        source_path = Path(source_dir).expanduser()
+        return {
+            "status": "ok",
+            "case_folder": source_path.name,
+            "case_root": str(source_path.parent),
+            "matched_dir": str(source_path),
+        }
+    suggestion = _suggest_case_location_from_filenames(source_files)
+    if suggestion.get("status") == "ok":
+        return suggestion
+    return {"status": "not_found"}
+
+
+def _post_discord_thread_file(thread_id: str, filename: str, content: str, message: str = "") -> dict[str, str]:
+    config = load_json_config("LEGAL_REDACTOR_API_CONFIG", "api.local.json")
+    token = os.environ.get("LEGAL_REDACTOR_DISCORD_BOT_TOKEN") or config_value(config, "discord_bot_token")
+    if not token or token.startswith("optional-"):
+        raise RuntimeError("未配置 Discord bot token")
+
+    message = (message.strip() or "脱敏文件已生成，请见附件。")[:1900]
+    payload = {
+        "content": message,
+        "attachments": [{"id": 0, "filename": filename}],
+    }
+    fields = [
+        ("payload_json", "application/json", None, json.dumps(payload, ensure_ascii=False).encode("utf-8")),
+        ("files[0]", "text/plain; charset=utf-8", filename, content.encode("utf-8")),
+    ]
+    body, content_type = _multipart_form_data(fields)
+    request = urllib.request.Request(
+        f"https://discord.com/api/v10/channels/{thread_id}/messages",
+        data=body,
+        headers={
+            "Authorization": f"Bot {token}",
+            "Content-Type": content_type,
+            "User-Agent": "legal-redactor/0.1",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body_text = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Discord 发送失败: HTTP {exc.code} {body_text}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Discord 发送失败: {exc}") from exc
+    return {
+        "message_id": str(data.get("id", "")),
+        "channel_id": str(data.get("channel_id", "")),
+    }
+
+
+def _multipart_form_data(fields: list[tuple[str, str, str | None, bytes]]) -> tuple[bytes, str]:
+    boundary = f"----legal-redactor-{next(tempfile._get_candidate_names())}"
+    chunks: list[bytes] = []
+    for name, content_type, filename, value in fields:
+        chunks.append(f"--{boundary}\r\n".encode("ascii"))
+        disposition = f'Content-Disposition: form-data; name="{name}"'
+        if filename:
+            disposition += f'; filename="{filename}"'
+        chunks.append(f"{disposition}\r\n".encode("utf-8"))
+        chunks.append(f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"))
+        chunks.append(value)
+        chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode("ascii"))
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def _suggest_case_location_from_filenames(
+    filenames: list[str],
+    search_roots: list[Path] | None = None,
+) -> dict[str, object]:
+    wanted = {Path(str(name)).name for name in filenames if str(name).strip()}
+    wanted = {name for name in wanted if name and not name.startswith("._")}
+    if not wanted:
+        return {"status": "no_filename"}
+
+    roots = search_roots or _case_location_search_roots()
+    matches: list[Path] = []
+    for root in roots:
+        matches.extend(_find_matching_files(root, wanted))
+        if len({path.parent.resolve() for path in matches}) > 1:
+            break
+
+    parent_dirs = sorted({path.parent.resolve() for path in matches})
+    if not parent_dirs:
+        return {"status": "not_found"}
+    if len(parent_dirs) > 1:
+        return {
+            "status": "ambiguous",
+            "matches": [str(path) for path in parent_dirs[:8]],
+        }
+
+    case_dir_path = parent_dirs[0]
+    return {
+        "status": "ok",
+        "case_folder": case_dir_path.name,
+        "case_root": str(case_dir_path.parent),
+        "matched_dir": str(case_dir_path),
+    }
+
+
+def _case_location_search_roots() -> list[Path]:
+    candidates: list[Path] = [
+        default_case_root(),
+        Path("~/Documents").expanduser(),
+        Path("~/Downloads").expanduser(),
+        Path("~/Desktop").expanduser(),
+    ]
+    volumes = Path("/Volumes")
+    if volumes.exists():
+        for volume in volumes.iterdir():
+            if volume.name.startswith("."):
+                continue
+            candidates.append(volume)
+            case_materials = volume / "案件资料"
+            if case_materials.exists():
+                candidates.insert(0, case_materials)
+
+    seen: set[Path] = set()
+    roots: list[Path] = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.expanduser().resolve()
+        except OSError:
+            continue
+        if resolved.exists() and resolved not in seen:
+            seen.add(resolved)
+            roots.append(resolved)
+    return roots
+
+
+def _find_matching_files(root: Path, wanted: set[str], *, max_depth: int = 5, max_entries: int = 30000) -> list[Path]:
+    matches: list[Path] = []
+    root = root.resolve()
+    visited = 0
+    for current, dirs, files in os.walk(root):
+        visited += len(dirs) + len(files)
+        if visited > max_entries:
+            break
+        current_path = Path(current)
+        depth = len(current_path.relative_to(root).parts)
+        dirs[:] = [item for item in dirs if not item.startswith(".") and item not in {"__pycache__", ".git", ".venv"}]
+        if depth >= max_depth:
+            dirs[:] = []
+        for filename in files:
+            if filename in wanted:
+                matches.append(current_path / filename)
+    return matches
 
 
 def _render_mapping_edit_rows(redaction_map: RedactionMap) -> str:
@@ -1237,6 +1567,21 @@ def _decode_text_bytes(data: bytes, filename: str) -> str:
             continue
     return data.decode("utf-8", errors="replace")
 
+
+def _suffix_for_filename(filename: str) -> str:
+    return "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ".txt"
+
+
+def _docx_bytes_to_text(data: bytes) -> str:
+    from docx import Document
+    doc = Document(BytesIO(data))
+    texts = [p.text for p in doc.paragraphs]
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                texts.extend(p.text for p in cell.paragraphs)
+    return "\n".join(texts)
+
 async def _read_restore_map_text(map_json: str, map_file: UploadFile | None) -> str:
     """读取还原映射表，支持直接粘贴 JSON 和上传 JSON 文件（包括加密映射表）。"""
     map_text = ""
@@ -1257,13 +1602,11 @@ async def _read_restore_map_text(map_json: str, map_file: UploadFile | None) -> 
 
 async def _read_upload_text(file: UploadFile) -> str:
     data = await file.read()
-    suffix = "." + file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ".txt"
+    suffix = _suffix_for_filename(file.filename)
     if suffix in (".txt", ".md"):
         return _decode_text_bytes(data, file.filename)
     if suffix == ".docx":
-        from docx import Document
-        doc = Document(BytesIO(data))
-        return "\n".join([p.text for p in doc.paragraphs])
+        return _docx_bytes_to_text(data)
     if suffix == ".pdf":
         try:
             from pypdf import PdfReader
@@ -1313,6 +1656,10 @@ def _form_list_value(values: list[str], index: int) -> str:
 
 def _data_download(filename: str, mime: str, content: str) -> str:
     return f"data:{mime};charset=utf-8,{urllib.parse.quote(content)}"
+
+
+def _binary_download(mime: str, content: bytes) -> str:
+    return f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}"
 
 
 def _documents_bundle_json(documents: list[RedactedDocument]) -> str:
@@ -1504,9 +1851,66 @@ def _page(title: str, body: str) -> str:
       var _tt;function toast(m,c){{var e=document.getElementById('toast');if(!e)return;e.textContent=m;e.className='toast '+(c||'');clearTimeout(_tt);requestAnimationFrame(function(){{e.classList.add('show');}});_tt=setTimeout(function(){{e.classList.remove('show');}},2500);}}
       window.addEventListener('message',function(e){{if(e.data&&e.data.type==='toast')toast(e.data.msg,e.data.cls==='warn'?'warn':'');}});
       (function(){{var ta=document.getElementById('text-input');if(!ta)return;ta.addEventListener('dragover',function(e){{e.preventDefault();ta.classList.add('dragover');}});ta.addEventListener('dragleave',function(){{ta.classList.remove('dragover');}});ta.addEventListener('drop',function(e){{e.preventDefault();ta.classList.remove('dragover');var f=e.dataTransfer.files[0];if(!f)return;if(['txt','md'].indexOf(f.name.split('.').pop().toLowerCase())<0){{toast('不支持 .'+f.name.split('.').pop(),'warn');return;}}var r=new FileReader();r.onload=function(){{ta.value=r.result;toast('已加载: '+f.name);}};r.readAsText(f,'UTF-8');}});}})();
+      (function(){{var input=document.getElementById('source-files');if(!input)return;input.addEventListener('change',async function(){{var names=Array.prototype.map.call(input.files||[],function(f){{return f.name;}});if(!names.length)return;try{{var resp=await fetch('/api/suggest-case-location',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{filenames:names}})}});var data=await resp.json();if(data.status==='ok'){{var root=document.getElementById('case-root-input');var folder=document.getElementById('case-folder-input');var sourceDir=document.getElementById('upload-source-dir-input');if(root)root.value=data.case_root||'';if(folder&&!folder.value.trim())folder.value=data.case_folder||'';if(sourceDir)sourceDir.value=data.matched_dir||'';toast('已识别案件目录: '+data.case_folder);}}}}catch(err){{console.debug(err);}}}});}})();
       function addBlankRow(btn){{var tb=btn.parentElement.querySelector('tbody');if(!tb)return;var rows=tb.querySelectorAll('tr');var last=rows[rows.length-1];var c=last.cloneNode(true);var n=rows.length;c.querySelectorAll('input,textarea').forEach(function(e){{if(e.name==='row_delete')e.value=n;if(e.name==='map_type')e.value='manual';if(e.name==='map_original'||e.name==='map_masked'||e.name==='map_role')e.value='';if(e.name==='map_source')e.value='manual';if(e.name==='map_confidence')e.value='1.0';if(e.name==='map_restore_by_default')e.value='1';e.checked=false;}});tb.appendChild(c);}}
       function saveRow(idx,btn){{var row=btn.closest('tr');var orig=row.querySelector('[name^=orig_]').value;var masked=row.querySelector('[name^=masked_]').value;fetch('/samples/update/'+idx,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{original:orig,masked:masked}})}}).then(function(r){{return r.json();}}).then(function(d){{toast(d.msg);}});}}
       function saveNewRow(total,btn){{var act=document.getElementById('new-action').value;var orig=document.getElementById('new-orig').value;var masked=document.getElementById('new-masked').value;if(!orig||!masked){{toast('请填写原文和替换为','warn');return;}}fetch('/samples/add',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:act,original:orig,masked:masked}})}}).then(function(r){{return r.json();}}).then(function(d){{toast(d.msg);setTimeout(function(){{location.reload();}},1000);}});}}
+
+      async function sendRedactedToDiscord(threadUrl, filename, textareaId, messageId, buttonEl) {{
+        var textEl = document.getElementById(textareaId);
+        var messageEl = document.getElementById(messageId);
+        var statusEl = buttonEl && buttonEl.dataset && buttonEl.dataset.statusId ? document.getElementById(buttonEl.dataset.statusId) : null;
+        if (!textEl || !textEl.value) {{
+          toast('没有可发送的脱敏内容', 'warn');
+          if (statusEl) statusEl.textContent = '没有可发送的脱敏内容';
+          return;
+        }}
+        var origText = '';
+        if (buttonEl) {{
+          buttonEl.disabled = true;
+          origText = buttonEl.textContent || buttonEl.innerText;
+          buttonEl.textContent = '正在发送...';
+        }}
+        try {{
+          var resp = await fetch('/api/discord/send-redacted', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{
+              discord_thread_url: threadUrl,
+              filename: filename,
+              content: textEl.value,
+              message: messageEl ? messageEl.value : ''
+            }})
+          }});
+          var res = await resp.json();
+          if (resp.ok && res.status === 'success') {{
+            toast('已发送到 Discord 帖子');
+            if (statusEl) statusEl.textContent = '已发送到 Discord 帖子';
+          }} else {{
+            toast(res.message || 'Discord 发送失败', 'warn');
+            if (statusEl) statusEl.textContent = res.message || 'Discord 发送失败';
+          }}
+        }} catch (err) {{
+          toast('Discord 发送失败：' + err.message, 'warn');
+          if (statusEl) statusEl.textContent = 'Discord 发送失败：' + err.message;
+        }} finally {{
+          if (buttonEl) {{
+            buttonEl.disabled = false;
+            buttonEl.textContent = origText;
+          }}
+        }}
+      }}
+      document.addEventListener('click', function(e) {{
+        var btn = e.target && e.target.closest ? e.target.closest('.discord-send-button') : null;
+        if (!btn) return;
+        sendRedactedToDiscord(
+          btn.dataset.threadUrl || '',
+          btn.dataset.filename || 'redacted.txt',
+          btn.dataset.textareaId || 'redacted-output',
+          btn.dataset.messageId || '',
+          btn
+        );
+      }});
 
       // 本地直接保存 API 调用
       async function saveToLocalPath(files, buttonEl) {{
@@ -1636,4 +2040,3 @@ def _page(title: str, body: str) -> str:
       </script>
     </body>
     </html>"""
-

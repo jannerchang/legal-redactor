@@ -166,12 +166,11 @@ class RedactionProfile:
             )
         return profile
 
-MAX_EFFECT_LLM_MODEL = "batiai/qwen3.6-27b:iq4"
+MAX_EFFECT_LLM_MODEL = "qwen3.5:9b"
 MAX_EFFECT_FALLBACK_MODELS = (
-    "qwen3:30b",
-    "qwen2.5:7b-instruct-q8_0",
+    "batiai/qwen3.6-27b:iq4",
 )
-BALANCED_LLM_MODEL = "qwen2.5:7b-instruct-q8_0"
+BALANCED_LLM_MODEL = "qwen3.5:9b"
 BALANCED_FALLBACK_MODELS = ()
 
 

@@ -1,0 +1,5 @@
+{
+  "case_root": "/path/to/local/case-root",
+  "api_token": "replace-with-a-long-random-token",
+  "discord_bot_token": "optional-discord-bot-token-for-posting-redacted-files"
+}
