@@ -106,6 +106,9 @@ LOCATION_RE = re.compile(
     r"(?![个些么这那某每各全数余多近共约将整前在往到去赴与和同及当该此被原住扰乱维驳映范限])"
     r"[\u4e00-\u9fa5]{2,6}?(?:省|自治区|市|自治州|盟|(?<!小|校|厂|园|战|军|市|省|街|工|林|矿|片)区|县|旗|镇|乡|街道|(?<!名)村|社区)"
 )
+GRASSROOTS_ORG_RE = re.compile(
+    r"[\u4e00-\u9fa5]{2,30}?(?:村民委员会|居民委员会|村委会|居委会)"
+)
 ADDRESS_KEY_RE = re.compile(
     r"(?:住所地|住址|户籍地|经常居住地|送达地址|地址|住)"
     r"[：:]?\s*(?P<addr>[\u4e00-\u9fa5A-Za-z0-9（）()号幢栋单元室楼层路街弄巷村社区区县市省镇乡\-]{5,80})"
@@ -563,6 +566,29 @@ def detect_fallback_person_candidates(text: str) -> list[Candidate]:
 
 def detect_heuristic_ner_candidates(text: str) -> list[Candidate]:
     candidates: list[Candidate] = []
+    for match in GRASSROOTS_ORG_RE.finditer(text):
+        raw_value = match.group(0)
+        value = raw_value
+        leading_admin = re.match(r"^.*(?:省|市|区|县|旗|镇|乡|街道)(?P<leaf>[\u4e00-\u9fa5]{2,12}(?:村民委员会|居民委员会|村委会|居委会))$", value)
+        if leading_admin:
+            value = leading_admin.group("leaf")
+        if value in {"村村民委员会", "村村委会", "社区居民委员会", "社区居委会"}:
+            continue
+        start = match.start() + raw_value.rfind(value)
+        candidates.append(
+            Candidate(
+                type="grassroots_org",
+                text=value,
+                start=start,
+                end=start + len(value),
+                source="heuristic_grassroots_org",
+                confidence=0.86,
+                risk_level=risk_for("location"),
+                auto_redact=True,
+                reason="本地启发式基层组织识别",
+                metadata={"context": text[max(0, match.start() - 40) : min(len(text), match.end() + 40)]},
+            )
+        )
     for pattern, entity_type, reason, confidence in (
         (ORG_RE, "organization", "本地启发式组织机构识别", 0.84),
         (PROJECT_RE, "project", "本地启发式项目/工程/楼盘识别", 0.82),
@@ -570,6 +596,8 @@ def detect_heuristic_ner_candidates(text: str) -> list[Candidate]:
     ):
         for match in pattern.finditer(text):
             raw = match.group(0)
+            if entity_type == "organization" and raw.endswith(("村民委员会", "居民委员会", "村委会", "居委会")):
+                continue
             # ── 地名上下文过滤 ──
             if entity_type == "location" and _looks_like_false_location(text, match.start(), match.end(), raw):
                 continue
@@ -1344,6 +1372,8 @@ def _looks_like_false_location(text: str, start: int, end: int, raw: str) -> boo
         "",
         raw,
     )
+    if raw_stripped.endswith(("村民委员会", "居民委员会", "村委会", "居委会")):
+        return raw_stripped in {"村村民委员会", "村村委会", "社区居民委员会", "社区居委会"}
     if raw_stripped in {
         "省", "市", "区", "县", "镇", "乡", "村", "街道", "社区", "自治区", "自治州",
         "市甲", "省丙", "其他村", "我村村", "城中村", "安置区", "生活区",

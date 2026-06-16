@@ -26,6 +26,10 @@ from .models import Candidate, MappingEntry
 
 
 ADMIN_SUFFIXES = (
+    "居民委员会",
+    "村民委员会",
+    "居委会",
+    "村委会",
     "特别行政区",
     "自治区",
     "自治州",

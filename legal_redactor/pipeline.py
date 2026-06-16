@@ -1015,7 +1015,7 @@ class RedactionPipeline:
 
         if self.config.enable_heuristic_ner and profile.redact_locations:
             for candidate in detect_heuristic_ner_candidates(scan_text):
-                if candidate.type != "location" or candidate.text in sample_blacklist:
+                if candidate.type not in {"location", "grassroots_org"} or candidate.text in sample_blacklist:
                     continue
                 if any(
                     not (candidate.end <= start or candidate.start >= end)
