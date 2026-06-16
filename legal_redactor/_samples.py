@@ -288,15 +288,19 @@ def load_trusted_sample_mappings(samples_dir: str | Path | None = None) -> list[
             elif action == "modify":
                 original = entry.get("new_original", "")
                 masked = entry.get("new_masked", "")
+            elif action == "add" and _trusted_added_mapping_type(entry):
+                original = entry.get("original", "")
+                masked = entry.get("masked", "")
             else:
                 continue
 
             if not original or not masked or original in seen or original == masked:
                 continue
             seen.add(original)
+            mapping_type = _trusted_added_mapping_type(entry) or entry.get("type", "sample")
             mappings.append(
                 MappingEntry(
-                    type=entry.get("type", "sample"),
+                    type=mapping_type,
                     original=original,
                     masked=masked,
                     role=None,
@@ -307,6 +311,17 @@ def load_trusted_sample_mappings(samples_dir: str | Path | None = None) -> list[
             )
 
     return mappings
+
+
+def _trusted_added_mapping_type(entry: dict) -> str:
+    """Only promote added samples when they are a complete, low-ambiguity entity."""
+    if entry.get("action") != "add":
+        return ""
+    original = str(entry.get("original") or "")
+    masked = str(entry.get("masked") or "")
+    if original.endswith(("有限责任公司", "股份有限公司", "集团有限公司", "有限公司", "公司")) and masked.endswith("公司"):
+        return "organization"
+    return ""
 
 
 def _sample_files(samples_dir: str | Path | None = None) -> list[Path]:

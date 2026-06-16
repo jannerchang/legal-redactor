@@ -174,6 +174,8 @@ class HebeiAdminDivisionDetector:
         value = (text or "").strip()
         if not value or len(value) < 2:
             return
+        if _is_generic_grassroots_term(value):
+            return
         previous = terms.get(value)
         if previous is not None and previous.confidence >= confidence:
             return
@@ -241,6 +243,10 @@ def _is_short_local_name(term: AdminTerm) -> bool:
     if term.text.endswith(("村民委员会", "居民委员会", "村委会", "居委会")):
         return False
     return len(term.text) <= 2
+
+
+def _is_generic_grassroots_term(value: str) -> bool:
+    return value in {"村村民委员会", "村村委会", "社区居民委员会", "社区居委会"}
 
 
 def _can_overlap_admin_terms(term: AdminTerm, used_level: str) -> bool:
