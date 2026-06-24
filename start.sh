@@ -31,5 +31,8 @@ except ImportError as exc:
     ) from exc
 PY
 
-exec python -m uvicorn legal_redactor.web_app:app --host "$HOST" --port "$PORT"
+if [[ "${LEGAL_REDACTOR_SKIP_MLX:-0}" != "1" ]]; then
+  bash scripts/start_mlx9b_server.sh
+fi
 
+exec python -m uvicorn legal_redactor.web_app:app --host "$HOST" --port "$PORT"

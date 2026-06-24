@@ -38,7 +38,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "inputs",
         nargs="*",
-        help="要脱敏的文件路径（支持 .txt / .md / .docx / .pdf）",
+        help="要脱敏的文件路径（支持 .txt / .md / .doc / .docx / .pdf；.doc 建议走 Web 或先转换）",
     )
     parser.add_argument(
         "--batch", "-b",
@@ -49,13 +49,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--llm",
         choices=("max-effect", "balanced", "off"),
         default="max-effect",
-        help="本地 LLM 模式（需运行 Ollama）：max-effect / balanced / off（默认 max-effect）",
+        help="本地 LLM 模式；默认固定使用 MLX Qwen3.5 9B",
     )
     parser.add_argument(
         "--model",
         type=str,
         default=None,
-        help="自定义 Ollama 模型名，如 qwen3.5:9b",
+        help="兼容旧命令，当前已忽略，固定使用 MLX Qwen3.5 9B",
     )
     parser.add_argument(
         "--output-dir", "-o",

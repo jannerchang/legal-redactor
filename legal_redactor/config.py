@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 
 HIGH_RISK_TYPES = {
@@ -166,19 +166,18 @@ class RedactionProfile:
             )
         return profile
 
-MAX_EFFECT_LLM_MODEL = "qwen3.5:9b"
-MAX_EFFECT_FALLBACK_MODELS = (
-    "batiai/qwen3.6-27b:iq4",
-)
-BALANCED_LLM_MODEL = "qwen3.5:9b"
-BALANCED_FALLBACK_MODELS = ()
+MAX_EFFECT_LLM_MODEL = "mlx-community/Qwen3.5-9B-MLX-4bit"
+MAX_EFFECT_FALLBACK_MODELS: tuple[str, ...] = ()
+BALANCED_LLM_MODEL = MAX_EFFECT_LLM_MODEL
+BALANCED_FALLBACK_MODELS: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class LocalLLMConfig:
     enabled: bool = True
     role: str = "candidate_review_only"
-    backend_priority: tuple[str, ...] = ("ollama", "llama_cpp", "mlx")
+    backend: str = "mlx"
+    backend_priority: tuple[str, ...] = ("mlx",)
     mode: str = "max-effect"
     model: str = MAX_EFFECT_LLM_MODEL
     fallback_models: tuple[str, ...] = MAX_EFFECT_FALLBACK_MODELS
@@ -189,6 +188,8 @@ class LocalLLMConfig:
     fail_open: bool = True
     ollama_host: str = "127.0.0.1"
     ollama_port: int = 11434
+    mlx_host: str = "127.0.0.1"
+    mlx_port: int = 18080
 
 
 @dataclass(frozen=True)
@@ -209,6 +210,9 @@ class PipelineConfig:
     enable_hebei_admin_db: bool = True
     hebei_admin_db_path: str = "data/hebei_admin_divisions.sqlite"
     enable_heuristic_ner: bool = True
+    enable_hanlp_ner: bool = False
+    hanlp_model: str = "MSRA_NER_ELECTRA_SMALL_ZH"
+    hanlp_max_chars: int = 12000
     enable_local_llm: bool = True
     local_llm: LocalLLMConfig = field(default_factory=LocalLLMConfig)
     redaction_profile: RedactionProfile = field(default_factory=RedactionProfile.standard)
@@ -230,6 +234,7 @@ class PipelineConfig:
     @classmethod
     def max_effect(cls, profile_name: str = "standard") -> "PipelineConfig":
         llm = LocalLLMConfig(
+            role="sentence_entity_extraction",
             mode="max-effect",
             model=MAX_EFFECT_LLM_MODEL,
             fallback_models=MAX_EFFECT_FALLBACK_MODELS,
@@ -245,10 +250,11 @@ class PipelineConfig:
     @classmethod
     def balanced_llm(cls, profile_name: str = "standard") -> "PipelineConfig":
         llm = LocalLLMConfig(
+            role="sentence_entity_extraction",
             mode="balanced",
             model=BALANCED_LLM_MODEL,
             fallback_models=BALANCED_FALLBACK_MODELS,
-            context_window=32768,
+            context_window=8192,
             timeout_seconds=180,
         )
         return cls(
@@ -259,13 +265,10 @@ class PipelineConfig:
 
     @classmethod
     def from_llm_mode(cls, llm_mode: str, profile_name: str = "standard", model: str | None = None) -> "PipelineConfig":
+        # model is kept for backward-compatible callers, but runtime selection is fixed.
+        _ = model
         if llm_mode == "off":
             return cls.offline_without_llm(profile_name)
         if llm_mode == "balanced":
-            cfg = cls.balanced_llm(profile_name)
-        else:
-            cfg = cls.max_effect(profile_name)
-        if model:
-            llm = replace(cfg.local_llm, model=model)
-            cfg = replace(cfg, local_llm=llm)
-        return cfg
+            return cls.balanced_llm(profile_name)
+        return cls.max_effect(profile_name)

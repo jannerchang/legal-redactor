@@ -70,34 +70,39 @@ JSON 配置，避免手动复制 token/IP 到仓库文件。
 - 内存：24 GB
 - 系统：macOS 26.5.1
 - Python：3.13.2（项目 `.venv`）
-- Ollama：0.30.8
-- 默认本地审核模型：`qwen3.5:9b`（约 6.6 GB）
-- 疑难候选升级模型：`batiai/qwen3.6-27b:iq4`（约 15 GB）
+- MLX 运行时：`mlx_lm.server`
+- 固定本地审核模型：`mlx-community/Qwen3.5-9B-MLX-4bit`（约 5.6 GB）
+- MLX 模型缓存：`/Volumes/SSD2T/.cache/huggingface`
+- MLX 服务端口：`127.0.0.1:18080`
 - 默认 Web 端口：`127.0.0.1:7860`
 - Office 私网还原 API 端口：建议 `127.0.0.1:8787` 或 Tailscale 私网地址绑定
 
-实际使用中，默认 `max-effect` 模式先调用 `qwen3.5:9b` 做候选审核；
-该模型不可用或失败时，自动尝试 `batiai/qwen3.6-27b:iq4`。两者都不可用时，
+实际使用中，Web 端固定调用 MLX Qwen3.5 9B 做整句语义识别和候选审核；
+该模型服务不可用或调用失败时，
 系统降级为纯规则模式，仍可完成基础脱敏、映射保存、MCP 还原和 Discord 发帖流程。
 
 ## 安装与启动
 
 ```bash
 cd legal-redactor
-.venv/bin/pip install -r requirements.txt
-.venv/bin/pip install cryptography
+./start.sh --install-deps
 ```
 
 ### Web 界面
 
 ```bash
-.venv/bin/python -m legal_redactor --web
+./start.sh
 # 浏览器打开 http://127.0.0.1:7860
 ```
 
-支持拖拽 txt/md 文件到文本框、上传 docx、多文件批量处理（统一映射表）。
-脱敏时可以选填案件文件夹名和 Discord 帖子链接；填写后，脱敏文本和加密映射表
-会保存到本地案件库，供后续 Hermes/Discord 还原工作流使用。
+`start.sh` 会创建/复用 `.venv`，检查 Web 依赖，启动或复用
+`127.0.0.1:18080` 上的 MLX Qwen3.5 9B 服务，然后启动 WebUI。
+如果只想临时跳过 MLX，可设置 `LEGAL_REDACTOR_SKIP_MLX=1 ./start.sh`。
+
+Web 支持粘贴文本、拖拽 txt/md、上传 txt/md/doc/docx/pdf、多文件批量处理
+（统一映射表）。脱敏时可以选填或自动识别案件文件夹；填写或绑定 Discord
+帖子后，脱敏文本和加密映射表会保存到本地案件库，供后续 Hermes/Discord
+还原工作流使用。
 
 ### 命令行
 
@@ -143,6 +148,8 @@ cd legal-redactor
 本功能用于 Home Mac 上的 Hermes/Discord 和 Office Mac 上的本地脱敏系统协作：
 
 - Web 脱敏时可绑定案件文件夹和 Discord 帖子链接，生成 `manifest.json`。
+- Web 脱敏后也可以填写案由，一键请求 Hermes 新建 Discord 案件帖。
+- Hermes 写回帖子链接后，Web 可自动把脱敏附件和附言发送到绑定帖子。
 - Office Mac 只在本地保存原始材料、脱敏文件和加密映射表。
 - Home Mac 的 Hermes 通过 MCP adapter 调用 Office 私网 API。
 - 还原结果写回 Office Mac 的案件目录 `restored/`，MCP 响应不返回映射表或还原全文。
@@ -174,15 +181,35 @@ Hermes 工具调用只传 Discord thread id 和判决稿；Office Mac 根据本�
 
 ## 本地 LLM
 
-需安装 Ollama 并拉取模型：
+Web 启动脚本固定使用 MLX Qwen3.5 9B，不再在页面提供模型选择。首次部署需安装
+`mlx-lm`，并确保模型缓存位于 `/Volumes/SSD2T/.cache/huggingface`：
 
 ```bash
-ollama pull qwen3.5:9b                 # 默认候选审核模型
-ollama pull batiai/qwen3.6-27b:iq4    # 疑难候选升级模型
+uv tool install mlx-lm --python /opt/homebrew/bin/python3.11
+bash scripts/start_mlx9b_server.sh
 ```
 
-默认由 Qwen3.5 9B 审核低置信候选；调用失败时升级到 27B。两者均不可用时
+默认由 MLX Qwen3.5 9B 处理整句实体识别和低置信候选审核；模型服务不可用时
 自动降级为纯规则模式。LLM 不负责控制全文替换。
+
+当前 Web 端固定使用这一个模型，不再提供 9B/27B 或自定义模型选择。旧的
+Ollama 模型不参与默认流程。
+
+## HanLP 本地 NER
+
+Web 脱敏页可启用 HanLP 本地 NER 作为高速候选生成器。HanLP 只负责补充
+人名、地名、机构名候选，候选仍会进入现有线性规则、样本黑名单和 LLM
+校验流程；不会直接绕过映射规则。
+
+HanLP 是可选依赖，未安装时系统会跳过并继续使用现有规则。当前 HanLP
+兼容 `transformers<5`，项目的可选依赖已固定该约束：
+
+```bash
+.venv/bin/pip install '.[hanlp]'
+```
+
+默认模型名为 `MSRA_NER_ELECTRA_SMALL_ZH`。首次启用时 HanLP 会下载本地模型，
+因此需要预留磁盘空间和网络时间。
 
 ## 量化样本
 
@@ -216,5 +243,5 @@ config = PipelineConfig(strategy="legacy")
 
 ## 支持格式
 
-- 输入：`.txt` / `.md` / `.docx`
-- 输出：脱敏文本、加密映射表
+- 输入：`.txt` / `.md` / `.doc` / `.docx` / `.pdf`
+- 输出：脱敏文本、加密映射表、可选 Word 还原文件

@@ -14,6 +14,22 @@ def get_case_status_by_thread(discord_thread_id: str) -> dict[str, Any]:
     return _request("GET", f"/cases/by-discord-thread/{discord_thread_id}")
 
 
+def bind_discord_thread_to_case(
+    case_folder: str,
+    discord_thread_url: str,
+    source_dir: str | None = None,
+) -> dict[str, Any]:
+    return _request(
+        "POST",
+        "/cases/bind-discord-thread",
+        {
+            "case_folder": case_folder,
+            "discord_thread_url": discord_thread_url,
+            "source_dir": source_dir,
+        },
+    )
+
+
 def restore_judgment_from_thread(discord_thread_id: str, draft_text: str) -> dict[str, Any]:
     return _request(
         "POST",
@@ -24,7 +40,8 @@ def restore_judgment_from_thread(discord_thread_id: str, draft_text: str) -> dic
 
 def _request(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     config = load_json_config("LEGAL_REDACTOR_MCP_CONFIG", "mcp.local.json")
-    base_url = (os.environ.get("LEGAL_REDACTOR_API_URL") or config_value(config, "api_url")).rstrip("/")
+    raw_base_url = os.environ.get("LEGAL_REDACTOR_API_URL") or config_value(config, "api_url") or ""
+    base_url = raw_base_url.rstrip("/")
     token = os.environ.get("LEGAL_REDACTOR_API_TOKEN") or config_value(config, "api_token")
     if not base_url:
         return {"ok": False, "error": {"code": "missing_api_url"}}
@@ -85,6 +102,19 @@ def _run_fastmcp_stdio() -> bool:
 
         return json.dumps(get_case_status_by_thread(discord_thread_id), ensure_ascii=False)
 
+    @server.tool(name="bind_discord_thread_to_case")
+    def bind_discord_thread_to_case_tool(
+        case_folder: str,
+        discord_thread_url: str,
+        source_dir: str | None = None,
+    ) -> str:
+        """Bind a Discord thread URL to an Office Mac case manifest."""
+
+        return json.dumps(
+            bind_discord_thread_to_case(case_folder, discord_thread_url, source_dir),
+            ensure_ascii=False,
+        )
+
     server.run()
     return True
 
@@ -126,6 +156,19 @@ def _handle_jsonrpc(message: dict[str, Any]) -> dict[str, Any] | None:
                             "required": ["discord_thread_id"],
                         },
                     },
+                    {
+                        "name": "bind_discord_thread_to_case",
+                        "description": "Bind a Discord thread URL to an Office Mac case manifest.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "case_folder": {"type": "string"},
+                                "discord_thread_url": {"type": "string"},
+                                "source_dir": {"type": "string"},
+                            },
+                            "required": ["case_folder", "discord_thread_url"],
+                        },
+                    },
                 ]
             }
         elif method == "tools/call":
@@ -135,6 +178,8 @@ def _handle_jsonrpc(message: dict[str, Any]) -> dict[str, Any] | None:
                 result = {"content": [{"type": "text", "text": json.dumps(restore_judgment_from_thread(**arguments), ensure_ascii=False)}]}
             elif name == "get_case_status_by_thread":
                 result = {"content": [{"type": "text", "text": json.dumps(get_case_status_by_thread(**arguments), ensure_ascii=False)}]}
+            elif name == "bind_discord_thread_to_case":
+                result = {"content": [{"type": "text", "text": json.dumps(bind_discord_thread_to_case(**arguments), ensure_ascii=False)}]}
             else:
                 raise ValueError(f"unknown tool: {name}")
         else:

@@ -18,6 +18,7 @@ from .models import Candidate, MappingEntry
 SAMPLE_VERSION = "1.0"
 DEFAULT_SAMPLES_DIR = Path("samples")
 AUTO_SAMPLE_FILE = "_auto.sample.json"
+_PROVINCE_ABBRS = frozenset("京津冀晋蒙辽吉黑沪苏浙皖闽赣鲁豫鄂湘粤桂琼渝川贵云藏陕甘青宁新兵")
 
 
 def _auto_sample_path(samples_dir: str | Path = DEFAULT_SAMPLES_DIR) -> Path:
@@ -248,14 +249,14 @@ def load_all_samples(samples_dir: str | Path | None = None) -> tuple[dict[str, s
                 elif action in ("keep", "add"):
                     orig = entry.get("original", "")
                     masked = entry.get("masked", "")
-                    if orig and masked:
+                    if orig and masked and _sample_lookup_allowed(entry, orig, masked):
                         lookup[orig] = masked
                 elif action == "modify":
                     old = entry.get("old_original", "")
                     new = entry.get("new_original", "")
                     if old and old != new:
                         blacklist.add(old)
-                    if new and entry.get("new_masked"):
+                    if new and entry.get("new_masked") and _sample_lookup_allowed(entry, new, entry["new_masked"]):
                         lookup[new] = entry["new_masked"]
         except (json.JSONDecodeError, KeyError):
             continue
@@ -319,9 +320,62 @@ def _trusted_added_mapping_type(entry: dict) -> str:
         return ""
     original = str(entry.get("original") or "")
     masked = str(entry.get("masked") or "")
-    if original.endswith(("有限责任公司", "股份有限公司", "集团有限公司", "有限公司", "公司")) and masked.endswith("公司"):
+    if not _sample_lookup_allowed(entry, original, masked):
+        return ""
+    if _looks_like_sample_org(original, masked, str(entry.get("type") or "")):
         return "organization"
+    if _looks_like_sample_location(original, masked, str(entry.get("type") or "")):
+        return "location"
+    if _looks_like_sample_person(original, masked, str(entry.get("type") or "")):
+        return "person"
+    if _looks_like_sample_project(original, masked):
+        return "project"
     return ""
+
+
+def _sample_lookup_allowed(entry: dict, original: str, masked: str) -> bool:
+    if not original or not masked or original == masked:
+        return False
+    if len(original) == 1 and original in _PROVINCE_ABBRS:
+        return False
+    if str(entry.get("type") or "") == "case_number":
+        return False
+    return True
+
+
+def _looks_like_sample_org(original: str, masked: str, sample_type: str) -> bool:
+    if not masked.endswith(("公司", "集团")):
+        return False
+    if sample_type == "organization" and len(original) >= 2:
+        return True
+    return len(original) >= 3 and (
+        original.endswith(("有限责任公司", "股份有限公司", "集团有限公司", "有限公司", "公司", "集团"))
+        or "公司" in original
+        or "集团" in original
+    )
+
+
+def _looks_like_sample_location(original: str, masked: str, sample_type: str) -> bool:
+    if not masked.endswith(("省", "市", "区", "县", "镇", "乡", "村", "社区", "街道")):
+        return False
+    if sample_type == "location" and len(original) >= 2:
+        return True
+    if sample_type == "grassroots_org" and len(original) >= 2:
+        return True
+    return len(original) >= 2 and (
+        original.endswith(("省", "市", "区", "县", "镇", "乡", "村", "社区", "街道", "小区"))
+        or masked.endswith(("小区", "村", "镇", "县", "区", "市", "省"))
+    )
+
+
+def _looks_like_sample_person(original: str, masked: str, sample_type: str) -> bool:
+    if sample_type not in {"person", "manual"}:
+        return False
+    return 2 <= len(original) <= 4 and bool(re.fullmatch(r"[\u4e00-\u9fa5]某[\u4e00-\u9fa5]?", masked))
+
+
+def _looks_like_sample_project(original: str, masked: str) -> bool:
+    return len(original) >= 3 and masked.endswith(("小区", "项目", "工程"))
 
 
 def _sample_files(samples_dir: str | Path | None = None) -> list[Path]:

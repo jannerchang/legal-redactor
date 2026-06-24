@@ -84,17 +84,20 @@ ORG_RE = re.compile(
     # 3) 专业事务所
     r"[\u4e00-\u9fa5A-Za-z0-9·]{2,25}(?:律师事务所|会计师事务所)"
     r"|"
-    # 4) 机构/单位（需较长前缀防止误匹配）
+    # 4) 教育机构（幼儿园前缀通常较短，单独处理）
+    r"[\u4e00-\u9fa5]{2,30}(?:幼儿园)"
+    r"|"
+    # 5) 机构/单位（需较长前缀防止误匹配）
     r"[\u4e00-\u9fa5]{4,30}"
     r"(?:委员会|管理局|公安局|税务局|中心|医院|学校|银行)"
     r"|"
-    # 5) 个体工商户/经营部/商行/工作室
+    # 6) 个体工商户/经营部/商行/工作室
     r"[\u4e00-\u9fa5]{3,25}(?:个体工商户|经营部|商行|工作室)"
     r"|"
-    # 6) 带地名前缀的厂/店
+    # 7) 带地名前缀的厂/店
     r"[\u4e00-\u9fa5]{2,10}(?:省|市|区|县)[\u4e00-\u9fa5]{2,25}(?:厂|店)"
     r"|"
-    # 7) 通用公司名（不要求行政区划前缀）
+    # 8) 通用公司名（不要求行政区划前缀）
     r"[\u4e00-\u9fa5A-Za-z0-9()（）·]{2,45}(?:有限责任公司|股份有限公司|集团有限公司|有限公司)"
 )
 PROJECT_RE = re.compile(
@@ -254,7 +257,7 @@ def classify_entity(text: str, role: str | None = None) -> str:
         return "person"
     if "个体工商户" in text:
         return "individual_business"
-    if ORG_RE.fullmatch(text) or any(key in text for key in ("公司", "集团", "律师事务所", "合作社", "委员会", "管理局", "公安局", "税务局", "中心", "医院", "学校", "银行", "经营部", "商行", "工作室", "厂", "店")):
+    if ORG_RE.fullmatch(text) or any(key in text for key in ("公司", "集团", "律师事务所", "合作社", "委员会", "管理局", "公安局", "税务局", "中心", "医院", "学校", "幼儿园", "银行", "经营部", "商行", "工作室", "厂", "店")):
         return "organization"
     if PROJECT_RE.fullmatch(text):
         return "project"
@@ -440,7 +443,7 @@ _FALSE_PERSON_WORDS = frozenset({
     "部门", "块", "圈", "后", "没见", "见过章", "明确", "法庭",
     "包含", "施工", "法官", "齐齐", "利润", "时三方", "时到期", "时甲方", "时该条", "时还约",
     "水采暖", "水配管", "水管道", "水管清", "时期其", "应检测", "应实体", "安装费",
-    "安置方", "所说", "正义",
+    "安置方", "所说", "正义", "仲裁", "应以",
     # ── 新增：从715条黑名单分析出的高频误识别词 ──
     "通过", "经由", "经营", "劳动", "劳力", "劳务", "安装", "万元", "平房", "房屋",
     "应予", "应债", "应就", "应票", "应该", "应项", "应造价", "应商票", "应向",
@@ -448,6 +451,8 @@ _FALSE_PERSON_WORDS = frozenset({
     "公共", "公平", "公序", "公交", "司法", "制度", "维持", "驳回", "扰乱",
     "国家", "范围", "反映", "步推", "保护", "限制", "组织", "全面",
     "高水", "花架", "解协",
+    "同意", "不同意", "第一", "第二", "第三", "仲裁委", "仲裁时",
+    "包括", "作为", "案涉", "权限",
 })
 
 
@@ -488,6 +493,7 @@ def _is_false_person(value: str) -> bool:
     _TAIL_ACTION_CHARS = frozenset(
         "全均承提抗扣图聊反送担到打替找查验收据向属力监者称证过进内无赔手"
         "交破期满合范工费还详适关就形备规约债票项款应出"
+        "拨支负签协公"
     )
     if len(value) == 3 and value[-1] in _TAIL_ACTION_CHARS:
         return True
@@ -498,6 +504,13 @@ def _is_false_person(value: str) -> bool:
         return True
     # 排除包含常见助词、连词、语气代词等误匹配
     if any(p in value for p in ("的", "了", "在", "是", "去", "给", "有", "我", "你", "他", "们", "这", "那", "个", "对", "后", "做", "用")):
+        return True
+    if value.startswith((
+        "北京", "天津", "河北", "山西", "内蒙古", "辽宁", "吉林", "黑龙江",
+        "上海", "江苏", "浙江", "安徽", "福建", "江西", "山东", "河南",
+        "湖北", "湖南", "广东", "广西", "海南", "重庆", "四川", "贵州",
+        "云南", "西藏", "陕西", "甘肃", "青海", "宁夏", "新疆",
+    )):
         return True
     return False
 
@@ -598,9 +611,6 @@ def detect_heuristic_ner_candidates(text: str) -> list[Candidate]:
             raw = match.group(0)
             if entity_type == "organization" and raw.endswith(("村民委员会", "居民委员会", "村委会", "居委会")):
                 continue
-            # ── 地名上下文过滤 ──
-            if entity_type == "location" and _looks_like_false_location(text, match.start(), match.end(), raw):
-                continue
             if entity_type == "project":
                 value = _clean_project_text(raw)
             elif entity_type == "location":
@@ -611,10 +621,13 @@ def detect_heuristic_ner_candidates(text: str) -> list[Candidate]:
                 value = _clean_candidate_text(raw)
             if not value or value.startswith("某"):
                 continue
+            start = match.start() + match.group(0).find(value)
+            # ── 地名上下文过滤：先收窄“张三住某地”这类边界，再判断是否伪地名 ──
+            if entity_type == "location" and _looks_like_false_location(text, start, start + len(value), value):
+                continue
             # 过滤无品牌名的纯后缀/描述词公司名（如"家具有限公司"、"有限责任公司"）
             if entity_type == "organization" and _is_false_org(value):
                 continue
-            start = match.start() + match.group(0).find(value)
             if entity_type == "organization" and value.endswith("集团"):
                 next_index = start + len(value)
                 if next_index < len(text) and text[next_index] in "区县市":
@@ -667,7 +680,7 @@ _COMMON_SURNAME_CHARS = frozenset("赵钱孙李周吴郑王冯陈褚卫蒋沈韩
 def _is_false_org(value: str) -> bool:
     """检查清理后的公司名是否为误识别（如"家具有限公司"、"有限责任公司"）。"""
     # 纯法律后缀，无品牌
-    _pure_suffixes = {"有限责任公司", "股份有限公司", "集团有限公司", "有限公司", "公司", "集团"}
+    _pure_suffixes = {"有限责任公司", "股份有限公司", "集团有限公司", "有限公司", "公司", "集团", "幼儿园"}
     if value in _pure_suffixes:
         return True
     if "（" in value or "）" in value or "(" in value or ")" in value:
@@ -687,7 +700,8 @@ def _is_false_org(value: str) -> bool:
         "租赁", "出租", "派遣", "支付", "履行", "不服", "认为", "陈述", "答辩",
         "进行", "支持", "协助", "配合", "加盖", "盖章", "签章", "签字",
         "损害", "不接受", "返还", "交跟", "去跟", "发放", "归属", "使用",
-        "核对", "核实", "审查", "交给", "转给", "遵循", "通知", "依据", "根据"
+        "核对", "核实", "审查", "交给", "转给", "遵循", "通知", "依据", "根据",
+        "汇入", "聘用",
     )
     
     # 去掉法律后缀后，检查剩余部分
@@ -697,8 +711,14 @@ def _is_false_org(value: str) -> bool:
             # ── 过滤由常用代词、语气词或国家/通用指代代词构成的伪字号 ──
             if core in ("我", "你", "他", "本", "该", "贵", "此", "来我", "我去", "我区", "你区", "来", "中国", "中华", "全国", "地方", "本地", "其实", "确实", "事实", "真实", "证实", "落实", "实", "但是", "可是", "若是", "总是", "但", "并", "且", "及", "或", "已", "曾", "即", "就", "也", "都", "而",
                         "上", "下", "前", "后", "两", "两家", "三", "三家", "双", "各", "各家", "某", "某家", "一", "用", "指", "往", "去", "来", "分", "联", "劳动者", "单位",
-                        "两个", "三家", "二公司", "三公司", "多个", "几家", "见两个", "两个公司", "三家公司",
+                        "两个", "三家", "二公司", "三公司", "多个", "几家", "见两个", "两个公司", "三家公司", "外两家", "达等",
                         "任何", "刺破", "代", "备选机构", "机构", "股东用", "非", "说", "知", "解", "知天煜"):
+                return True
+            if len(core) < 2:
+                return True
+            if "我" in core or "两家" in core or core.endswith(("等", "等公司")):
+                return True
+            if core.endswith(("省", "市", "区", "县", "旗", "镇", "乡", "街道", "村", "社区")):
                 return True
             if re.fullmatch(r"[\u4e00-\u9fa5]{2,3}", core) and core[0] in _COMMON_SURNAME_CHARS:
                 return True
@@ -713,7 +733,9 @@ def _is_false_org(value: str) -> bool:
             # 核心以常见非品牌词结尾（如"购买家具"以"家具"结尾）
             for fb in _FALSE_ORG_BRANDS:
                 if core.endswith(fb) and len(core) > len(fb):
-                    return True
+                    prefix = core[: -len(fb)]
+                    if len(prefix) <= 2 or any(verb in prefix for verb in _action_verbs):
+                        return True
             break
     else:
         # 如果不带公司/集团后缀，直接检查 core 级别的非地理/动作词
@@ -999,6 +1021,11 @@ def _trim_address(value: str) -> str:
 def _clean_location_text(value: str) -> str:
     value = _clean_candidate_text(value)
     value = re.sub(
+        r"^[\u4e00-\u9fa5]{2,4}住(?=[\u4e00-\u9fa5]{2,20}(?:省|自治区|市|自治州|区|县|旗|镇|乡|街道|村|社区)$)",
+        "",
+        value,
+    )
+    value = re.sub(
         r"^(?:项目地点|项目|地点|住所地|住所|住址|户籍地|经常居住地|送达地址|地址|所在地|"
         r"坐落于|坐落|位于|前往|进驻|人员进驻|提交|提供|交|出|发|派|根据|按照|"
         r"涉及|合作开发|开发|投资实施|住|地)",
@@ -1014,7 +1041,7 @@ def _looks_like_placeholder_address(value: str) -> bool:
 
 
 def _looks_like_non_address(value: str) -> bool:
-    if re.search(r"(?:有限公司|公司|集团|委员会|居民委员会|村民委员会|合作社|经营部|商行|工作室|厂|店)", value):
+    if re.search(r"(?:有限公司|公司|集团|委员会|居民委员会|村民委员会|合作社|经营部|商行|工作室|幼儿园|厂|店)", value):
         return True
     if any(
         marker in value
@@ -1109,144 +1136,46 @@ def _clean_project_text(value: str) -> str:
 def _clean_organization_text(value: str) -> str:
     value = value.strip(" ：:，,。、；;\n\t（）()")
     value = _clean_unbalanced_brackets(value)
-    value = _clean_candidate_text(value)
+    value = re.sub(r"(有限责任公司|股份有限公司|集团有限公司|有限公司)公司$", r"\1", value)
     _org_sfx = ["有限责任公司","股份有限公司","集团有限公司","有限公司",
                 "律师事务所","会计师事务所","公司","集团","经营部",
                 "商行","工作室","委员会","管理局","公安局","税务局",
-                "中心","医院","学校","银行","个体工商户","厂","店"]
-    matched = ""
-    for sfx in sorted(_org_sfx, key=len, reverse=True):
-        if value.endswith(sfx):
-            core = value[:-len(sfx)]
-            matched = sfx
-            break
-    else:
-        core = value
-        matched = ""
-        
+                "中心","医院","学校","幼儿园","银行","个体工商户","厂","店"]
+    value = _clean_org_brackets(value.strip(" ：:，,。、；;\n\t"))
+    value = re.sub(
+        r"^(?:申诉人|被申诉人|原告(?:\d+)?|被告(?:\d+)?|第三人|申请人|被申请人|"
+        r"上诉人|被上诉人|再审申请人|再审被申请人|原审原告|原审被告)",
+        "",
+        value,
+    ).strip(" ：:，,。、；;\n\t")
+    value = re.sub(
+        r"^(?:和|及|与|、|，|,|；|;|"
+        r"原名|曾用名为|曾用名|原名称|简称为|简称|"
+        r"以下简称|下称)",
+        "",
+        value,
+    ).strip(" ：:，,。、；;\n\t")
+    matched = next((sfx for sfx in sorted(_org_sfx, key=len, reverse=True) if value.endswith(sfx)), "")
+    core = value[: -len(matched)] if matched else value
     if not core:
         return ""
-    core = core.strip(" ：:，,。、；;\n\t（）()")
-    # 1. 优先使用正则表达式剔除常见的误匹配前缀词（动词、介词、方位词等）
-    prefix_stopwords = [
-        r"^.*?诉称", r"^.*?辩称", r"^.*?查明", r"^.*?认为", r"^.*?主张", r"^.*?驳回",
-        r"^.*?要求", r"^.*?导致", r"^.*?致使", r"^.*?造成", r"^.*?提供", r"^.*?出具",
-        r"^.*?提交", r"^.*?提出", r"^.*?作出", r"^.*?进行", r"^.*?予以", r"^.*?共同",
-        r"^.*?各自", r"^.*?已经", r"^.*?尚未", r"^.*?不得", r"^.*?可以", r"^.*?应当",
-        r"^.*?由于", r"^.*?鉴于", r"^.*?按照", r"^.*?依照", r"^.*?根据", r"^.*?规定",
-        r"^.*?法律", r"^.*?事实", r"^.*?证据", r"^.*?案件", r"^.*?项目", r"^.*?生效后",
-        r"^.*?合同", r"^.*?判决", r"^.*?裁定", r"^.*?法院", r"^.*?本院",
-        r"^.*?被告", r"^.*?原告", r"^.*?申请人", r"^.*?被申请人", r"^.*?上诉人", r"^.*?被上诉人",
-        r"^.*?第三人", r"^.*?代理人", r"^.*?法定代表人", r"^.*?负责人", r"^.*?联系人", r"^.*?证人",
-        r"^.*?配合", r"^.*?影响", r"^.*?发生", r"^.*?算至", r"^.*?窃取", r"^.*?离开",
-        r"^.*?退出", r"^.*?纳入", r"^.*?限制", r"^.*?控制", r"^.*?担任", r"^.*?非法",
-        r"^.*?的", r"^.*?了",
-        r"^.*?在", r"^.*?由", r"^.*?将", r"^.*?向", r"^.*?或", r"^.*?和", r"^.*?与",
-        r"^.*?因", r"^.*?虽", r"^.*?也", r"^.*?都", r"^.*?只", r"^.*?却", r"^.*?又", 
-        r"^.*?而", r"^.*?但", r"^.*?且", r"^.*?其", r"^.*?据", r"^.*?按", r"^.*?以", 
-        r"^.*?已", r"^.*?该", r"^.*?此", r"^.*?上列", r"^.*?下列",
-        r"^.*?某", r"^.*?第", r"^.*?自", r"^.*?可", r"^.*?各", r"^.*?另", r"^.*?欠",
-        r"^.*?是", r"^.*?有", r"^.*?能", r"^.*?会", r"^.*?要", r"^.*?及", 
-        r"^.*?日", r"^.*?时", r"^.*?年", r"^.*?月", r"^.*?委托", r"^.*?参照", r"^.*?依据", 
-        r"^.*?维持", r"^.*?撤销", r"^.*?包括", r"^.*?属于", r"^.*?关于", r"^.*?经过", 
-        r"^.*?已经", r"^.*?并由", r"^.*?均由", r"^.*?应由", r"^.*?赔偿", r"^.*?支付", 
-        r"^.*?给付", r"^.*?收到", r"^.*?证明", r"^.*?判令", r"^.*?认定", r"^.*?上述", 
-        r"^.*?前述", r"^.*?下述", r"^.*?共计", r"^.*?交付", r"^.*?位于",
-        # ── 新增针对性清理口语动词、介词、前缀噪声 ──
-        r"^.*?去跟", r"^.*?去和", r"^.*?去与", r"^.*?去同", r"^.*?去", r"^.*?跟",
-        r"^.*?接管", r"^.*?违反", r"^.*?严重违反", r"^.*?继续违反",
-        r"^.*?加盖", r"^.*?盖章", r"^.*?签章", r"^.*?签字",
-        r"^.*?否返还", r"^.*?返还", r"^.*?退还", r"^.*?偿还",
-        r"^.*?不接受", r"^.*?拒绝", r"^.*?不予", r"^.*?接受", r"^.*?同意",
-        r"^.*?调函邮寄", r"^.*?邮寄", r"^.*?发送", r"^.*?送达",
-        r"^.*?往返", r"^.*?签订的", r"^.*?签署的", r"^.*?签订", r"^.*?签署",
-        r"^.*?其实", r"^.*?确实", r"^.*?事实", r"^.*?真实", r"^.*?证实", r"^.*?落实",
-        r"^.*?通知", r"^.*?请追加", r"^.*?身份系代表", r"^.*?解(?=[\u4e00-\u9fa5]{2,4}(?:公司|集团|有限))", r"^.*?见",
-        r"^.*?无权代表", r"^.*?无权指示", r"^.*?代表", r"^.*?借用", r"^.*?挂靠",
-        r"^.*?系借用", r"^.*?实际(?:上)?", r"^.*?即便", r"^.*?即", r"^.*?后来",
-        r"^.*?最终", r"^.*?显示", r"^.*?笔录系", r"^.*?代开发票",
-        r"^.*?无论", r"^.*?备选机构", r"^.*?机构", r"^.*?受",
-        r"^.*?系(?=[\u4e00-\u9fa5A-Za-z0-9()（）·]{2,45}$)",
-        r"^.*?解(?=[\u4e00-\u9fa5A-Za-z0-9()（）·]{2,45}$)",
-        r"^.*?说(?=[\u4e00-\u9fa5A-Za-z0-9()（）·]{2,45}$)",
-        r"^.*?非(?=[\u4e00-\u9fa5A-Za-z0-9()（）·]{2,45}$)",
-        r"^.*?系(?=[\u4e00-\u9fa5A-Za-z0-9()（）·]{2,45}(?:有限责任公司|股份有限公司|集团有限公司|有限公司|公司|集团|中心))",
-        r"^.*?解(?=[\u4e00-\u9fa5A-Za-z0-9()（）·]{2,45}(?:公司|集团|有限责任公司|有限公司))",
-        r"^.*?说(?=[\u4e00-\u9fa5A-Za-z0-9()（）·]{2,45}(?:公司|集团|有限责任公司|有限公司))",
-        r"^.*?非(?=[\u4e00-\u9fa5A-Za-z0-9()（）·]{2,45}(?:公司|集团|有限责任公司|有限公司))",
-    ]
-    prefix_stopwords.sort(key=len, reverse=True)
-    pattern = re.compile("|".join(prefix_stopwords))
-    while True:
-        match = pattern.match(core)
-        if match:
-            core = core[match.end():]
-        else:
-            break
-
-    # 2. 从右向左扫描，遇到"边界字"就截断（剔除了容易误杀的 上, 成, 建, 经, 本, 行 等字）
-    _boundary = set(
-        "一二三四五六七八九十百千万亿零"
-        "审判决策定令裁驳维撤申被原告被告"
-        "人诉称辩理证据查明认"
-        "院局委科室处部所会社司店工"
-        "的得地了对在由让使将向从到或和与及并就"
-        "为因虽也都只却又而但且其"
-        "据依照按以已该此下列每某"
-        "停故则第自就可方另它许必偿欠"
-        "是有能会要可以及"
-        "日时年月委托参照根据依据按照维持撤销"
-        "包括属于关于经过已经并由均由应由"
-        "赔偿支付给付收到证明导致致使"
-        "判令要求认定认为主张驳回"
-        "前述下述"
-        "共计交付位于"
-        "号路街巷弄栋幢单元楼层室"
-    )
-    _protected_compounds = (
-        "房地产", "建地", "场地", "用地", "基地", "土地", "工地",
-        "当地", "外地", "产地", "目的地", "所在地",
-        "社会", "社区", "行社", "合社",
-        "委会", "委员",
-        "建设", "建筑", "建材", "建工",
-        "工程", "工业", "工贸", "工艺",
-        "新能", "新材", "新型",
-        "经济", "经营", "经贸", "经纬",
-        "科技", "科学",
-        "实业", "实验",
-        "投资", "控股",
-        "策划", "决策",
-        "分行", "支行", "银行",
-        "上海", "北京", "重庆", "天津", "中国", "中华", "国际",
-        "中成", "四川", "发展", "商业", "农商", "浦东",
-        "人才", "人民", "物流",
-    )
-    def _is_protected(core_text: str, idx: int) -> bool:
-        for cw in _protected_compounds:
-            cw_start = core_text.find(cw)
-            while cw_start >= 0:
-                if cw_start <= idx < cw_start + len(cw):
-                    return True
-                cw_start = core_text.find(cw, cw_start + 1)
-        return False
-
-    for i in range(len(core) - 1, -1, -1):
-        if core[i] in _boundary and not _is_protected(core, i):
-            core = core[i+1:]
-            break
-    else:
-        if len(core) > 20:
-            core = core[-20:]
-            
-    if not core:
+    if core.startswith("名") and core[1:].startswith((
+        "北京", "天津", "河北", "山西", "内蒙古", "辽宁", "吉林", "黑龙江",
+        "上海", "江苏", "浙江", "安徽", "福建", "江西", "山东", "河南",
+        "湖北", "湖南", "广东", "广西", "海南", "重庆", "四川", "贵州",
+        "云南", "西藏", "陕西", "甘肃", "青海", "宁夏", "新疆",
+    )):
         return ""
-    value = (core + matched).strip(" ：:，,。、；;\n\t（）()")
-    value = _clean_unbalanced_brackets(value)
     if _looks_like_standalone_branch_company(value):
         return ""
     if value in ("公司","该公司","本公司","分公司"):
         return ""
     return value
+
+def _clean_org_brackets(value: str) -> str:
+    if value.count("（") == value.count("）") and value.count("(") == value.count(")"):
+        return value
+    return _clean_unbalanced_brackets(value)
 
 def _looks_like_standalone_branch_company(value: str) -> bool:
     return bool(re.fullmatch(r"[\u4e00-\u9fa5]{2,12}(?:市)?分公司", value))

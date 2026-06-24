@@ -24,9 +24,9 @@ def sort_mapping_entries(mappings: list["MappingEntry"]) -> list["MappingEntry"]
         mappings,
         key=lambda entry: (
             _MAPPING_TYPE_ORDER.get(entry.type, 9),
+            entry.masked or "",
             -len(entry.original or ""),
             entry.original or "",
-            entry.masked or "",
         ),
     )
 

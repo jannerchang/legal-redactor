@@ -74,6 +74,7 @@ class HebeiAdminDivisionDetector:
                         metadata={
                             "division_code": term.division_code,
                             "level": term.level,
+                            "canonical_name": term.canonical_name,
                             "context": text[max(0, index - 40) : min(len(text), end + 40)],
                         },
                     )
@@ -232,12 +233,18 @@ def _admin_suffix_count(text: str) -> int:
 
 def _direct_admin_short_aliases(level: str, name: str | None) -> list[str]:
     value = (name or "").strip()
+    if level == "province" and value.endswith("省") and len(value) >= 3:
+        return [value[:-1]]
     if level == "city" and value.endswith("市") and len(value) >= 3:
+        return [value[:-1]]
+    if level in {"county", "county_city"} and value.endswith(("区", "县", "市", "旗")) and len(value) >= 3:
         return [value[:-1]]
     return []
 
 
 def _is_short_local_name(term: AdminTerm) -> bool:
+    if term.level in {"county", "county_city"}:
+        return not term.text.endswith(("区", "县", "市", "旗")) and len(term.text) <= 3
     if term.level not in {"village", "community"}:
         return False
     if term.text.endswith(("村民委员会", "居民委员会", "村委会", "居委会")):
@@ -246,7 +253,10 @@ def _is_short_local_name(term: AdminTerm) -> bool:
 
 
 def _is_generic_grassroots_term(value: str) -> bool:
-    return value in {"村村民委员会", "村村委会", "社区居民委员会", "社区居委会"}
+    return value in {
+        "省", "市", "区", "县", "镇", "乡", "街道", "社区", "村",
+        "村村民委员会", "村村委会", "社区居民委员会", "社区居委会",
+    }
 
 
 def _can_overlap_admin_terms(term: AdminTerm, used_level: str) -> bool:

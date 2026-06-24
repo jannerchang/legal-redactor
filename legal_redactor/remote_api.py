@@ -7,6 +7,7 @@ from pathlib import Path
 from .cases import (
     CaseError,
     CaseNotFoundError,
+    create_or_update_manifest,
     default_case_root,
     find_case_by_discord_thread,
     manifest_public_status,
@@ -29,6 +30,12 @@ app = FastAPI(title="legal-redactor Office restore API", version="0.1.0")
 
 class RestoreTextRequest(BaseModel):
     draft_text: str
+
+
+class BindDiscordThreadRequest(BaseModel):
+    case_folder: str
+    discord_thread_url: str
+    source_dir: str | None = None
 
 
 def get_case_root() -> Path:
@@ -58,6 +65,22 @@ def case_status_by_thread(thread_id: str, _: None = Depends(require_api_token)) 
     except CaseError as exc:
         raise _http_error(exc) from exc
     return {"ok": True, **manifest_public_status(case_path, manifest)}
+
+
+@app.post("/cases/bind-discord-thread")
+def bind_discord_thread(
+    payload: BindDiscordThreadRequest,
+    _: None = Depends(require_api_token),
+) -> dict:
+    try:
+        return bind_discord_thread_to_case(
+            get_case_root(),
+            payload.case_folder,
+            payload.discord_thread_url,
+            source_dir=payload.source_dir,
+        )
+    except CaseError as exc:
+        raise _http_error(exc) from exc
 
 
 @app.post("/cases/by-discord-thread/{thread_id}/restore-text")
@@ -95,6 +118,23 @@ def restore_text_for_thread(case_root: str | Path, thread_id: str, draft_text: s
         "unresolved_placeholders": unresolved,
         "replacement_count": replacement_count,
     }
+
+
+def bind_discord_thread_to_case(
+    case_root: str | Path,
+    case_folder: str,
+    discord_thread_url: str,
+    *,
+    source_dir: str | None = None,
+) -> dict:
+    manifest = create_or_update_manifest(
+        case_root,
+        case_folder,
+        discord_thread_url,
+        source_dir=source_dir,
+    )
+    case_path, manifest = find_case_by_discord_thread(case_root, manifest.discord_thread_id)
+    return {"ok": True, **manifest_public_status(case_path, manifest)}
 
 
 def find_unresolved_placeholders(text: str, redaction_map) -> list[str]:
