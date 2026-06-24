@@ -19,6 +19,31 @@ SAMPLE_VERSION = "1.0"
 DEFAULT_SAMPLES_DIR = Path("samples")
 AUTO_SAMPLE_FILE = "_auto.sample.json"
 _PROVINCE_ABBRS = frozenset("京津冀晋蒙辽吉黑沪苏浙皖闽赣鲁豫鄂湘粤桂琼渝川贵云藏陕甘青宁新兵")
+_COMMON_SURNAME_CHARS = frozenset(
+    "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜"
+    "戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳史唐"
+    "费薛雷贺倪汤罗毕郝安常于时傅齐康伍余元顾孟平黄和萧尹姚邵汪祁毛"
+    "狄米明计成戴谈宋庞熊纪舒屈项祝董梁杜阮蓝季强贾路娄危江童颜郭梅盛林"
+    "钟徐邱骆高夏蔡田樊胡凌霍万柯管卢莫经房裘干解应宗丁宣邓郁单洪包诸左"
+    "石崔吉龚程邢裴陆荣翁惠甄曲家封储松段富巫焦巴弓秋仲伊宁仇暴甘厉戎祖"
+    "武符刘景詹龙叶幸司黎薄白从赖卓屠池乔阴能苍双闻党谭贡劳姬申冉郦"
+    "桂牛寿通边燕浦尚农温庄晏柴瞿阎慕连茹习艾向古易戈廖终居衡步都耿满弘"
+    "国文寇广禄阙东欧利师巩聂勾"
+)
+_COMMON_COMPOUND_SURNAMES = (
+    "欧阳", "司马", "上官", "夏侯", "诸葛", "闻人", "东方", "赫连", "皇甫", "尉迟",
+    "公羊", "澹台", "公冶", "宗政", "濮阳", "淳于", "单于", "太叔", "申屠", "公孙",
+    "仲孙", "轩辕", "令狐", "钟离", "宇文", "长孙", "慕容", "鲜于", "闾丘", "司徒",
+    "司空", "端木", "巫马", "公西", "漆雕", "乐正", "拓跋", "夹谷", "谷梁", "南宫",
+)
+_SHORT_PERSON_DELETE_SAFE_TYPES = {
+    "case_number",
+    "phone",
+    "id_number",
+    "bank_account",
+    "uscc",
+    "email",
+}
 
 
 def _auto_sample_path(samples_dir: str | Path = DEFAULT_SAMPLES_DIR) -> Path:
@@ -197,6 +222,26 @@ def _compact_entries(entries: list[dict]) -> list[dict]:
     return result
 
 
+def is_global_delete_sample_allowed(entry: dict) -> bool:
+    """Return whether a delete/old-original sample may suppress future matches globally."""
+    original = str(entry.get("original") or entry.get("old_original") or "").strip()
+    if not original:
+        return False
+    if str(entry.get("type") or "") in _SHORT_PERSON_DELETE_SAFE_TYPES:
+        return True
+    return not _looks_like_short_common_person_name(original)
+
+
+def _looks_like_short_common_person_name(value: str) -> bool:
+    if not re.fullmatch(r"[\u4e00-\u9fa5]{2,3}", value):
+        return False
+    if any(token in value for token in ("某", "公司", "法院", "项目", "工程")):
+        return False
+    if len(value) == 3 and value[:2] in _COMMON_COMPOUND_SURNAMES:
+        return True
+    return value[0] in _COMMON_SURNAME_CHARS
+
+
 def load_recent_error_samples(
     samples_dir: str | Path | None = None,
     limit: int = 100,
@@ -245,7 +290,8 @@ def load_all_samples(samples_dir: str | Path | None = None) -> tuple[dict[str, s
             for entry in data.get("entries", []):
                 action = entry.get("action", "keep")
                 if action == "delete":
-                    blacklist.add(entry.get("original", ""))
+                    if is_global_delete_sample_allowed(entry):
+                        blacklist.add(entry.get("original", ""))
                 elif action in ("keep", "add"):
                     orig = entry.get("original", "")
                     masked = entry.get("masked", "")
@@ -254,7 +300,7 @@ def load_all_samples(samples_dir: str | Path | None = None) -> tuple[dict[str, s
                 elif action == "modify":
                     old = entry.get("old_original", "")
                     new = entry.get("new_original", "")
-                    if old and old != new:
+                    if old and old != new and is_global_delete_sample_allowed({"type": entry.get("type", ""), "original": old}):
                         blacklist.add(old)
                     if new and entry.get("new_masked") and _sample_lookup_allowed(entry, new, entry["new_masked"]):
                         lookup[new] = entry["new_masked"]
@@ -441,7 +487,7 @@ def get_few_shot_examples(samples_dir: str | Path | None = None, max_examples: i
                 t = entry.get("type", "other")
                 if action == "delete":
                     orig = entry.get("original", "")
-                    if orig and len(orig) >= 2:
+                    if orig and len(orig) >= 2 and is_global_delete_sample_allowed(entry):
                         negative_examples.append({"original": orig, "type": t})
                 elif action in ("keep", "add", "modify"):
                     orig = entry.get("original") or entry.get("new_original", "")

@@ -903,7 +903,7 @@ async def save_sample_page(request: Request) -> str:
     map_source_file = form.get("map_source_file", "")
     original_mapping_json = form.get("original_mapping_json", "")
 
-    from ._samples import save_sample_auto
+    from ._samples import is_global_delete_sample_allowed, save_sample_auto
 
     try:
         original_data = json.loads(original_mapping_json) if original_mapping_json else {}
@@ -926,13 +926,18 @@ async def save_sample_page(request: Request) -> str:
 
     entries: list[dict] = []
     processed: set[str] = set()
+    skipped_risky_deletes: list[str] = []
     for i_str in deleted:
         try:
             i = int(i_str)
             if i < len(map_original):
                 orig = map_original[i].strip()
                 if orig and orig not in processed:
-                    entries.append({"action": "delete", "type": map_type[i] if i < len(map_type) else "other", "original": orig})
+                    entry = {"action": "delete", "type": map_type[i] if i < len(map_type) else "other", "original": orig}
+                    if is_global_delete_sample_allowed(entry):
+                        entries.append(entry)
+                    else:
+                        skipped_risky_deletes.append(orig)
                     processed.add(orig)
         except (ValueError, IndexError):
             continue
@@ -949,6 +954,8 @@ async def save_sample_page(request: Request) -> str:
             entries.append({"action": "add", "type": t, "original": orig, "masked": masked})
 
     if not entries:
+        if skipped_risky_deletes:
+            return HTMLResponse('<script>parent.postMessage({type:"toast",msg:"短中文人名未写入全局黑名单，请用修改映射或规则修正处理",cls:"warn"},"*")</script>')
         return HTMLResponse('<script>parent.postMessage({type:"toast",msg:"无变化，未追加"},"*")</script>')
 
     try:
@@ -960,6 +967,8 @@ async def save_sample_page(request: Request) -> str:
     new_count = sum(1 for e in entries if e["action"] in ("add", "modify"))
     del_count = sum(1 for e in entries if e["action"] == "delete")
     msg = f'已追加 {added} 条 | 匹配 {new_count} | 黑名单 {del_count}'
+    if skipped_risky_deletes:
+        msg += f' | 跳过短人名黑名单 {len(skipped_risky_deletes)}'
     return HTMLResponse(f'<script>parent.postMessage({{type:"toast",msg:{json.dumps(msg)}}},"*")</script>')
 
 
@@ -1101,7 +1110,7 @@ async def update_sample_entry(idx: int, request: Request) -> JSONResponse:
 
 @app.post("/samples/add")
 async def add_sample_entry(request: Request) -> JSONResponse:
-    from ._samples import _auto_sample_path, save_sample_auto
+    from ._samples import is_global_delete_sample_allowed, save_sample_auto
     body = await request.json()
     action = body.get("action", "add")
     orig = body.get("original", "").strip()
@@ -1109,7 +1118,10 @@ async def add_sample_entry(request: Request) -> JSONResponse:
     if not orig:
         return JSONResponse({"msg": "原文不能为空"}, status_code=400)
     if action == "delete":
-        save_sample_auto([{"action": "delete", "type": "manual", "original": orig}], source="samples_edit")
+        entry = {"action": "delete", "type": "manual", "original": orig}
+        if not is_global_delete_sample_allowed(entry):
+            return JSONResponse({"msg": "短中文人名不写入全局黑名单，请改用精确映射校准。"}, status_code=400)
+        save_sample_auto([entry], source="samples_edit")
     else:
         save_sample_auto([{"action": "add", "type": "manual", "original": orig, "masked": masked}], source="samples_edit")
     return JSONResponse({"msg": "已添加"})
