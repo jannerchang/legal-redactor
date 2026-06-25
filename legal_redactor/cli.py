@@ -29,6 +29,7 @@ def main(argv: list[str] | None = None) -> int:
         default="max-effect",
         help="本地 LLM 语义识别模式；max-effect 使用当前最高稳定本地模型",
     )
+    redact_parser.add_argument("--debug-trace", action="store_true", help="额外输出 debug_trace.json")
 
     restore_parser = subparsers.add_parser("restore", help="按 redaction_map 反向还原")
     restore_parser.add_argument("input", help="AI 修改后的脱敏文档")
@@ -41,6 +42,19 @@ def main(argv: list[str] | None = None) -> int:
     recent_errors_parser = samples_subparsers.add_parser("recent-errors", help="按时间查看最新错误样本")
     recent_errors_parser.add_argument("--limit", type=int, default=50, help="最多输出条数")
 
+    eval_parser = subparsers.add_parser("eval", help="用 gold set 评估识别率")
+    eval_parser.add_argument("gold", help="gold set JSON 路径")
+    eval_parser.add_argument("--out", default="", help="保存完整 JSON 报告的路径")
+    eval_parser.add_argument("--no-llm", action="store_true", help="禁用本地 LLM，评估离线规则")
+    eval_parser.add_argument(
+        "--llm-mode",
+        choices=("max-effect", "balanced", "off"),
+        default="max-effect",
+        help="评估使用的本地 LLM 模式",
+    )
+    eval_parser.add_argument("--fail-under-recall", type=float, default=None, help="低于该 recall 时返回非零")
+    eval_parser.add_argument("--fail-under-precision", type=float, default=None, help="低于该 precision 时返回非零")
+
     args = parser.parse_args(argv)
     if args.command == "redact":
         return _run_redact(args)
@@ -48,6 +62,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_restore(args)
     if args.command == "samples" and args.samples_command == "recent-errors":
         return _run_recent_errors(args)
+    if args.command == "eval":
+        return _run_eval(args)
     return 1
 
 
@@ -64,9 +80,16 @@ def _run_redact(args: argparse.Namespace) -> int:
     map_path = output_dir / "redaction_map.json"
     write_document(redacted_path, result.redacted_text)
     save_redaction_map(map_path, result.redaction_map)
+    if args.debug_trace:
+        from .debug_trace import debug_trace_to_json, redaction_debug_trace
+
+        trace_path = output_dir / "debug_trace.json"
+        trace_path.write_text(debug_trace_to_json(redaction_debug_trace(result)), encoding="utf-8")
 
     print(f"redacted: {redacted_path}")
     print(f"map: {map_path}")
+    if args.debug_trace:
+        print(f"debug_trace: {trace_path}")
     print(f"candidates: {len(result.candidates)}")
     if result.review_candidates:
         print(f"review_candidates: {len(result.review_candidates)}")
@@ -111,6 +134,34 @@ def _run_recent_errors(args: argparse.Namespace) -> int:
         original = entry.get("original", "")
         source = entry.get("last_source") or entry.get("source") or ""
         print(f"{updated_at}\t{entity_type}\t{original}\t{source}")
+    return 0
+
+
+def _run_eval(args: argparse.Namespace) -> int:
+    from .evaluation import evaluate_gold_file, evaluation_report_to_json
+
+    config = PipelineConfig.offline_without_llm() if args.no_llm else PipelineConfig.from_llm_mode(args.llm_mode)
+    report = evaluate_gold_file(args.gold, config=config)
+    print(
+        "cases={case_count} precision={precision:.4f} recall={recall:.4f} f1={f1:.4f} "
+        "tp={true_positive} fp={false_positive} fn={false_negative}".format(**report)
+    )
+    for case in report["cases"]:
+        if case["false_negative"] or case["false_positive"]:
+            print(
+                "- {name}: precision={precision:.4f} recall={recall:.4f} "
+                "missing={false_negative} extra={false_positive}".format(**case)
+            )
+    if args.out:
+        output_path = Path(args.out)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(evaluation_report_to_json(report), encoding="utf-8")
+        print(f"report: {output_path}")
+
+    if args.fail_under_recall is not None and report["recall"] < args.fail_under_recall:
+        return 2
+    if args.fail_under_precision is not None and report["precision"] < args.fail_under_precision:
+        return 2
     return 0
 
 

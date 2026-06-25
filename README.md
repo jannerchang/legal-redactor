@@ -213,6 +213,39 @@ HanLP 是可选依赖，未安装时系统会跳过并继续使用现有规则�
 默认模型名为 `MSRA_NER_ELECTRA_SMALL_ZH`。首次启用时 HanLP 会下载本地模型，
 因此需要预留磁盘空间和网络时间。
 
+## 识别率评估与调试
+
+可以用 gold set JSON 对脱敏结果做 Precision / Recall / F1 评估。gold set
+只需要列出期望识别的实体；`type` 可选，填写后会按类型严格匹配：
+
+```json
+{
+  "cases": [
+    {
+      "name": "case-001",
+      "text": "原告张三与被告星河建设有限公司签订施工合同。",
+      "expected": [
+        {"type": "person", "original": "张三"},
+        {"type": "organization", "original": "星河建设有限公司"}
+      ]
+    }
+  ]
+}
+```
+
+运行评估：
+
+```bash
+.venv/bin/python -m legal_redactor --eval-gold path/to/gold.json --eval-report output/eval-report.json
+# 或禁用本地 LLM，只评估规则兜底：
+.venv/bin/python -m legal_redactor --llm off --eval-gold path/to/gold.json
+```
+
+命令行脱敏可加 `--debug-trace` 输出 `debug_trace.json`；Web 结果页也提供
+`debug_trace.json` 下载按钮。该文件记录映射来源、置信度、复核候选、泄漏告警、
+每个映射在各文件中的出现次数，适合排查漏识别或边界漂移。它和映射表一样包含原文
+实体，不能上传到 Discord 或提交到 Git。
+
 ## 量化样本
 
 Web 结果页编辑映射表后点「保存为样本」，自动追加到 `samples/_auto.sample.json`。修改、删除、新增的记录全部保留：

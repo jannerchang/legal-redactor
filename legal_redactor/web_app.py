@@ -1289,12 +1289,32 @@ def _render_redaction_result(
 ) -> str:
     default_dir = save_dir.strip() or os.path.expanduser("~/Desktop")
     map_json = redaction_map_to_json(redaction_map)
+    from .debug_trace import debug_trace_from_parts, debug_trace_to_json
+
+    debug_json = debug_trace_to_json(
+        debug_trace_from_parts(
+            mode=redaction_map.mode,
+            source_file=redaction_map.source_file,
+            mappings=redaction_map.mappings,
+            documents=[
+                {
+                    "source_file": redaction_map.source_file,
+                    "original_text": original_text,
+                    "redacted_text": redacted_text,
+                }
+            ],
+            review_candidates=review_candidates,
+            leaks=leaks,
+            warnings=warnings,
+        )
+    )
     leaks_html = "".join(f"<li><strong>{html.escape(lk.type)}</strong>: <mark>{html.escape(lk.text)}</mark></li>" for lk in leaks)
     warnings_html = "".join(f"<li>{html.escape(w)}</li>" for w in warnings)
     redacted_filename = "redacted.txt"
     redacted_filename_json = json.dumps(redacted_filename, ensure_ascii=False)
     redacted_url = _data_download(redacted_filename, "text/plain", redacted_text)
     map_url = _data_download("redaction_map.json", "application/json", map_json)
+    debug_url = _data_download("debug_trace.json", "application/json", debug_json)
     discord_create_section = _discord_create_thread_section(
         discord_thread_url=discord_thread_url,
         case_root=case_root,
@@ -1319,6 +1339,7 @@ def _render_redaction_result(
         <div class="downloads">
           <a download="{html.escape(redacted_filename)}" href="{redacted_url}" class="btn">下载脱敏文本</a>
           <a download="redaction_map.json" href="{map_url}" class="btn btn-secondary">下载 redaction_map</a>
+          <a download="debug_trace.json" href="{debug_url}" class="btn btn-secondary">下载 debug_trace</a>
           <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制脱敏文本</button>
         </div>
         
@@ -1337,6 +1358,7 @@ def _render_redaction_result(
             <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px;">
               <button type="button" class="btn btn-sm" onclick="saveToLocalPath([{{filename: {html.escape(redacted_filename_json)}, content: document.getElementById('redacted-output').value}}], this)">保存脱敏文本</button>
               <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'redaction_map.json', content: document.getElementById('mapping-json-output').value}}], this)">保存映射表</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'debug_trace.json', content: document.getElementById('debug-trace-output').value}}], this)">保存调试追踪</button>
               <button type="button" class="btn btn-sm" style="background: #e18c12; border-color: #e18c12; color: #fff;" onclick="saveToLocalPath([{{filename: {html.escape(redacted_filename_json)}, content: document.getElementById('redacted-output').value}}, {{filename: 'redaction_map.json', content: document.getElementById('mapping-json-output').value}}], this)">一键保存全部</button>
             </div>
           </div>
@@ -1375,6 +1397,7 @@ def _render_redaction_result(
             <textarea name="original_text" class="hidden-raw">{html.escape(original_text)}</textarea>
             <textarea name="original_bundle_json" class="hidden-raw"></textarea>
             <textarea id="mapping-json-output" name="original_mapping_json" class="hidden-raw">{html.escape(map_json)}</textarea>
+            <textarea id="debug-trace-output" class="hidden-raw">{html.escape(debug_json)}</textarea>
             <input type="hidden" name="save_dir" value="{html.escape(save_dir)}">
             <input type="hidden" name="discord_thread_url" value="{html.escape(discord_thread_url)}">
             <input type="hidden" name="case_root" value="{html.escape(case_root)}">
@@ -1423,9 +1446,30 @@ def _render_batch_redaction_result(
     map_json = redaction_map_to_json(redaction_map)
     bundle_json = _documents_bundle_json(documents)
     combined_redacted = "\n\n".join(d.redacted_text for d in documents)
+    from .debug_trace import debug_trace_from_parts, debug_trace_to_json
+
+    debug_json = debug_trace_to_json(
+        debug_trace_from_parts(
+            mode=redaction_map.mode,
+            source_file=redaction_map.source_file,
+            mappings=redaction_map.mappings,
+            documents=[
+                {
+                    "source_file": document.source_file,
+                    "original_text": document.original_text,
+                    "redacted_text": document.redacted_text,
+                }
+                for document in documents
+            ],
+            review_candidates=review_candidates,
+            leaks=leaks,
+            warnings=warnings,
+        )
+    )
     leaks_html = "".join(f"<li><strong>{html.escape(lk.type)}</strong>: <mark>{html.escape(lk.text)}</mark></li>" for lk in leaks)
     warnings_html = "".join(f"<li>{html.escape(w)}</li>" for w in warnings)
     map_url = _data_download("redaction_map.json", "application/json", map_json)
+    debug_url = _data_download("debug_trace.json", "application/json", debug_json)
     combined_filename = "batch.redacted.txt"
     combined_filename_json = json.dumps(combined_filename, ensure_ascii=False)
     redacted_url = _data_download(combined_filename, "text/plain", combined_redacted)
@@ -1455,6 +1499,7 @@ def _render_batch_redaction_result(
         <div class="downloads">
           <a download="{combined_filename}" href="{redacted_url}" class="btn">下载合并脱敏文本</a>
           <a download="redaction_map.json" href="{map_url}" class="btn btn-secondary">下载统一映射表</a>
+          <a download="debug_trace.json" href="{debug_url}" class="btn btn-secondary">下载 debug_trace</a>
           <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制合并文本</button>
         </div>
         
@@ -1475,6 +1520,7 @@ def _render_batch_redaction_result(
             <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px;">
               <button type="button" class="btn btn-sm" onclick="saveToLocalPath([{{filename: {html.escape(combined_filename_json)}, content: document.getElementById('redacted-output').value}}], this)">保存合并文本</button>
               <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'redaction_map.json', content: document.getElementById('mapping-json-output').value}}], this)">保存统一映射表</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'debug_trace.json', content: document.getElementById('debug-trace-output').value}}], this)">保存调试追踪</button>
               <button type="button" class="btn btn-sm" style="background: #e18c12; border-color: #e18c12; color: #fff;" onclick="saveToLocalPath([{{filename: {html.escape(combined_filename_json)}, content: document.getElementById('redacted-output').value}}, {{filename: 'redaction_map.json', content: document.getElementById('mapping-json-output').value}}].concat(_individualRedactedFiles), this)">一键保存全部</button>
             </div>
           </div>
@@ -1503,6 +1549,7 @@ def _render_batch_redaction_result(
             <textarea name="original_text" class="hidden-raw"></textarea>
             <textarea name="original_bundle_json" class="hidden-raw">{html.escape(bundle_json)}</textarea>
             <textarea id="mapping-json-output" name="original_mapping_json" class="hidden-raw">{html.escape(map_json)}</textarea>
+            <textarea id="debug-trace-output" class="hidden-raw">{html.escape(debug_json)}</textarea>
             <input type="hidden" name="save_dir" value="{html.escape(save_dir)}">
             <input type="hidden" name="discord_thread_url" value="{html.escape(discord_thread_url)}">
             <input type="hidden" name="case_root" value="{html.escape(case_root)}">

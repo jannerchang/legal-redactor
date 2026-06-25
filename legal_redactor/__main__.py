@@ -85,6 +85,35 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="还原模式：第一个参数是 redaction_map.json，第二个是脱敏后的文件",
     )
+    parser.add_argument(
+        "--debug-trace",
+        action="store_true",
+        help="脱敏时额外输出 debug_trace.json，便于排查每个实体的来源和替换次数",
+    )
+    parser.add_argument(
+        "--eval-gold",
+        type=str,
+        default="",
+        help="运行识别率评估：传入 gold set JSON 路径",
+    )
+    parser.add_argument(
+        "--eval-report",
+        type=str,
+        default="",
+        help="评估时保存完整 JSON 报告的路径",
+    )
+    parser.add_argument(
+        "--eval-fail-under-recall",
+        type=float,
+        default=None,
+        help="评估 recall 低于该值时返回失败",
+    )
+    parser.add_argument(
+        "--eval-fail-under-precision",
+        type=float,
+        default=None,
+        help="评估 precision 低于该值时返回失败",
+    )
     return parser
 
 
@@ -94,6 +123,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.web:
         _start_web(args.host, args.port)
+
+    if args.eval_gold:
+        _do_eval(args)
+        return
 
     if args.restore:
         if len(args.inputs) < 2:
@@ -128,6 +161,12 @@ def _do_redact(args: argparse.Namespace) -> None:
         from .io import save_redaction_map_auto
         save_redaction_map_auto(str(map_path), result.redaction_map)
         print(f"[映射表] {map_path}")
+        if args.debug_trace:
+            from .debug_trace import batch_debug_trace, debug_trace_to_json
+
+            trace_path = session_dir / "debug_trace.json"
+            trace_path.write_text(debug_trace_to_json(batch_debug_trace(result)), encoding="utf-8")
+            print(f"[调试追踪] {trace_path}")
         _print_warnings_and_leaks(result.warnings, result.leaks)
     else:
         for input_path in input_paths:
@@ -142,6 +181,12 @@ def _do_redact(args: argparse.Namespace) -> None:
             from .io import save_redaction_map_auto
             save_redaction_map_auto(str(map_path), result.redaction_map)
             print(f"[映射表] {map_path}")
+            if args.debug_trace:
+                from .debug_trace import debug_trace_to_json, redaction_debug_trace
+
+                trace_path = session_dir / "debug_trace.json"
+                trace_path.write_text(debug_trace_to_json(redaction_debug_trace(result)), encoding="utf-8")
+                print(f"[调试追踪] {trace_path}")
             _print_warnings_and_leaks(result.warnings, result.leaks)
 
 
@@ -180,6 +225,32 @@ def _print_warnings_and_leaks(warnings: list[str], leaks: list) -> None:
         print(f"[高危泄漏] 脱敏后仍发现 {len(leaks)} 处高危字段，请人工核查：")
         for leak in leaks:
             print(f"  - {leak.type}: {leak.text}")
+
+
+def _do_eval(args: argparse.Namespace) -> None:
+    from .evaluation import evaluate_gold_file, evaluation_report_to_json
+
+    config = PipelineConfig.from_llm_mode(args.llm, profile_name="standard", model=args.model)
+    report = evaluate_gold_file(args.eval_gold, config=config)
+    print(
+        "[评估] cases={case_count} precision={precision:.4f} recall={recall:.4f} "
+        "f1={f1:.4f} tp={true_positive} fp={false_positive} fn={false_negative}".format(**report)
+    )
+    for case in report["cases"]:
+        if case["false_negative"] or case["false_positive"]:
+            print(
+                "  - {name}: precision={precision:.4f} recall={recall:.4f} "
+                "missing={false_negative} extra={false_positive}".format(**case)
+            )
+    if args.eval_report:
+        output_path = Path(args.eval_report)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(evaluation_report_to_json(report), encoding="utf-8")
+        print(f"[评估报告] {output_path}")
+    if args.eval_fail_under_recall is not None and report["recall"] < args.eval_fail_under_recall:
+        sys.exit(2)
+    if args.eval_fail_under_precision is not None and report["precision"] < args.eval_fail_under_precision:
+        sys.exit(2)
 
 
 def _start_web(host: str, port: int) -> None:
