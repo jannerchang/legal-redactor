@@ -18,6 +18,7 @@ def bind_discord_thread_to_case(
     case_folder: str,
     discord_thread_url: str,
     source_dir: str | None = None,
+    case_root: str | None = None,
 ) -> dict[str, Any]:
     return _request(
         "POST",
@@ -26,6 +27,7 @@ def bind_discord_thread_to_case(
             "case_folder": case_folder,
             "discord_thread_url": discord_thread_url,
             "source_dir": source_dir,
+            "case_root": case_root,
         },
     )
 
@@ -107,11 +109,12 @@ def _run_fastmcp_stdio() -> bool:
         case_folder: str,
         discord_thread_url: str,
         source_dir: str | None = None,
+        case_root: str | None = None,
     ) -> str:
         """Bind a Discord thread URL to an Office Mac case manifest."""
 
         return json.dumps(
-            bind_discord_thread_to_case(case_folder, discord_thread_url, source_dir),
+            bind_discord_thread_to_case(case_folder, discord_thread_url, source_dir, case_root),
             ensure_ascii=False,
         )
 
@@ -165,6 +168,7 @@ def _handle_jsonrpc(message: dict[str, Any]) -> dict[str, Any] | None:
                                 "case_folder": {"type": "string"},
                                 "discord_thread_url": {"type": "string"},
                                 "source_dir": {"type": "string"},
+                                "case_root": {"type": "string"},
                             },
                             "required": ["case_folder", "discord_thread_url"],
                         },

@@ -124,11 +124,19 @@ async def create_discord_thread(request: Request) -> JSONResponse:
     body = await request.json()
     case_folder = str(body.get("case_folder", "")).strip()
     case_cause = str(body.get("case_cause", "")).strip()
+    case_root = str(body.get("case_root", "")).strip()
+    source_dir = str(body.get("source_dir", "")).strip()
     if not case_folder:
         return JSONResponse({"status": "error", "message": "缺少案件文件夹名"}, status_code=400)
     request_id = str(body.get("request_id") or _new_discord_request_id())
     try:
-        command = _case_creation_command(case_folder, request_id, case_cause)
+        command = _case_creation_command(
+            case_folder,
+            request_id,
+            case_cause,
+            case_root=case_root,
+            source_dir=source_dir,
+        )
         result = _post_discord_channel_message(_discord_command_channel_id(), command)
     except RuntimeError as exc:
         return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
@@ -1724,15 +1732,25 @@ def _new_discord_request_id() -> str:
     return f"lr_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
 
 
-def _case_creation_command(case_folder: str, request_id: str, case_cause: str = "") -> str:
+def _case_creation_command(
+    case_folder: str,
+    request_id: str,
+    case_cause: str = "",
+    *,
+    case_root: str = "",
+    source_dir: str = "",
+) -> str:
     folder = case_folder.strip()
-    return "\n".join(
-        [
-            f"新建案件，{_case_creation_title(folder, case_cause)}",
-            f"请求ID：{request_id.strip() or _new_discord_request_id()}",
-            f"案件目录：{folder}",
-        ]
-    )
+    lines = [
+        f"新建案件，{_case_creation_title(folder, case_cause)}",
+        f"请求ID：{request_id.strip() or _new_discord_request_id()}",
+        f"案件目录：{folder}",
+    ]
+    if case_root.strip():
+        lines.append(f"案件根目录：{case_root.strip()}")
+    if source_dir.strip():
+        lines.append(f"原文件目录：{source_dir.strip()}")
+    return "\n".join(lines)
 
 
 def _case_creation_title(case_folder: str, case_cause: str = "") -> str:
@@ -2795,7 +2813,9 @@ def _page(title: str, body: str) -> str:
 	            headers: {{ 'Content-Type': 'application/json' }},
 		            body: JSON.stringify({{
 		              case_folder: payload.case_folder,
-		              case_cause: payload.case_cause
+		              case_cause: payload.case_cause,
+		              case_root: payload.case_root,
+		              source_dir: payload.source_dir
 		            }})
 	          }});
 	          var res = await resp.json();

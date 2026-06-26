@@ -7,6 +7,7 @@ from pathlib import Path
 from .cases import (
     CaseError,
     CaseNotFoundError,
+    CaseManifest,
     create_or_update_manifest,
     default_case_root,
     find_case_by_discord_thread,
@@ -36,6 +37,7 @@ class BindDiscordThreadRequest(BaseModel):
     case_folder: str
     discord_thread_url: str
     source_dir: str | None = None
+    case_root: str | None = None
 
 
 def get_case_root() -> Path:
@@ -61,7 +63,7 @@ def health() -> dict[str, str]:
 @app.get("/cases/by-discord-thread/{thread_id}")
 def case_status_by_thread(thread_id: str, _: None = Depends(require_api_token)) -> dict:
     try:
-        case_path, manifest = find_case_by_discord_thread(get_case_root(), thread_id)
+        case_path, manifest = find_case_by_thread(thread_id)
     except CaseError as exc:
         raise _http_error(exc) from exc
     return {"ok": True, **manifest_public_status(case_path, manifest)}
@@ -78,6 +80,7 @@ def bind_discord_thread(
             payload.case_folder,
             payload.discord_thread_url,
             source_dir=payload.source_dir,
+            case_root_override=payload.case_root,
         )
     except CaseError as exc:
         raise _http_error(exc) from exc
@@ -90,13 +93,19 @@ def restore_text_by_thread(
     _: None = Depends(require_api_token),
 ) -> dict:
     try:
-        return restore_text_for_thread(get_case_root(), thread_id, payload.draft_text)
+        case_path, manifest = find_case_by_thread(thread_id)
+        return restore_text_for_case(case_path, manifest, payload.draft_text)
     except CaseError as exc:
         raise _http_error(exc) from exc
 
 
 def restore_text_for_thread(case_root: str | Path, thread_id: str, draft_text: str) -> dict:
     case_path, manifest = find_case_by_discord_thread(case_root, thread_id)
+    return restore_text_for_case(case_path, manifest, draft_text)
+
+
+def restore_text_for_case(case_path: str | Path, manifest: CaseManifest, draft_text: str) -> dict:
+    case_path = Path(case_path)
     mapping_path = case_path / manifest.mapping_file
     if not mapping_path.exists():
         raise CaseNotFoundError("案件映射表不存在")
@@ -126,15 +135,88 @@ def bind_discord_thread_to_case(
     discord_thread_url: str,
     *,
     source_dir: str | None = None,
+    case_root_override: str | Path | None = None,
 ) -> dict:
-    manifest = create_or_update_manifest(
+    effective_case_root = _case_root_for_bind(
         case_root,
+        case_folder,
+        source_dir=source_dir,
+        case_root_override=case_root_override,
+    )
+    manifest = create_or_update_manifest(
+        effective_case_root,
         case_folder,
         discord_thread_url,
         source_dir=source_dir,
     )
-    case_path, manifest = find_case_by_discord_thread(case_root, manifest.discord_thread_id)
+    case_path, manifest = find_case_by_discord_thread(effective_case_root, manifest.discord_thread_id)
     return {"ok": True, **manifest_public_status(case_path, manifest)}
+
+
+def find_case_by_thread(thread_id: str) -> tuple[Path, CaseManifest]:
+    matches: dict[Path, CaseManifest] = {}
+    for root in _bind_case_root_candidates(get_case_root()):
+        try:
+            case_path, manifest = find_case_by_discord_thread(root, thread_id)
+        except CaseNotFoundError:
+            continue
+        matches[case_path.resolve()] = manifest
+    if not matches:
+        raise CaseNotFoundError("未找到绑定该 Discord 帖子的案件")
+    return max(matches.items(), key=lambda item: item[1].updated_at or "")
+
+
+def _case_root_for_bind(
+    configured_case_root: str | Path,
+    case_folder: str,
+    *,
+    source_dir: str | None = None,
+    case_root_override: str | Path | None = None,
+) -> Path:
+    if case_root_override and str(case_root_override).strip():
+        return Path(case_root_override).expanduser()
+
+    source_value = (source_dir or "").strip()
+    if source_value:
+        source_path = Path(source_value).expanduser()
+        if source_path.exists():
+            if source_path.name == case_folder.strip():
+                return source_path.parent
+            if (source_path / case_folder.strip()).exists():
+                return source_path
+
+    configured = Path(configured_case_root).expanduser()
+    for candidate in _bind_case_root_candidates(configured):
+        if (candidate / case_folder.strip()).exists():
+            return candidate
+    return configured
+
+
+def _bind_case_root_candidates(configured_case_root: Path) -> list[Path]:
+    candidates: list[Path] = [
+        configured_case_root,
+        default_case_root(),
+        Path("~/Documents/legal-redactor-cases").expanduser(),
+    ]
+    volumes = Path("/Volumes")
+    if volumes.exists():
+        for volume in volumes.iterdir():
+            if volume.name.startswith("."):
+                continue
+            case_materials = volume / "案件资料"
+            if case_materials.exists():
+                candidates.append(case_materials)
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.expanduser().resolve()
+        except OSError:
+            continue
+        if resolved not in seen:
+            seen.add(resolved)
+            roots.append(resolved)
+    return roots
 
 
 def find_unresolved_placeholders(text: str, redaction_map) -> list[str]:
