@@ -243,6 +243,7 @@ def manifest_public_status(case_path: str | Path, manifest: CaseManifest) -> dic
             latest_restored = {"filename": files[0].name, "path": str(files[0])}
     return {
         "case_folder": manifest.case_folder,
+        "discord_thread_url": manifest.discord_thread_url,
         "discord_thread_id": manifest.discord_thread_id,
         "redacted_file_count": len(manifest.redacted_files),
         "mapping_present": mapping_path.exists(),
