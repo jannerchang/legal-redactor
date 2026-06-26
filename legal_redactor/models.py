@@ -64,6 +64,7 @@ class MappingEntry:
     source: str
     confidence: float
     restore_by_default: bool
+    reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

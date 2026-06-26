@@ -843,6 +843,7 @@ async def apply_edited_map_page(request: Request) -> str:
     map_role = form.getlist("map_role")
     map_source = form.getlist("map_source")
     map_confidence = form.getlist("map_confidence")
+    map_reason = form.getlist("map_reason")
     map_restore_by_default = form.getlist("map_restore_by_default")
     row_delete = form.getlist("row_delete")
 
@@ -850,7 +851,8 @@ async def apply_edited_map_page(request: Request) -> str:
         version=map_version, created_at=map_created_at, mode=map_mode,
         source_file=map_source_file, map_type=map_type, map_original=map_original,
         map_masked=map_masked, map_role=map_role, map_source=map_source,
-        map_confidence=map_confidence, map_restore_by_default=map_restore_by_default,
+        map_confidence=map_confidence, map_reason=map_reason,
+        map_restore_by_default=map_restore_by_default,
         row_delete=row_delete,
     )
     pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
@@ -898,6 +900,7 @@ async def save_sample_page(request: Request) -> str:
     map_role = form.getlist("map_role")
     map_source = form.getlist("map_source")
     map_confidence = form.getlist("map_confidence")
+    map_reason = form.getlist("map_reason")
     map_restore_by_default = form.getlist("map_restore_by_default")
     row_delete = form.getlist("row_delete")
     map_source_file = form.get("map_source_file", "")
@@ -915,14 +918,18 @@ async def save_sample_page(request: Request) -> str:
     deleted = set(str(r) for r in row_delete)
     edited_index: dict[str, str] = {}
     edited_types: dict[str, str] = {}
+    edited_reasons: dict[str, str] = {}
     for i in range(max(len(map_original), len(map_masked))):
         if str(i) in deleted: continue
         orig = (map_original[i] if i < len(map_original) else "").strip()
         masked = (map_masked[i] if i < len(map_masked) else "").strip()
         t = (map_type[i] if i < len(map_type) else "other").strip()
+        reason = (map_reason[i] if i < len(map_reason) else "").strip()
         if orig and masked:
             edited_index[orig] = masked
             edited_types[orig] = t
+            if reason:
+                edited_reasons[orig] = reason
 
     entries: list[dict] = []
     processed: set[str] = set()
@@ -934,6 +941,9 @@ async def save_sample_page(request: Request) -> str:
                 orig = map_original[i].strip()
                 if orig and orig not in processed:
                     entry = {"action": "delete", "type": map_type[i] if i < len(map_type) else "other", "original": orig}
+                    reason = (map_reason[i] if i < len(map_reason) else "").strip()
+                    if reason:
+                        entry["reason"] = reason
                     if is_global_delete_sample_allowed(entry):
                         entries.append(entry)
                     else:
@@ -945,13 +955,20 @@ async def save_sample_page(request: Request) -> str:
         if orig in processed: continue
         processed.add(orig)
         t = edited_types.get(orig, "other")
+        reason = edited_reasons.get(orig, "")
         if orig in original_index:
             old_masked = original_index[orig].get("masked", "")
             if masked != old_masked:
-                entries.append({"action": "modify", "type": t, "old_original": orig, "new_original": orig, "old_masked": old_masked, "new_masked": masked})
+                entry = {"action": "modify", "type": t, "old_original": orig, "new_original": orig, "old_masked": old_masked, "new_masked": masked}
+                if reason:
+                    entry["reason"] = reason
+                entries.append(entry)
             # keep 条目不保存（识别正确的无需记录）
         else:
-            entries.append({"action": "add", "type": t, "original": orig, "masked": masked})
+            entry = {"action": "add", "type": t, "original": orig, "masked": masked}
+            if reason:
+                entry["reason"] = reason
+            entries.append(entry)
 
     if not entries:
         if skipped_risky_deletes:
@@ -976,6 +993,9 @@ def _diagnose_sample_entry(entry: dict) -> str:
     action = entry.get("action", "")
     orig = entry.get("original") or entry.get("new_original", "")
     masked = entry.get("masked") or entry.get("new_masked", "")
+    manual_reason = str(entry.get("reason") or "").strip()
+    if manual_reason:
+        return html.escape(manual_reason)
     
     if action == "delete":
         matched_rules = []
@@ -1039,6 +1059,7 @@ def edit_samples_page() -> str:
         orig = e.get("original") or e.get("new_original", "")
         masked = e.get("masked") or e.get("new_masked", "")
         old = e.get("old_original", "")
+        reason = e.get("reason", "")
         action_label = {"keep": "保留", "delete": "黑名单", "add": "新增", "modify": "修改"}.get(action, action)
         row_class = "style='opacity:.6'" if action == "delete" else ""
         row_diagnose = _diagnose_sample_entry(e)
@@ -1047,6 +1068,7 @@ def edit_samples_page() -> str:
           <td><input name="orig_{i}" value="{html.escape(orig)}" style="width:180px"></td>
           <td><input name="masked_{i}" value="{html.escape(masked)}" style="width:140px"></td>
           <td style="font-size:11px;color:var(--muted)">{html.escape(old)}</td>
+          <td><textarea name="reason_{i}" rows="2" style="width:220px" placeholder="为什么删除/修改/添加">{html.escape(reason)}</textarea></td>
           <td style="font-size:12px;color:var(--ink);max-width:320px;word-break:break-all">{row_diagnose}</td>
           <td>
             <button class="btn btn-sm" onclick="saveRow({i},this)">保存</button>
@@ -1058,6 +1080,7 @@ def edit_samples_page() -> str:
       <td><input id="new-orig" placeholder="原文" style="width:180px"></td>
       <td><input id="new-masked" placeholder="替换为" style="width:140px"></td>
       <td></td>
+      <td><textarea id="new-reason" rows="2" style="width:220px" placeholder="为什么新增/删除"></textarea></td>
       <td></td>
       <td><button class="btn btn-sm" onclick="saveNewRow({len(entries)},this)">＋</button></td>
     </tr>"""
@@ -1077,7 +1100,7 @@ def edit_samples_page() -> str:
           <h2>样本库（{len(entries)} 条）</h2>
           <p class="hint">编辑后自动保存。删除操作立即生效。</p>
           <table>
-            <thead><tr><th>类型</th><th>原文</th><th>替换为</th><th>旧值</th><th>诊断与优化分析</th><th>操作</th></tr></thead>
+            <thead><tr><th>类型</th><th>原文</th><th>替换为</th><th>旧值</th><th>修改理由</th><th>诊断与优化分析</th><th>操作</th></tr></thead>
             <tbody>{rows}</tbody>
           </table>
         </section>
@@ -1103,6 +1126,7 @@ async def update_sample_entry(idx: int, request: Request) -> JSONResponse:
         elif action == "modify":
             e["new_original"] = body.get("original", e.get("new_original", ""))
             e["new_masked"] = body.get("masked", e.get("new_masked", ""))
+        e["reason"] = body.get("reason", e.get("reason", "")).strip()
         save_sample_auto([e], source=e.get("source", "samples_edit"))
         return JSONResponse({"msg": "已保存"})
     return JSONResponse({"msg": "索引无效"}, status_code=400)
@@ -1115,15 +1139,23 @@ async def add_sample_entry(request: Request) -> JSONResponse:
     action = body.get("action", "add")
     orig = body.get("original", "").strip()
     masked = body.get("masked", "").strip()
+    reason = body.get("reason", "").strip()
     if not orig:
         return JSONResponse({"msg": "原文不能为空"}, status_code=400)
     if action == "delete":
         entry = {"action": "delete", "type": "manual", "original": orig}
+        if reason:
+            entry["reason"] = reason
         if not is_global_delete_sample_allowed(entry):
             return JSONResponse({"msg": "短中文人名不写入全局黑名单，请改用精确映射校准。"}, status_code=400)
         save_sample_auto([entry], source="samples_edit")
     else:
-        save_sample_auto([{"action": "add", "type": "manual", "original": orig, "masked": masked}], source="samples_edit")
+        if not masked:
+            return JSONResponse({"msg": "替换为不能为空"}, status_code=400)
+        entry = {"action": "add", "type": "manual", "original": orig, "masked": masked}
+        if reason:
+            entry["reason"] = reason
+        save_sample_auto([entry], source="samples_edit")
     return JSONResponse({"msg": "已添加"})
 
 
@@ -1408,7 +1440,7 @@ def _render_redaction_result(
             <input type="hidden" name="map_mode" value="{html.escape(redaction_map.mode)}">
             <input type="hidden" name="map_source_file" value="{html.escape(redaction_map.source_file or '')}">
             <table>
-              <thead><tr><th>类型</th><th>原文（精确匹配）</th><th>替换为</th><th>来源</th><th>置信度</th><th>操作</th></tr></thead>
+              <thead><tr><th>类型</th><th>原文（精确匹配）</th><th>替换为</th><th>修改理由</th><th>来源</th><th>置信度</th><th>操作</th></tr></thead>
               <tbody>{_render_mapping_edit_rows(redaction_map)}</tbody>
             </table>
             <button type="button" class="btn btn-secondary btn-sm" onclick="addBlankRow(this)" style="margin-bottom:12px">＋ 新增一行</button>
@@ -1560,7 +1592,7 @@ def _render_batch_redaction_result(
             <input type="hidden" name="map_mode" value="{html.escape(redaction_map.mode)}">
             <input type="hidden" name="map_source_file" value="{html.escape(redaction_map.source_file or '')}">
             <table>
-              <thead><tr><th>类型</th><th>原文</th><th>替换为</th><th>来源</th><th>置信度</th><th>操作</th></tr></thead>
+              <thead><tr><th>类型</th><th>原文</th><th>替换为</th><th>修改理由</th><th>来源</th><th>置信度</th><th>操作</th></tr></thead>
               <tbody>{_render_mapping_edit_rows(redaction_map)}</tbody>
             </table>
             <button type="button" class="btn btn-secondary btn-sm" onclick="addBlankRow(this)" style="margin-bottom:12px">＋ 新增一行</button>
@@ -1966,12 +1998,14 @@ def _render_mapping_edit_rows(redaction_map: RedactionMap) -> str:
 
 def _render_mapping_edit_row(index: int, entry: MappingEntry) -> str:
     role = entry.role or ""
+    reason = entry.reason or ""
     restore = "1" if entry.restore_by_default else "0"
     return f"""
         <tr>
           <td><input name="map_type" value="{html.escape(entry.type)}"></td>
           <td><textarea name="map_original" rows="2">{html.escape(entry.original)}</textarea></td>
           <td><textarea name="map_masked" rows="2">{html.escape(entry.masked)}</textarea></td>
+          <td><textarea name="map_reason" rows="2" placeholder="为什么删除/修改/添加">{html.escape(reason)}</textarea></td>
           <td>{html.escape(entry.source)}</td>
           <td>{entry.confidence:.2f}</td>
           <td><label class="inline"><input type="checkbox" name="row_delete" value="{index}"> 删除</label>
@@ -1990,6 +2024,7 @@ def _render_blank_mapping_row(index: int) -> str:
           <td><input name="map_type" value="manual" placeholder="person/org"></td>
           <td><textarea name="map_original" rows="2" placeholder="新增要替换的原文"></textarea></td>
           <td><textarea name="map_masked" rows="2" placeholder="替换为"></textarea></td>
+          <td><textarea name="map_reason" rows="2" placeholder="为什么新增这条"></textarea></td>
           <td>manual</td>
           <td>1.0</td>
           <td><label class="inline"><input type="checkbox" name="row_delete" value="{index}"> 删除</label>
@@ -2139,7 +2174,7 @@ def _redaction_map_from_rows(
     version: str, created_at: str, mode: str, source_file: str,
     map_type: list[str], map_original: list[str], map_masked: list[str],
     map_role: list[str], map_source: list[str], map_confidence: list[str],
-    map_restore_by_default: list[str], row_delete: list[str],
+    map_reason: list[str], map_restore_by_default: list[str], row_delete: list[str],
 ) -> RedactionMap:
     deleted = set(row_delete)
     row_count = max(len(map_original), len(map_masked), len(map_type))
@@ -2160,6 +2195,7 @@ def _redaction_map_from_rows(
             source=_form_list_value(map_source, index).strip() or "manual",
             confidence=confidence,
             restore_by_default=_form_list_value(map_restore_by_default, index) != "0",
+            reason=_form_list_value(map_reason, index).strip() or None,
         ))
     return RedactionMap(version=version or "1.0", created_at=created_at,
                         mode=mode or "normal", source_file=source_file or None, mappings=mappings)
@@ -2514,9 +2550,9 @@ def _page(title: str, body: str) -> str:
 	          }}
 	        }});
 	      }})();
-      function addBlankRow(btn){{var tb=btn.parentElement.querySelector('tbody');if(!tb)return;var rows=tb.querySelectorAll('tr');var last=rows[rows.length-1];var c=last.cloneNode(true);var n=rows.length;c.querySelectorAll('input,textarea').forEach(function(e){{if(e.name==='row_delete')e.value=n;if(e.name==='map_type')e.value='manual';if(e.name==='map_original'||e.name==='map_masked'||e.name==='map_role')e.value='';if(e.name==='map_source')e.value='manual';if(e.name==='map_confidence')e.value='1.0';if(e.name==='map_restore_by_default')e.value='1';e.checked=false;}});tb.appendChild(c);}}
-      function saveRow(idx,btn){{var row=btn.closest('tr');var orig=row.querySelector('[name^=orig_]').value;var masked=row.querySelector('[name^=masked_]').value;fetch('/samples/update/'+idx,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{original:orig,masked:masked}})}}).then(function(r){{return r.json();}}).then(function(d){{toast(d.msg);}});}}
-	      function saveNewRow(total,btn){{var act=document.getElementById('new-action').value;var orig=document.getElementById('new-orig').value;var masked=document.getElementById('new-masked').value;if(!orig||!masked){{toast('请填写原文和替换为','warn');return;}}fetch('/samples/add',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:act,original:orig,masked:masked}})}}).then(function(r){{return r.json();}}).then(function(d){{toast(d.msg);setTimeout(function(){{location.reload();}},1000);}});}}
+      function addBlankRow(btn){{var tb=btn.parentElement.querySelector('tbody');if(!tb)return;var rows=tb.querySelectorAll('tr');var last=rows[rows.length-1];var c=last.cloneNode(true);var n=rows.length;c.querySelectorAll('input,textarea').forEach(function(e){{if(e.name==='row_delete')e.value=n;if(e.name==='map_type')e.value='manual';if(e.name==='map_original'||e.name==='map_masked'||e.name==='map_role'||e.name==='map_reason')e.value='';if(e.name==='map_source')e.value='manual';if(e.name==='map_confidence')e.value='1.0';if(e.name==='map_restore_by_default')e.value='1';e.checked=false;}});tb.appendChild(c);}}
+      function saveRow(idx,btn){{var row=btn.closest('tr');var orig=row.querySelector('[name^=orig_]').value;var masked=row.querySelector('[name^=masked_]').value;var reasonEl=row.querySelector('[name^=reason_]');var reason=reasonEl?reasonEl.value:'';fetch('/samples/update/'+idx,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{original:orig,masked:masked,reason:reason}})}}).then(function(r){{return r.json();}}).then(function(d){{toast(d.msg);}});}}
+	      function saveNewRow(total,btn){{var act=document.getElementById('new-action').value;var orig=document.getElementById('new-orig').value;var masked=document.getElementById('new-masked').value;var reasonEl=document.getElementById('new-reason');var reason=reasonEl?reasonEl.value:'';if(!orig||(act!=='delete'&&!masked)){{toast(act==='delete'?'请填写原文':'请填写原文和替换为','warn');return;}}fetch('/samples/add',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:act,original:orig,masked:masked,reason:reason}})}}).then(function(r){{return r.json();}}).then(function(d){{toast(d.msg);setTimeout(function(){{location.reload();}},1000);}});}}
 
 	      (function(){{
 	        var menu=document.getElementById('selection-add-menu');
