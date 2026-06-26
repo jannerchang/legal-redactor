@@ -72,7 +72,7 @@ JSON 配置，避免手动复制 token/IP 到仓库文件。
 - Python：3.13.2（项目 `.venv`）
 - MLX 运行时：`mlx_lm.server`
 - 固定本地审核模型：`mlx-community/Qwen3.5-9B-MLX-4bit`（约 5.6 GB）
-- MLX 模型缓存：`/Volumes/SSD2T/.cache/huggingface`
+- MLX 模型缓存：`~/.cache/huggingface`
 - MLX 服务端口：`127.0.0.1:18080`
 - 默认 Web 端口：`127.0.0.1:7860`
 - Office 私网还原 API 端口：建议 `127.0.0.1:8787` 或 Tailscale 私网地址绑定
@@ -183,7 +183,8 @@ Hermes 工具调用只传 Discord thread id 和判决稿；Office Mac 根据本�
 ## 本地 LLM
 
 Web 启动脚本固定使用 MLX Qwen3.5 9B，不再在页面提供模型选择。首次部署需安装
-`mlx-lm`，并确保模型缓存位于 `/Volumes/SSD2T/.cache/huggingface`：
+`mlx-lm`，默认模型缓存位于本机 `~/.cache/huggingface`；如需临时改位置可设置
+`HF_HOME`：
 
 ```bash
 uv tool install mlx-lm --python /opt/homebrew/bin/python3.11

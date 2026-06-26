@@ -5,12 +5,13 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 HOST="${LEGAL_REDACTOR_MLX_HOST:-127.0.0.1}"
 PORT="${LEGAL_REDACTOR_MLX_PORT:-18080}"
 MODEL="mlx-community/Qwen3.5-9B-MLX-4bit"
-HF_HOME="${HF_HOME:-/Volumes/SSD2T/.cache/huggingface}"
+HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 LOG_FILE="${LEGAL_REDACTOR_MLX_LOG:-$ROOT_DIR/.mlx9b-server.log}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 export HF_HOME
 export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
+export COPYFILE_DISABLE="${COPYFILE_DISABLE:-1}"
 
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "缺少 $PYTHON_BIN，无法检测 MLX 服务端口。" >&2
@@ -62,6 +63,21 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
     raise SystemExit(0 if sock.connect_ex((host, port)) == 0 else 1)
 PY
 }
+
+clean_macos_appledouble_files() {
+  local model_cache_dir="$HF_HOME/hub/models--${MODEL//\//--}"
+  if [[ -d "$model_cache_dir" ]]; then
+    if command -v xattr >/dev/null 2>&1; then
+      xattr -cr "$model_cache_dir" 2>/dev/null || true
+    fi
+    if command -v dot_clean >/dev/null 2>&1; then
+      dot_clean -m "$model_cache_dir" >/dev/null 2>&1 || true
+    fi
+    find "$model_cache_dir" -name '._*' -type f -delete
+  fi
+}
+
+clean_macos_appledouble_files
 
 if check_mlx_health; then
   echo "MLX server already ready at http://$HOST:$PORT with ${MODEL}"
