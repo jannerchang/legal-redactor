@@ -2626,7 +2626,7 @@ def _page(title: str, body: str) -> str:
 	                body:JSON.stringify({{
 	                  selected_text:selectedText,
 	                  entity_type:btn.dataset.entityType,
-	                  map_json:mapEl.value||''
+	                  map_json:currentMappingJson(form,mapEl)
 	                }})
 	              }});
 	              var data=await resp.json();
@@ -2640,31 +2640,107 @@ def _page(title: str, body: str) -> str:
 	                hideMenu();
 	                return;
 	              }}
-	              appendMappingInputs(form,data.entry);
-	              toast('已添加映射：'+data.entry.original+' → '+data.entry.masked);
+	              appendMappingRow(form,data.entry);
+	              toast('已加入映射表：'+data.entry.original+' → '+data.entry.masked);
 	              hideMenu();
-	              setTimeout(function(){{form.submit();}},120);
 	            }}catch(err){{
 	              toast('添加映射失败：'+err.message,'warn');
 	              hideMenu();
 	            }}
 	          }});
 	        }}
-	        function appendHidden(form,name,value){{
+	        function rowValue(row,name){{
+	          var el=row.querySelector('[name="'+name+'"]');
+	          if(!el)return '';
+	          if(el.type==='checkbox')return el.checked?el.value:'';
+	          return el.value||'';
+	        }}
+	        function currentMappingJson(form,mapEl){{
+	          var base={{}};
+	          try{{base=JSON.parse(mapEl.value||'{{}}');}}catch(_err){{base={{}};}}
+	          var rows=form.querySelectorAll('tbody tr');
+	          var mappings=[];
+	          rows.forEach(function(row){{
+	            var deleted=row.querySelector('input[name="row_delete"]');
+	            if(deleted&&deleted.checked)return;
+	            var original=rowValue(row,'map_original').trim();
+	            var masked=rowValue(row,'map_masked').trim();
+	            if(!original||!masked)return;
+	            var confidence=parseFloat(rowValue(row,'map_confidence')||'1.0');
+	            mappings.push({{
+	              type:rowValue(row,'map_type').trim()||'manual',
+	              original:original,
+	              masked:masked,
+	              role:rowValue(row,'map_role').trim()||null,
+	              source:rowValue(row,'map_source').trim()||'manual',
+	              confidence:isNaN(confidence)?1.0:confidence,
+	              restore_by_default:rowValue(row,'map_restore_by_default')!=='0',
+	              reason:rowValue(row,'map_reason').trim()||null
+	            }});
+	          }});
+	          base.mappings=mappings;
+	          return JSON.stringify(base);
+	        }}
+	        function appendHidden(parent,name,value){{
 	          var input=document.createElement('input');
 	          input.type='hidden';
 	          input.name=name;
 	          input.value=value==null?'':String(value);
-	          form.appendChild(input);
+	          parent.appendChild(input);
 	        }}
-	        function appendMappingInputs(form,entry){{
-	          appendHidden(form,'map_type',entry.type||'manual');
-	          appendHidden(form,'map_original',entry.original||'');
-	          appendHidden(form,'map_masked',entry.masked||'');
-	          appendHidden(form,'map_role',entry.role||'');
-	          appendHidden(form,'map_source',entry.source||'manual_selection');
-	          appendHidden(form,'map_confidence',entry.confidence==null?'1.0':entry.confidence);
-	          appendHidden(form,'map_restore_by_default',entry.restore_by_default===false?'0':'1');
+	        function appendTextCell(row,name,value,rows,placeholder){{
+	          var cell=document.createElement('td');
+	          var input=rows?document.createElement('textarea'):document.createElement('input');
+	          input.name=name;
+	          if(rows)input.rows=rows;
+	          if(placeholder)input.placeholder=placeholder;
+	          input.value=value==null?'':String(value);
+	          cell.appendChild(input);
+	          row.appendChild(cell);
+	        }}
+	        function renumberMappingRows(tbody){{
+	          tbody.querySelectorAll('tr').forEach(function(row,index){{
+	            var del=row.querySelector('input[name="row_delete"]');
+	            if(del)del.value=String(index);
+	          }});
+	        }}
+	        function appendMappingRow(form,entry){{
+	          var tbody=form.querySelector('tbody');
+	          if(!tbody)return;
+	          var tr=document.createElement('tr');
+	          appendTextCell(tr,'map_type',entry.type||'manual',0,'person/org');
+	          appendTextCell(tr,'map_original',entry.original||'',2,'新增要替换的原文');
+	          appendTextCell(tr,'map_masked',entry.masked||'',2,'替换为');
+	          appendTextCell(tr,'map_reason','',2,'为什么新增这条');
+	          var sourceCell=document.createElement('td');
+	          sourceCell.textContent=entry.source||'manual_selection';
+	          tr.appendChild(sourceCell);
+	          var confidence=entry.confidence==null?1.0:entry.confidence;
+	          var confidenceCell=document.createElement('td');
+	          confidenceCell.textContent=Number(confidence).toFixed(2);
+	          tr.appendChild(confidenceCell);
+	          var actionCell=document.createElement('td');
+	          var label=document.createElement('label');
+	          label.className='inline';
+	          var checkbox=document.createElement('input');
+	          checkbox.type='checkbox';
+	          checkbox.name='row_delete';
+	          label.appendChild(checkbox);
+	          label.appendChild(document.createTextNode(' 删除'));
+	          actionCell.appendChild(label);
+	          appendHidden(actionCell,'map_role',entry.role||'');
+	          appendHidden(actionCell,'map_source',entry.source||'manual_selection');
+	          appendHidden(actionCell,'map_confidence',confidence);
+	          appendHidden(actionCell,'map_restore_by_default',entry.restore_by_default===false?'0':'1');
+	          tr.appendChild(actionCell);
+	          var rows=tbody.querySelectorAll('tr');
+	          var last=rows[rows.length-1];
+	          if(last&&!rowValue(last,'map_original').trim()&&!rowValue(last,'map_masked').trim()){{
+	            tbody.insertBefore(tr,last);
+	          }}else{{
+	            tbody.appendChild(tr);
+	          }}
+	          renumberMappingRows(tbody);
 	        }}
 	      }})();
 
