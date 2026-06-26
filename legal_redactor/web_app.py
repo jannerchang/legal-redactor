@@ -2710,39 +2710,48 @@ def _page(title: str, body: str) -> str:
 	        return new Promise(function(resolve) {{ setTimeout(resolve, ms); }});
 	      }}
 
+	      async function attachBoundDiscordThread(buttonEl, payload, statusEl, linkEl) {{
+	        var resp = await fetch('/api/discord/attach-bound-thread', {{
+	          method: 'POST',
+	          headers: {{ 'Content-Type': 'application/json' }},
+	          body: JSON.stringify(payload)
+	        }});
+	        var res = await resp.json();
+	        if (res.status === 'pending') {{
+	          return {{attached:false, message:res.message || '等待 Hermes 写回 Discord 帖子链接'}};
+	        }}
+	        if (resp.ok && res.status === 'success') {{
+	          toast('已绑定帖子并发送脱敏附件');
+	          if (statusEl) statusEl.textContent = '已绑定并发送: ' + res.thread_url;
+	          if (linkEl) {{
+	            linkEl.href = res.thread_url;
+	            linkEl.style.display = 'inline';
+	          }}
+	          document.querySelectorAll('input[name=discord_thread_url]').forEach(function(inp) {{
+	            inp.value = res.thread_url;
+	          }});
+	          buttonEl.dataset.boundThreadUrl = res.thread_url || '';
+	          buttonEl.textContent = '再次发送脱敏附件';
+	          buttonEl.disabled = false;
+	          return {{attached:true, thread_url:res.thread_url}};
+	        }}
+	        throw new Error(res.message || 'Discord 附件发送失败');
+	      }}
+
 	      async function waitForBoundDiscordThread(buttonEl, payload, statusEl, linkEl, origText) {{
 	        var maxAttempts = 40;
 	        for (var attempt = 1; attempt <= maxAttempts; attempt++) {{
-	          var resp = await fetch('/api/discord/attach-bound-thread', {{
-	            method: 'POST',
-	            headers: {{ 'Content-Type': 'application/json' }},
-	            body: JSON.stringify(payload)
-	          }});
-	          var res = await resp.json();
-	          if (res.status === 'pending') {{
-	            if (statusEl) statusEl.textContent = (res.message || '等待 Hermes 写回 Discord 帖子链接') + '（' + attempt + '/' + maxAttempts + '）';
+	          var bound = await attachBoundDiscordThread(buttonEl, payload, statusEl, linkEl);
+	          if (!bound.attached) {{
+	            if (statusEl) statusEl.textContent = bound.message + '（' + attempt + '/' + maxAttempts + '）';
 	            await discordWait(3000);
 	            continue;
 	          }}
-	          if (resp.ok && res.status === 'success') {{
-	            toast('已绑定帖子并发送脱敏附件');
-	            if (statusEl) statusEl.textContent = '已绑定并发送: ' + res.thread_url;
-	            if (linkEl) {{
-	              linkEl.href = res.thread_url;
-	              linkEl.style.display = 'inline';
-	            }}
-	            document.querySelectorAll('input[name=discord_thread_url]').forEach(function(inp) {{
-	              inp.value = res.thread_url;
-	            }});
-	            buttonEl.textContent = '已绑定并发送';
-	            buttonEl.disabled = true;
-	            return;
-	          }}
-	          throw new Error(res.message || 'Discord 附件发送失败');
+	          return;
 	        }}
 	        if (statusEl) statusEl.textContent = '等待超时：Hermes 尚未写回帖子链接，可稍后再点一次继续绑定';
 	        toast('等待 Hermes 写回超时', 'warn');
-	        buttonEl.textContent = origText;
+	        buttonEl.textContent = '继续检查并发送附件';
 	        buttonEl.disabled = false;
 	      }}
 
@@ -2763,8 +2772,8 @@ def _page(title: str, body: str) -> str:
         }}
 	        var origText = buttonEl.textContent || buttonEl.innerText;
 	        buttonEl.disabled = true;
-	        buttonEl.textContent = '正在请求 Hermes...';
-	        if (statusEl) statusEl.textContent = '';
+	        buttonEl.textContent = '正在检查绑定...';
+	        if (statusEl) statusEl.textContent = '正在检查是否已绑定 Discord 帖子...';
 	        var payload = {{
 	          case_root: buttonEl.dataset.caseRoot || '',
 	          case_folder: buttonEl.dataset.caseFolder || '',
@@ -2776,6 +2785,11 @@ def _page(title: str, body: str) -> str:
 	          message: messageEl ? messageEl.value : ''
 	        }};
 	        try {{
+	          var bound = await attachBoundDiscordThread(buttonEl, payload, statusEl, linkEl);
+	          if (bound.attached) {{
+	            return;
+	          }}
+	          buttonEl.textContent = '正在请求 Hermes...';
 	          var resp = await fetch('/api/discord/create-thread', {{
 	            method: 'POST',
 	            headers: {{ 'Content-Type': 'application/json' }},
