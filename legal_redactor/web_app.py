@@ -16,16 +16,33 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 from zipfile import BadZipFile
 
 from .config import PipelineConfig
-from .cases import CaseError, InvalidDiscordThreadError, case_dir, default_case_root, load_manifest, parse_discord_thread_id, persist_case_redaction
+from .cases import (
+    CaseError,
+    InvalidDiscordThreadError,
+    InvalidWorkflowInputError,
+    case_dir,
+    case_workflow_public,
+    default_case_root,
+    load_manifest,
+    manifest_fields_for_case_dir,
+    parse_discord_thread_id,
+    persist_case_redaction,
+    raise_for_forged_workflow_fields,
+    suggest_case_location_from_filenames as case_suggest_case_location_from_filenames,
+    validate_case_folder_name,
+    workflow_state_message,
+)
 from .counters import CN_ORDINALS, TypeCounters
 from .io import is_encrypted_map, load_redaction_map_encrypted, redaction_map_from_json, redaction_map_to_json
 from .local_config import config_value, load_json_config
 from .models import MappingEntry, RedactedDocument, RedactionMap
 from .pipeline import RedactionPipeline
 from .restore import preview_restore, restore_docx
+from .status import build_status_payload
 
 try:
     from fastapi import FastAPI, File, Form, Request, UploadFile
@@ -43,9 +60,104 @@ class InputDocument:
     text: str
 
 
+class DiscordApiError(RuntimeError):
+    code = "discord_api_error"
+
+
+MAPPING_REVIEW_CATEGORY_LABELS = {
+    "low_confidence": "低置信",
+    "manual_added": "手工新增",
+    "modified": "已修改",
+    "delete_candidate": "删除候选",
+    "restore_risk": "还原风险",
+    "sample_reused": "样本复用",
+}
+
+RESTORE_RISK_REASON_LABELS = {
+    "delete_candidate": "删除候选会影响后续黑名单和还原复核",
+    "restore_disabled": "该行默认不参与还原",
+    "empty_mask": "替换为空，无法可靠还原",
+    "risky_delete_guard": "短中文人名未写入全局黑名单",
+    "lookup_guard": "未进入可复用样本映射",
+}
+
+SAMPLE_SUMMARY_KEYS = (
+    "lookup_entries",
+    "delete_blacklist_candidates",
+    "suppressed_risky_entries",
+    "manual_corrections",
+    "false_positive_deletes",
+    "missing_adds",
+    "restore_unresolved_placeholders",
+    "newest_sample_provenance",
+    "regression_suggestions",
+)
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "bind_host": "127.0.0.1", "network": "offline"}
+
+
+@app.get("/api/status")
+def api_status() -> dict:
+    return _status_payload()
+
+
+def _reject_forged_workflow_fields(body: dict) -> JSONResponse | None:
+    try:
+        raise_for_forged_workflow_fields(body)
+    except InvalidWorkflowInputError as exc:
+        return JSONResponse(
+            {
+                "status": "error",
+                "code": exc.code,
+                "fields": exc.fields,
+                "message": str(exc),
+            },
+            status_code=400,
+        )
+    return None
+
+
+def _reject_forged_workflow_form_data(form: dict) -> HTMLResponse | None:
+    try:
+        raise_for_forged_workflow_fields(form)
+    except InvalidWorkflowInputError as exc:
+        return HTMLResponse(
+            _page(
+                "请求无效",
+                (
+                    f'<p class="error">INVALID_INPUT：请求包含不能由浏览器提交的工作流决策字段。</p>'
+                    f'<p class="hint">字段：{html.escape(", ".join(exc.fields))}</p>'
+                ),
+            ),
+            status_code=400,
+        )
+    return None
+
+
+def _case_error_response(message: str, *, code: str = "case_error", status_code: int = 400) -> JSONResponse:
+    return JSONResponse(
+        {
+            "status": "error",
+            "workflow_state": "attach_failed",
+            "code": code,
+            "message": _safe_public_error_message(message),
+        },
+        status_code=status_code,
+    )
+
+
+def _waiting_hermes_response() -> JSONResponse:
+    return JSONResponse(
+        {
+            "status": "pending",
+            "workflow_state": "waiting_hermes",
+            "message": "等待 Hermes 写回 Discord 帖子链接",
+        },
+        status_code=202,
+    )
 
 
 @app.post("/api/save-to-local")
@@ -92,56 +204,81 @@ async def save_to_local(request: Request) -> JSONResponse:
 @app.post("/api/suggest-case-location")
 async def suggest_case_location(request: Request) -> JSONResponse:
     body = await request.json()
+    invalid = _reject_forged_workflow_fields(body)
+    if invalid is not None:
+        return invalid
     filenames = body.get("filenames", [])
-    suggestion = _suggest_case_location_from_filenames(filenames)
+    roots = []
+    case_root = str(body.get("case_root", "")).strip()
+    if case_root:
+        roots.append(Path(case_root).expanduser())
+    suggestion = _suggest_case_location_from_filenames(
+        filenames,
+        roots or None,
+        source_dir=str(body.get("source_dir") or body.get("upload_source_dir") or "").strip(),
+        discord_thread_url=str(body.get("discord_thread_url", "")).strip(),
+    )
     return JSONResponse(suggestion)
 
 
 @app.post("/api/discord/send-redacted")
 async def send_redacted_to_discord(request: Request) -> JSONResponse:
     body = await request.json()
+    invalid = _reject_forged_workflow_fields(body)
+    if invalid is not None:
+        return invalid
     thread_url = str(body.get("discord_thread_url", "")).strip()
     filename = Path(str(body.get("filename", "redacted.txt"))).name or "redacted.txt"
     content = str(body.get("content", ""))
-    message = str(body.get("message", "")).strip()
     if not thread_url:
-        return JSONResponse({"status": "error", "message": "缺少 Discord 帖子链接"}, status_code=400)
+        return _case_error_response("缺少 Discord 帖子链接")
     if not content:
-        return JSONResponse({"status": "error", "message": "没有可发送的脱敏内容"}, status_code=400)
+        return _case_error_response("没有可发送的脱敏内容")
     try:
         thread_id = parse_discord_thread_id(thread_url)
     except InvalidDiscordThreadError as exc:
-        return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
+        return _case_error_response(str(exc), code=exc.code)
     try:
-        result = _post_discord_thread_file(thread_id, filename, content, message)
+        result = _post_discord_thread_file(
+            thread_id,
+            filename,
+            content,
+            _safe_discord_attachment_message(filename),
+        )
+    except DiscordApiError as exc:
+        return _case_error_response(str(exc), code=exc.code)
     except RuntimeError as exc:
-        return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
-    return JSONResponse({"status": "success", **result})
+        return _case_error_response(str(exc))
+    return JSONResponse({"status": "success", "workflow_state": "sent_discord", **result})
 
 
 @app.post("/api/discord/create-thread")
 async def create_discord_thread(request: Request) -> JSONResponse:
     body = await request.json()
+    invalid = _reject_forged_workflow_fields(body)
+    if invalid is not None:
+        return invalid
     case_folder = str(body.get("case_folder", "")).strip()
     case_cause = str(body.get("case_cause", "")).strip()
-    case_root = str(body.get("case_root", "")).strip()
-    source_dir = str(body.get("source_dir", "")).strip()
     if not case_folder:
-        return JSONResponse({"status": "error", "message": "缺少案件文件夹名"}, status_code=400)
+        return _case_error_response("缺少案件文件夹名")
     request_id = str(body.get("request_id") or _new_discord_request_id())
     try:
         command = _case_creation_command(
             case_folder,
             request_id,
             case_cause,
-            case_root=case_root,
-            source_dir=source_dir,
         )
         result = _post_discord_channel_message(_discord_command_channel_id(), command)
+    except CaseError as exc:
+        return _case_error_response(str(exc), code=getattr(exc, "code", "case_error"))
+    except DiscordApiError as exc:
+        return _case_error_response(str(exc), code=exc.code)
     except RuntimeError as exc:
-        return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
+        return _case_error_response(str(exc))
     return JSONResponse({
         "status": "pending",
+        "workflow_state": "waiting_hermes",
         "request_id": request_id,
         "command_message_id": result.get("message_id", ""),
         "channel_id": result.get("channel_id", ""),
@@ -152,40 +289,42 @@ async def create_discord_thread(request: Request) -> JSONResponse:
 @app.post("/api/discord/attach-bound-thread")
 async def attach_to_bound_discord_thread(request: Request) -> JSONResponse:
     body = await request.json()
+    invalid = _reject_forged_workflow_fields(body)
+    if invalid is not None:
+        return invalid
     case_folder = str(body.get("case_folder", "")).strip()
     case_root = str(body.get("case_root", "")).strip() or str(default_case_root())
     source_dir = str(body.get("source_dir", "")).strip() or None
     filename = Path(str(body.get("filename", "redacted.txt"))).name or "redacted.txt"
     content = str(body.get("content", ""))
-    message = str(body.get("message", "")).strip()
     map_json = str(body.get("map_json", ""))
     if not case_folder:
-        return JSONResponse({"status": "error", "message": "缺少案件文件夹名"}, status_code=400)
+        return _case_error_response("缺少案件文件夹名")
     if not content:
-        return JSONResponse({"status": "error", "message": "没有可发送的脱敏内容"}, status_code=400)
+        return _case_error_response("没有可发送的脱敏内容")
     try:
         case_path = case_dir(case_root, case_folder)
     except CaseError as exc:
-        return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
+        return _case_error_response(str(exc), code=getattr(exc, "code", "case_error"))
     try:
         manifest = load_manifest(case_path)
     except FileNotFoundError:
-        return JSONResponse({"status": "pending", "message": "等待 Hermes 写回 Discord 帖子链接"}, status_code=202)
+        return _waiting_hermes_response()
     except Exception as exc:
-        return JSONResponse({"status": "error", "message": f"案件 manifest 读取失败: {exc}"}, status_code=400)
+        return _case_error_response(f"案件 manifest 读取失败: {exc}")
     if not manifest.discord_thread_url:
-        return JSONResponse({"status": "pending", "message": "等待 Hermes 写回 Discord 帖子链接"}, status_code=202)
+        return _waiting_hermes_response()
     try:
         redaction_map = redaction_map_from_json(map_json)
     except Exception as exc:
-        return JSONResponse({"status": "error", "message": f"映射表解析失败: {exc}"}, status_code=400)
+        return _case_error_response(f"映射表解析失败: {exc}")
     try:
         thread_id = parse_discord_thread_id(manifest.discord_thread_url)
         result = _post_discord_thread_file(
             thread_id,
             filename=filename,
             content=content,
-            message=message,
+            message=_safe_discord_attachment_message(filename),
         )
         persist_case_redaction(
             case_root,
@@ -195,10 +334,13 @@ async def attach_to_bound_discord_thread(request: Request) -> JSONResponse:
             redaction_map,
             source_dir=source_dir,
         )
+    except DiscordApiError as exc:
+        return _case_error_response(str(exc), code=exc.code)
     except (CaseError, InvalidDiscordThreadError, RuntimeError) as exc:
-        return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
+        return _case_error_response(str(exc), code=getattr(exc, "code", "case_error"))
     return JSONResponse({
         "status": "success",
+        "workflow_state": "sent_discord",
         "thread_url": manifest.discord_thread_url,
         "thread_id": thread_id,
         "case_folder": case_folder,
@@ -240,10 +382,11 @@ def index() -> str:
     from ._samples import load_all_samples
     sample_lookup, sample_blacklist = load_all_samples()
     sample_info = ""
+    status_panel = _render_status_panel(_status_payload())
 
     return _page(
         "本地法律文书脱敏系统",
-        sample_info + f"""
+        status_panel + sample_info + f"""
         <section>
           <h2>脱敏</h2>
           <form action="/redact" method="post" enctype="multipart/form-data">
@@ -309,6 +452,44 @@ def index() -> str:
 
 def _hanlp_checked_attr() -> str:
     return "checked" if importlib.util.find_spec("hanlp") is not None else ""
+
+
+def _status_payload() -> dict:
+    return build_status_payload(mlx_timeout=0.4)
+
+
+def _render_status_panel(payload: dict) -> str:
+    components = payload.get("components", [])
+    rows = []
+    for item in components:
+        state = str(item.get("state", "missing"))
+        rows.append(
+            '<div class="status-item">'
+            f'<span class="status-pill status-{html.escape(state)}">{html.escape(_status_label(state))}</span>'
+            f'<strong>{html.escape(str(item.get("label", "")))}</strong>'
+            f'<span>{html.escape(str(item.get("message", "")))}</span>'
+            f'<small>{html.escape(str(item.get("action", "")))}</small>'
+            '</div>'
+        )
+    return f"""
+        <section class="status-panel" aria-label="系统状态">
+          <div class="status-head">
+            <h2>系统状态</h2>
+            <a href="/api/status" data-no-intercept="true">JSON</a>
+          </div>
+          <div class="status-grid">{''.join(rows)}</div>
+        </section>
+        """
+
+
+def _status_label(state: str) -> str:
+    return {
+        "ready": "就绪",
+        "degraded": "降级",
+        "missing": "缺失",
+        "error": "错误",
+        "skipped": "跳过",
+    }.get(state, state)
 
 
 @app.post("/analyze", response_class=HTMLResponse)
@@ -677,6 +858,7 @@ async def redact_confirmed_page(request: Request) -> str:
 
 @app.post("/redact", response_class=HTMLResponse)
 async def redact_page(
+    request: Request,
     text: str = Form(default=""),
     llm_mode: str = Form(default="max-effect"),
     enable_llm: str | None = Form(default=None),
@@ -692,6 +874,10 @@ async def redact_page(
     file: UploadFile | None = File(default=None),
     files: list[UploadFile] = File(default=[]),
 ) -> str:
+    form_invalid = _reject_forged_workflow_form_data(await request.form())
+    if form_invalid is not None:
+        return form_invalid
+
     try:
         documents = await _read_input_documents(text, file, files)
     except ValueError as exc:
@@ -833,6 +1019,10 @@ async def apply_map_page(
 @app.post("/redact/apply-edited-map", response_class=HTMLResponse)
 async def apply_edited_map_page(request: Request) -> str:
     form = await request.form()
+    form_invalid = _reject_forged_workflow_form_data(form)
+    if form_invalid is not None:
+        return form_invalid
+
     original_text = form.get("original_text", "")
     original_bundle_json = form.get("original_bundle_json", "")
     save_dir = str(form.get("save_dir", ""))
@@ -899,6 +1089,246 @@ async def apply_edited_map_page(request: Request) -> str:
     )
 
 
+def _source_indicates_manual(source: str) -> bool:
+    normalized = (source or "").strip().lower()
+    return normalized.startswith(("manual", "user", "selection"))
+
+
+def _source_indicates_sample(source: str) -> bool:
+    return "sample" in (source or "").strip().lower()
+
+
+def _review_candidate_text_set(review_candidates: list) -> set[str]:
+    values: set[str] = set()
+    for candidate in review_candidates or []:
+        text = getattr(candidate, "text", None)
+        if text:
+            values.add(str(text))
+    return values
+
+
+def _classify_mapping_review_row(
+    entry: MappingEntry,
+    *,
+    original_entry: dict[str, Any] | MappingEntry | None = None,
+    deleted: bool = False,
+    review_candidate_texts: set[str] | None = None,
+) -> list[str]:
+    categories: list[str] = []
+    review_candidate_texts = review_candidate_texts or set()
+    if entry.confidence < 0.85 or entry.original in review_candidate_texts:
+        categories.append("low_confidence")
+    if _source_indicates_manual(entry.source) or original_entry is None and entry.source not in {"rule", "regex", "llm"}:
+        categories.append("manual_added")
+    if original_entry is not None:
+        old_masked = original_entry.masked if isinstance(original_entry, MappingEntry) else str(original_entry.get("masked", ""))
+        if old_masked and old_masked != entry.masked:
+            categories.append("modified")
+    if deleted:
+        categories.append("delete_candidate")
+    if _restore_risk_reasons(entry, deleted=deleted):
+        categories.append("restore_risk")
+    if _source_indicates_sample(entry.source):
+        categories.append("sample_reused")
+    return [name for name in MAPPING_REVIEW_CATEGORY_LABELS if name in categories]
+
+
+def _restore_risk_reasons(entry: MappingEntry, *, deleted: bool = False) -> list[dict[str, str]]:
+    reasons: list[dict[str, str]] = []
+    if deleted:
+        reasons.append({
+            "reason_code": "delete_candidate",
+            "message": RESTORE_RISK_REASON_LABELS["delete_candidate"],
+        })
+    if not entry.restore_by_default:
+        reasons.append({
+            "reason_code": "restore_disabled",
+            "message": RESTORE_RISK_REASON_LABELS["restore_disabled"],
+        })
+    if not entry.masked:
+        reasons.append({
+            "reason_code": "empty_mask",
+            "message": RESTORE_RISK_REASON_LABELS["empty_mask"],
+        })
+    return reasons
+
+
+def _sample_entry_original(entry: dict[str, Any]) -> str:
+    if entry.get("action") == "modify":
+        return str(entry.get("new_original") or entry.get("old_original") or "")
+    return str(entry.get("original") or "")
+
+
+def _sample_entry_core(entry: dict[str, Any]) -> dict[str, str]:
+    keys = (
+        "action",
+        "type",
+        "original",
+        "masked",
+        "old_original",
+        "new_original",
+        "old_masked",
+        "new_masked",
+        "reason",
+    )
+    return {key: str(entry.get(key) or "") for key in keys if entry.get(key) not in (None, "")}
+
+
+def _sample_effective_delta(existing_entries: list[dict[str, Any]], incoming_entries: list[dict[str, Any]]) -> dict[str, int]:
+    existing_by_original = {
+        _sample_entry_original(entry): _sample_entry_core(entry)
+        for entry in existing_entries
+        if _sample_entry_original(entry)
+    }
+    delta = {"created": 0, "updated": 0, "unchanged": 0}
+    for entry in incoming_entries:
+        original = _sample_entry_original(entry)
+        if not original:
+            continue
+        current_core = _sample_entry_core(entry)
+        previous_core = existing_by_original.get(original)
+        if previous_core is None:
+            delta["created"] += 1
+        elif previous_core == current_core:
+            delta["unchanged"] += 1
+        else:
+            delta["updated"] += 1
+        existing_by_original[original] = current_core
+    return delta
+
+
+def _load_sample_entries_for_delta(samples_dir: str | Path | None = None) -> list[dict[str, Any]]:
+    from ._samples import _auto_sample_path
+
+    path = _auto_sample_path(samples_dir) if samples_dir is not None else _auto_sample_path()
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    entries = data.get("entries", [])
+    return entries if isinstance(entries, list) else []
+
+
+def _summary_item_from_entry(entry: dict[str, Any], *, action: str | None = None) -> dict[str, Any]:
+    actual_action = action or str(entry.get("action") or "")
+    if actual_action == "modify":
+        original = str(entry.get("new_original") or entry.get("old_original") or "")
+        masked = str(entry.get("new_masked") or entry.get("old_masked") or "")
+    else:
+        original = str(entry.get("original") or "")
+        masked = str(entry.get("masked") or "")
+    item = {
+        "action": actual_action,
+        "type": str(entry.get("type") or "other"),
+        "original": original,
+        "masked": masked,
+    }
+    reason = str(entry.get("reason") or "").strip()
+    if reason:
+        item["reason"] = reason
+    return item
+
+
+def _empty_sample_summary(source_file: str = "") -> dict[str, Any]:
+    return {
+        "lookup_entries": [],
+        "delete_blacklist_candidates": [],
+        "suppressed_risky_entries": [],
+        "manual_corrections": 0,
+        "false_positive_deletes": 0,
+        "missing_adds": 0,
+        "restore_unresolved_placeholders": None,
+        "newest_sample_provenance": {
+            "source": "web_ui",
+            "source_file_present": bool(source_file),
+        },
+        "regression_suggestions": [],
+    }
+
+
+def _sample_provenance(source_file: str = "", sample_path: str | Path | None = None) -> dict[str, Any]:
+    provenance: dict[str, Any] = {
+        "source": "web_ui",
+        "source_file_present": bool(source_file),
+    }
+    if sample_path:
+        path = Path(sample_path)
+        provenance["sample_file"] = path.name
+        try:
+            provenance["sample_updated_at"] = datetime.fromtimestamp(path.stat().st_mtime).isoformat()
+        except OSError:
+            provenance["sample_updated_at"] = None
+    return provenance
+
+
+def _build_sample_save_summary(
+    entries: list[dict[str, Any]],
+    *,
+    skipped_risky_entries: list[dict[str, Any]] | None = None,
+    source_file: str = "",
+    sample_path: str | Path | None = None,
+) -> dict[str, Any]:
+    from ._samples import is_sample_lookup_allowed
+
+    skipped_risky_entries = skipped_risky_entries or []
+    summary = _empty_sample_summary(source_file)
+    summary["newest_sample_provenance"] = _sample_provenance(source_file, sample_path)
+    for entry in entries:
+        action = str(entry.get("action") or "")
+        if action in {"add", "modify"}:
+            item = _summary_item_from_entry(entry, action=action)
+            lookup_entry = {
+                "action": action,
+                "type": item["type"],
+                "original": item["original"],
+                "masked": item["masked"],
+            }
+            if is_sample_lookup_allowed(entry, item["original"], item["masked"]):
+                summary["lookup_entries"].append(lookup_entry)
+            else:
+                summary["suppressed_risky_entries"].append({
+                    **lookup_entry,
+                    "reason_code": "lookup_guard",
+                    "message": RESTORE_RISK_REASON_LABELS["lookup_guard"],
+                })
+            if action == "add":
+                summary["missing_adds"] += 1
+        elif action == "delete":
+            item = _summary_item_from_entry(entry, action=action)
+            summary["delete_blacklist_candidates"].append({
+                "action": action,
+                "type": item["type"],
+                "original": item["original"],
+                "reason_code": "delete_candidate",
+                "message": RESTORE_RISK_REASON_LABELS["delete_candidate"],
+            })
+            summary["false_positive_deletes"] += 1
+    summary["suppressed_risky_entries"].extend(skipped_risky_entries)
+    summary["manual_corrections"] = len(entries) + len(skipped_risky_entries)
+    suggestions: list[str] = []
+    if entries or skipped_risky_entries:
+        suggestions.append(".venv/bin/python -m pytest tests/test_sample_integration.py")
+    if any(item.get("action") in {"add", "modify"} for item in entries):
+        suggestions.append(".venv/bin/python -m pytest tests/test_web_app.py")
+    summary["regression_suggestions"] = suggestions
+    return {key: summary[key] for key in SAMPLE_SUMMARY_KEYS}
+
+
+def _sample_summary_response(msg: str, summary: dict[str, Any], *, cls: str = "") -> HTMLResponse:
+    payload: dict[str, Any] = {
+        "type": "sample_summary",
+        "msg": msg,
+        "summary": summary,
+    }
+    if cls:
+        payload["cls"] = cls
+    return HTMLResponse(
+        f"<script>parent.postMessage({json.dumps(payload, ensure_ascii=False)},\"*\")</script>"
+    )
+
+
 @app.post("/redact/save-sample", response_class=HTMLResponse)
 async def save_sample_page(request: Request) -> str:
     form = await request.form()
@@ -914,6 +1344,7 @@ async def save_sample_page(request: Request) -> str:
     map_source_file = form.get("map_source_file", "")
     original_mapping_json = form.get("original_mapping_json", "")
 
+    from . import _samples as samples_module
     from ._samples import is_global_delete_sample_allowed, save_sample_auto
 
     try:
@@ -941,7 +1372,7 @@ async def save_sample_page(request: Request) -> str:
 
     entries: list[dict] = []
     processed: set[str] = set()
-    skipped_risky_deletes: list[str] = []
+    skipped_risky_deletes: list[dict[str, Any]] = []
     for i_str in deleted:
         try:
             i = int(i_str)
@@ -955,7 +1386,13 @@ async def save_sample_page(request: Request) -> str:
                     if is_global_delete_sample_allowed(entry):
                         entries.append(entry)
                     else:
-                        skipped_risky_deletes.append(orig)
+                        skipped_risky_deletes.append({
+                            "action": "delete",
+                            "type": entry["type"],
+                            "original": orig,
+                            "reason_code": "risky_delete_guard",
+                            "message": "短中文人名未写入全局黑名单",
+                        })
                     processed.add(orig)
         except (ValueError, IndexError):
             continue
@@ -979,22 +1416,43 @@ async def save_sample_page(request: Request) -> str:
             entries.append(entry)
 
     if not entries:
+        summary = _build_sample_save_summary(
+            entries,
+            skipped_risky_entries=skipped_risky_deletes,
+            source_file=str(map_source_file),
+        )
         if skipped_risky_deletes:
-            return HTMLResponse('<script>parent.postMessage({type:"toast",msg:"短中文人名未写入全局黑名单，请用修改映射或规则修正处理",cls:"warn"},"*")</script>')
-        return HTMLResponse('<script>parent.postMessage({type:"toast",msg:"无变化，未追加"},"*")</script>')
+            return _sample_summary_response(
+                "短中文人名未写入全局黑名单，请用修改映射或规则修正处理",
+                summary,
+                cls="warn",
+            )
+        return _sample_summary_response("无变化，未追加", summary)
+
+    existing_sample_entries = _load_sample_entries_for_delta(samples_module.DEFAULT_SAMPLES_DIR)
+    effective_delta = _sample_effective_delta(existing_sample_entries, entries)
 
     try:
-        save_sample_auto(entries, source=map_source_file or "web_ui")
+        sample_path = save_sample_auto(entries, source=map_source_file or "web_ui")
     except Exception as exc:
         return HTMLResponse(f'<script>parent.postMessage({{type:"toast",msg:"保存失败:{html.escape(str(exc))}",cls:"warn"}},"*")</script>')
 
-    added = len(entries)
     new_count = sum(1 for e in entries if e["action"] in ("add", "modify"))
     del_count = sum(1 for e in entries if e["action"] == "delete")
-    msg = f'已追加 {added} 条 | 匹配 {new_count} | 黑名单 {del_count}'
+    summary = _build_sample_save_summary(
+        entries,
+        skipped_risky_entries=skipped_risky_deletes,
+        source_file=str(map_source_file),
+        sample_path=sample_path,
+    )
+    msg = (
+        f'已处理 {len(entries)} 条 | 新增 {effective_delta["created"]} | '
+        f'更新 {effective_delta["updated"]} | 未变化 {effective_delta["unchanged"]} | '
+        f'匹配 {new_count} | 黑名单 {del_count}'
+    )
     if skipped_risky_deletes:
         msg += f' | 跳过短人名黑名单 {len(skipped_risky_deletes)}'
-    return HTMLResponse(f'<script>parent.postMessage({{type:"toast",msg:{json.dumps(msg)}}},"*")</script>')
+    return _sample_summary_response(msg, summary, cls="warn" if skipped_risky_deletes else "")
 
 
 def _diagnose_sample_entry(entry: dict) -> str:
@@ -1193,6 +1651,89 @@ def compact_samples_page() -> str:
     return _page("整理完成", '<p class="success">样本库已去重并优化。</p><nav><a href="/">返回首页</a></nav>')
 
 
+def _render_case_workflow_panel(
+    *,
+    case_root: str = "",
+    case_folder: str = "",
+    discord_thread_url: str = "",
+    saved_local: bool = False,
+    hermes_requested: bool = False,
+    attach_status: str = "",
+    attach_error: str | None = None,
+) -> str:
+    status = case_workflow_public(
+        case_root=case_root,
+        case_folder=case_folder,
+        discord_thread_url=discord_thread_url,
+        saved_local=saved_local,
+        hermes_requested=hermes_requested,
+        attach_status=attach_status,
+        attach_error=attach_error,
+    )
+    state = str(status.get("workflow_state", "not_saved"))
+    message = str(status.get("message") or workflow_state_message(state, attach_error=attach_error))
+    case_label = case_folder.strip() or "未选择案件"
+    thread_url = str(status.get("discord_thread_url") or discord_thread_url or "").strip()
+    next_action = {
+        "not_saved": "可先保存到本地案件，或填写案件目录后请求 Hermes 建帖。",
+        "saved_local": "可继续绑定 Discord 帖子。",
+        "bound_thread": "可发送脱敏附件到 Discord。",
+        "sent_discord": "等待 Discord/Hermes 后续审查起草。",
+        "waiting_hermes": "稍后继续检查并绑定帖子。",
+        "attach_failed": "检查失败原因后可再次发送附件。",
+    }.get(state, "可继续处理案件流程。")
+    thread_html = (
+        f'<a href="{html.escape(thread_url, quote=True)}" target="_blank" rel="noopener">打开 Discord 帖子</a>'
+        if thread_url
+        else '<span class="hint">尚未绑定 Discord 帖子</span>'
+    )
+    manifest = status.get("manifest") if isinstance(status.get("manifest"), dict) else {}
+    restore = manifest.get("restore") if isinstance(manifest.get("restore"), dict) else {}
+    mapping_label = "已就绪" if manifest.get("mapping_present") else "缺失"
+    restore_filename = str(restore.get("restored_filename") or "")
+    restore_label = restore_filename or {
+        "missing_map": "等待映射表",
+        "no_restore_yet": "尚无还原文件",
+        "metadata_unknown": "已有文件，缺少元数据",
+        "restore_failed": "最近还原失败",
+    }.get(str(restore.get("status") or ""), "尚无还原文件")
+    unresolved = restore.get("unresolved_placeholder_count")
+    unresolved_label = "未知" if unresolved is None else str(unresolved)
+    return f"""
+        <section class="case-workflow-panel" data-workflow-state="{html.escape(state, quote=True)}">
+          <div class="workflow-head">
+            <span class="workflow-pill workflow-{html.escape(state, quote=True)}">{html.escape(_workflow_state_label(state))}</span>
+            <strong>案件流程状态</strong>
+          </div>
+          <div class="workflow-grid">
+            <span><b>案件</b>{html.escape(case_label)}</span>
+            <span><b>状态</b>{html.escape(message)}</span>
+            <span><b>线程</b>{thread_html}</span>
+            <span><b>下一步</b>{html.escape(next_action)}</span>
+            <span><b>映射表</b>{html.escape(mapping_label)}</span>
+            <span><b>还原状态</b>{html.escape(restore_label)}</span>
+            <span><b>未解析占位符</b>{html.escape(unresolved_label)}</span>
+          </div>
+        </section>
+    """
+
+
+def _workflow_state_label(state: str) -> str:
+    return {
+        "not_saved": "未保存",
+        "saved_local": "本地已保存",
+        "bound_thread": "已绑定",
+        "sent_discord": "已发送",
+        "waiting_hermes": "等 Hermes",
+        "attach_failed": "附件失败",
+    }.get(state, state)
+
+
+def _should_apply_auto_prefill(current_value: str, previous_auto_value: str) -> bool:
+    current = current_value.strip()
+    return not current or current == previous_auto_value
+
+
 @app.post("/restore/preview", response_class=HTMLResponse)
 async def restore_preview_page(
     text: str = Form(default=""),
@@ -1366,6 +1907,15 @@ def _render_redaction_result(
         message_id="discord-create-message",
     )
     discord_section = _discord_send_section(discord_thread_url, redacted_filename, "redacted-output", "discord-message")
+    workflow_panel = _render_case_workflow_panel(
+        case_root=case_root,
+        case_folder=case_folder,
+        discord_thread_url=discord_thread_url,
+        saved_local=bool(case_folder),
+    )
+    mapping_review_toolbar = _render_mapping_review_toolbar(redaction_map, review_candidates)
+    sample_summary_panel = _render_sample_summary_panel()
+    review_candidate_texts_json = _review_candidate_texts_json(review_candidates)
     review_html = "".join(
         "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.2f}</td><td>{}</td></tr>".format(
             html.escape(c.type), html.escape(c.text), html.escape(c.source),
@@ -1382,6 +1932,8 @@ def _render_redaction_result(
           <a download="debug_trace.json" href="{debug_url}" class="btn btn-secondary">下载 debug_trace</a>
           <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制脱敏文本</button>
         </div>
+
+        {workflow_panel}
         
         <section class="local-save-section" style="border-left: 4px solid var(--accent); background: linear-gradient(135deg, var(--surface) 0%, rgba(26, 122, 109, 0.02) 100%); padding: 18px 24px; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 18px; box-shadow: var(--shadow);">
           <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 15px;">
@@ -1433,10 +1985,13 @@ def _render_redaction_result(
         <section>
           <h2>确认将替换的具体文字</h2>
           <p class="hint">修改表格中的原文或替换词后点「应用表格修改」即可重新脱敏。</p>
+          {mapping_review_toolbar}
+          {sample_summary_panel}
           <form id="mapping-edit-form" action="/redact/apply-edited-map" method="post">
             <textarea name="original_text" class="hidden-raw">{html.escape(original_text)}</textarea>
             <textarea name="original_bundle_json" class="hidden-raw"></textarea>
             <textarea id="mapping-json-output" name="original_mapping_json" class="hidden-raw">{html.escape(map_json)}</textarea>
+            <textarea id="mapping-review-candidates" class="hidden-raw">{html.escape(review_candidate_texts_json)}</textarea>
             <textarea id="debug-trace-output" class="hidden-raw">{html.escape(debug_json)}</textarea>
             <input type="hidden" name="save_dir" value="{html.escape(save_dir)}">
             <input type="hidden" name="discord_thread_url" value="{html.escape(discord_thread_url)}">
@@ -1449,7 +2004,7 @@ def _render_redaction_result(
             <input type="hidden" name="map_source_file" value="{html.escape(redaction_map.source_file or '')}">
             <table>
               <thead><tr><th>类型</th><th>原文（精确匹配）</th><th>替换为</th><th>修改理由</th><th>来源</th><th>置信度</th><th>操作</th></tr></thead>
-              <tbody>{_render_mapping_edit_rows(redaction_map)}</tbody>
+              <tbody>{_render_mapping_edit_rows(redaction_map, review_candidates)}</tbody>
             </table>
             <button type="button" class="btn btn-secondary btn-sm" onclick="addBlankRow(this)" style="margin-bottom:12px">＋ 新增一行</button>
             <button type="submit" class="btn">应用表格修改/删除</button>
@@ -1524,6 +2079,15 @@ def _render_batch_redaction_result(
         message_id="discord-create-message-batch",
     )
     discord_section = _discord_send_section(discord_thread_url, combined_filename, "redacted-output", "discord-message-batch")
+    workflow_panel = _render_case_workflow_panel(
+        case_root=case_root,
+        case_folder=case_folder,
+        discord_thread_url=discord_thread_url,
+        saved_local=bool(case_folder),
+    )
+    mapping_review_toolbar = _render_mapping_review_toolbar(redaction_map, review_candidates)
+    sample_summary_panel = _render_sample_summary_panel()
+    review_candidate_texts_json = _review_candidate_texts_json(review_candidates)
     doc_sections = "".join(
         f'<article class="doc-result">'
         f'<h3>{html.escape(d.source_file)}</h3>'
@@ -1544,6 +2108,8 @@ def _render_batch_redaction_result(
         </div>
         
         <textarea id="redacted-output" class="hidden-raw">{html.escape(combined_redacted)}</textarea>
+
+        {workflow_panel}
         
         <section class="local-save-section" style="border-left: 4px solid var(--accent); background: linear-gradient(135deg, var(--surface) 0%, rgba(26, 122, 109, 0.02) 100%); padding: 18px 24px; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 18px; box-shadow: var(--shadow);">
           <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 15px;">
@@ -1585,10 +2151,13 @@ def _render_batch_redaction_result(
         <section><h2>分文件结果</h2>{doc_sections}</section>
         <section>
           <h2>确认将替换的具体文字</h2>
+          {mapping_review_toolbar}
+          {sample_summary_panel}
           <form id="mapping-edit-form" action="/redact/apply-edited-map" method="post">
             <textarea name="original_text" class="hidden-raw"></textarea>
             <textarea name="original_bundle_json" class="hidden-raw">{html.escape(bundle_json)}</textarea>
             <textarea id="mapping-json-output" name="original_mapping_json" class="hidden-raw">{html.escape(map_json)}</textarea>
+            <textarea id="mapping-review-candidates" class="hidden-raw">{html.escape(review_candidate_texts_json)}</textarea>
             <textarea id="debug-trace-output" class="hidden-raw">{html.escape(debug_json)}</textarea>
             <input type="hidden" name="save_dir" value="{html.escape(save_dir)}">
             <input type="hidden" name="discord_thread_url" value="{html.escape(discord_thread_url)}">
@@ -1601,7 +2170,7 @@ def _render_batch_redaction_result(
             <input type="hidden" name="map_source_file" value="{html.escape(redaction_map.source_file or '')}">
             <table>
               <thead><tr><th>类型</th><th>原文</th><th>替换为</th><th>修改理由</th><th>来源</th><th>置信度</th><th>操作</th></tr></thead>
-              <tbody>{_render_mapping_edit_rows(redaction_map)}</tbody>
+              <tbody>{_render_mapping_edit_rows(redaction_map, review_candidates)}</tbody>
             </table>
             <button type="button" class="btn btn-secondary btn-sm" onclick="addBlankRow(this)" style="margin-bottom:12px">＋ 新增一行</button>
             <button type="submit" class="btn">应用表格修改/删除到全部文书</button>
@@ -1694,8 +2263,6 @@ def _persist_optional_case_redaction(
     has_thread_url = bool(discord_thread_url.strip())
     if not has_case_folder and not has_thread_url:
         return
-    if has_case_folder and not has_thread_url:
-        return
     if not has_case_folder and has_thread_url:
         raise CaseError("填写 Discord 帖子链接时必须同时填写案件文件夹名")
     root = case_root.strip() or str(default_case_root())
@@ -1705,15 +2272,7 @@ def _persist_optional_case_redaction(
 def _resolve_case_location(upload_source_dir: str, source_files: list[str]) -> dict[str, object]:
     source_dir = upload_source_dir.strip()
     if source_dir:
-        source_path = Path(source_dir).expanduser()
-        result = {
-            "status": "ok",
-            "case_folder": source_path.name,
-            "case_root": str(source_path.parent),
-            "matched_dir": str(source_path),
-        }
-        result.update(_case_manifest_fields(source_path))
-        return result
+        return _suggest_case_location_from_filenames(source_files, source_dir=source_dir)
     suggestion = _suggest_case_location_from_filenames(source_files)
     if suggestion.get("status") == "ok":
         return suggestion
@@ -1740,17 +2299,19 @@ def _case_creation_command(
     case_root: str = "",
     source_dir: str = "",
 ) -> str:
-    folder = case_folder.strip()
+    _ = case_root, source_dir
+    folder = validate_case_folder_name(case_folder)
     lines = [
         f"新建案件，{_case_creation_title(folder, case_cause)}",
-        f"请求ID：{request_id.strip() or _new_discord_request_id()}",
+        f"请求ID：{_safe_discord_request_id(request_id)}",
         f"案件目录：{folder}",
     ]
-    if case_root.strip():
-        lines.append(f"案件根目录：{case_root.strip()}")
-    if source_dir.strip():
-        lines.append(f"原文件目录：{source_dir.strip()}")
     return "\n".join(lines)
+
+
+def _safe_discord_request_id(request_id: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9_.:-]+", "_", request_id.strip())[:80]
+    return value or _new_discord_request_id()
 
 
 def _case_creation_title(case_folder: str, case_cause: str = "") -> str:
@@ -1770,7 +2331,16 @@ def _case_creation_title(case_folder: str, case_cause: str = "") -> str:
 def _clean_case_cause(case_cause: str) -> str:
     value = re.sub(r"\s+", " ", case_cause).strip()
     value = re.sub(r"^案由\s*[:：]\s*", "", value)
+    if _contains_local_path_text(value):
+        return ""
     return value[:80]
+
+
+def _contains_local_path_text(value: str) -> bool:
+    return bool(
+        re.search(r"(^|\s)(~?/|/Users/|/Volumes/|/private/|/var/folders/|[A-Za-z]:[\\/]|\\\\)", value)
+        or re.search(r"[\\/].+[\\/]", value)
+    )
 
 
 def _discord_command_channel_id() -> str:
@@ -1804,10 +2374,10 @@ def _post_discord_channel_message(channel_id: str, content: str) -> dict[str, st
         with urllib.request.urlopen(request, timeout=30) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        body_text = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Discord 指令发送失败: HTTP {exc.code} {body_text}") from exc
+        exc.read()
+        raise DiscordApiError(f"Discord 指令发送失败: HTTP {exc.code}") from exc
     except OSError as exc:
-        raise RuntimeError(f"Discord 指令发送失败: {exc}") from exc
+        raise DiscordApiError("Discord 指令发送失败: 网络不可达") from exc
     return {
         "message_id": str(data.get("id", "")),
         "channel_id": str(data.get("channel_id") or channel_id),
@@ -1818,7 +2388,8 @@ def _post_discord_thread_file(thread_id: str, filename: str, content: str, messa
     config = load_json_config("LEGAL_REDACTOR_API_CONFIG", "api.local.json")
     token = _discord_bot_token(config)
 
-    message = (message.strip() or "脱敏文件已生成，请见附件。")[:1900]
+    _ = message
+    message = _safe_discord_attachment_message(filename)
     payload = {
         "content": message,
         "attachments": [{"id": 0, "filename": filename}],
@@ -1842,14 +2413,23 @@ def _post_discord_thread_file(thread_id: str, filename: str, content: str, messa
         with urllib.request.urlopen(request, timeout=30) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        body_text = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Discord 发送失败: HTTP {exc.code} {body_text}") from exc
+        exc.read()
+        raise DiscordApiError(f"Discord 发送失败: HTTP {exc.code}") from exc
     except OSError as exc:
-        raise RuntimeError(f"Discord 发送失败: {exc}") from exc
+        raise DiscordApiError("Discord 发送失败: 网络不可达") from exc
     return {
         "message_id": str(data.get("id", "")),
         "channel_id": str(data.get("channel_id", "")),
     }
+
+
+def _safe_discord_attachment_message(filename: str) -> str:
+    safe_filename = Path(filename).name or "redacted.txt"
+    return f"脱敏文件已生成，请见附件：{safe_filename}"[:1900]
+
+
+def _safe_public_error_message(message: str) -> str:
+    return re.sub(r"(?:/Users/|/Volumes/|/private/|~)[^\\s\"'，。；;]+", "<local-path>", message)
 
 
 def _multipart_form_data(fields: list[tuple[str, str, str | None, bytes]]) -> tuple[bytes, str]:
@@ -1871,39 +2451,16 @@ def _multipart_form_data(fields: list[tuple[str, str, str | None, bytes]]) -> tu
 def _suggest_case_location_from_filenames(
     filenames: list[str],
     search_roots: list[Path] | None = None,
+    *,
+    source_dir: str = "",
+    discord_thread_url: str = "",
 ) -> dict[str, object]:
-    wanted = {Path(str(name)).name for name in filenames if str(name).strip()}
-    wanted = {name for name in wanted if name and not name.startswith("._")}
-    if not wanted:
-        return {"status": "no_filename"}
-
-    roots = search_roots or _case_location_search_roots()
-    matches: list[tuple[Path, Path]] = []
-    for root in roots:
-        for path in _find_matching_files(root, wanted):
-            matches.append((path, _case_dir_for_matched_file(root, path)))
-        best_case_dir, ambiguous_dirs = _best_case_location(matches, wanted)
-        if best_case_dir is not None or ambiguous_dirs:
-            break
-
-    best_case_dir, ambiguous_dirs = _best_case_location(matches, wanted)
-    if best_case_dir is None:
-        return {"status": "not_found"}
-    if ambiguous_dirs:
-        return {
-            "status": "ambiguous",
-            "matches": [str(path) for path in ambiguous_dirs[:8]],
-        }
-
-    case_dir_path = best_case_dir
-    result = {
-        "status": "ok",
-        "case_folder": case_dir_path.name,
-        "case_root": str(case_dir_path.parent),
-        "matched_dir": str(case_dir_path),
-    }
-    result.update(_case_manifest_fields(case_dir_path))
-    return result
+    return case_suggest_case_location_from_filenames(
+        filenames,
+        search_roots,
+        source_dir=source_dir,
+        discord_thread_url=discord_thread_url,
+    )
 
 
 def _best_case_location(
@@ -1949,13 +2506,10 @@ def _looks_like_case_root(root: Path) -> bool:
 
 
 def _case_manifest_fields(case_dir_path: Path) -> dict[str, str]:
-    try:
-        manifest = load_manifest(case_dir_path)
-    except Exception:
-        return {}
     return {
-        "discord_thread_url": manifest.discord_thread_url,
-        "discord_thread_id": manifest.discord_thread_id,
+        key: value
+        for key, value in manifest_fields_for_case_dir(case_dir_path).items()
+        if key in {"discord_thread_url", "discord_thread_id", "workflow_state", "manifest"}
     }
 
 
@@ -2008,18 +2562,80 @@ def _find_matching_files(root: Path, wanted: set[str], *, max_depth: int = 5, ma
     return matches
 
 
-def _render_mapping_edit_rows(redaction_map: RedactionMap) -> str:
-    rows = [_render_mapping_edit_row(i, e) for i, e in enumerate(redaction_map.mappings)]
+def _render_mapping_review_toolbar(redaction_map: RedactionMap, review_candidates: list | None = None) -> str:
+    review_texts = _review_candidate_text_set(review_candidates or [])
+    counts = {key: 0 for key in MAPPING_REVIEW_CATEGORY_LABELS}
+    for entry in redaction_map.mappings:
+        for category in _classify_mapping_review_row(entry, review_candidate_texts=review_texts):
+            counts[category] += 1
+    buttons = [
+        f'<button type="button" class="mapping-filter active" data-map-filter="all">'
+        f'全部 <span>{len(redaction_map.mappings)}</span></button>'
+    ]
+    for category, label in MAPPING_REVIEW_CATEGORY_LABELS.items():
+        buttons.append(
+            f'<button type="button" class="mapping-filter" data-map-filter="{category}">'
+            f'{html.escape(label)} <span>{counts[category]}</span></button>'
+        )
+    return (
+        '<div id="mapping-review-toolbar" class="mapping-toolbar">'
+        '<div class="mapping-toolbar-head"><strong>复核筛选</strong>'
+        '<span class="hint">默认显示全部；点击分类只看需要处理的行。</span></div>'
+        f'<div class="mapping-filter-row">{"".join(buttons)}</div>'
+        '</div>'
+    )
+
+
+def _render_category_badges(categories: list[str], *, restore_reasons: list[dict[str, str]] | None = None) -> str:
+    if not categories:
+        return ""
+    badges = ""
+    for category in categories:
+        attrs = ""
+        label = MAPPING_REVIEW_CATEGORY_LABELS[category]
+        if category == "restore_risk" and restore_reasons:
+            codes = ",".join(str(item.get("reason_code") or "") for item in restore_reasons if item.get("reason_code"))
+            messages = "；".join(str(item.get("message") or "") for item in restore_reasons if item.get("message"))
+            attrs = f' data-restore-risk-codes="{html.escape(codes)}" title="{html.escape(messages)}"'
+        badges += (
+            f'<span class="row-badge row-badge-{html.escape(category)}"{attrs}>'
+            f'{html.escape(label)}</span>'
+        )
+    return f'<div class="row-tags">{badges}</div>'
+
+
+def _render_sample_summary_panel() -> str:
+    return (
+        '<div id="sample-summary-panel" class="sample-summary-panel" hidden>'
+        '<strong>样本学习摘要</strong>'
+        '<div id="sample-summary-content" class="sample-summary-content"></div>'
+        '</div>'
+    )
+
+
+def _review_candidate_texts_json(review_candidates: list | None = None) -> str:
+    return json.dumps(sorted(_review_candidate_text_set(review_candidates or [])), ensure_ascii=False)
+
+
+def _render_mapping_edit_rows(redaction_map: RedactionMap, review_candidates: list | None = None) -> str:
+    review_texts = _review_candidate_text_set(review_candidates or [])
+    rows = [
+        _render_mapping_edit_row(i, e, review_candidate_texts=review_texts)
+        for i, e in enumerate(redaction_map.mappings)
+    ]
     rows.append(_render_blank_mapping_row(len(rows)))
     return "".join(rows)
 
 
-def _render_mapping_edit_row(index: int, entry: MappingEntry) -> str:
+def _render_mapping_edit_row(index: int, entry: MappingEntry, review_candidate_texts: set[str] | None = None) -> str:
     role = entry.role or ""
     reason = entry.reason or ""
     restore = "1" if entry.restore_by_default else "0"
+    categories = _classify_mapping_review_row(entry, review_candidate_texts=review_candidate_texts or set())
+    category_attr = html.escape(" ".join(categories))
+    tags_html = _render_category_badges(categories, restore_reasons=_restore_risk_reasons(entry))
     return f"""
-        <tr>
+        <tr data-map-row="{index}" data-categories="{category_attr}">
           <td><input name="map_type" value="{html.escape(entry.type)}"></td>
           <td><textarea name="map_original" rows="2">{html.escape(entry.original)}</textarea></td>
           <td><textarea name="map_masked" rows="2">{html.escape(entry.masked)}</textarea></td>
@@ -2027,6 +2643,7 @@ def _render_mapping_edit_row(index: int, entry: MappingEntry) -> str:
           <td>{html.escape(entry.source)}</td>
           <td>{entry.confidence:.2f}</td>
           <td><label class="inline"><input type="checkbox" name="row_delete" value="{index}"> 删除</label>
+            {tags_html}
             <input type="hidden" name="map_role" value="{html.escape(role)}">
             <input type="hidden" name="map_source" value="{html.escape(entry.source)}">
             <input type="hidden" name="map_confidence" value="{entry.confidence}">
@@ -2038,7 +2655,7 @@ def _render_mapping_edit_row(index: int, entry: MappingEntry) -> str:
 
 def _render_blank_mapping_row(index: int) -> str:
     return f"""
-        <tr>
+        <tr data-map-row="{index}" data-categories="">
           <td><input name="map_type" value="manual" placeholder="person/org"></td>
           <td><textarea name="map_original" rows="2" placeholder="新增要替换的原文"></textarea></td>
           <td><textarea name="map_masked" rows="2" placeholder="替换为"></textarea></td>
@@ -2499,6 +3116,32 @@ def _page(title: str, body: str) -> str:
         .hidden-raw{{display:none}}
         .warning{{border-color:var(--danger)}}
         .notice{{background:var(--danger-bg)}}
+        .status-panel{{padding:18px}}
+        .status-head{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px}}
+        .status-head h2{{margin:0}}
+        .status-head a{{font-size:12px;color:var(--accent);text-decoration:none}}
+        .status-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}}
+        .status-item{{display:grid;grid-template-columns:auto 1fr;gap:3px 8px;align-items:center;border:1px solid var(--border);border-radius:var(--radius-sm);padding:9px 10px;background:var(--bg);min-width:0}}
+        .status-item strong{{font-size:13px;font-weight:600;min-width:0}}
+        .status-item span:not(.status-pill),.status-item small{{grid-column:1 / -1;font-size:12px;color:var(--muted);min-width:0;overflow-wrap:anywhere}}
+        .status-pill{{display:inline-flex;align-items:center;justify-content:center;min-width:38px;border-radius:999px;padding:2px 7px;font-size:11px;font-weight:600;background:#ece9e1;color:var(--ink)}}
+        .status-ready{{background:#dceee7;color:#17624f}}
+        .status-degraded,.status-skipped{{background:#fff1c9;color:#7a5300}}
+        .status-missing{{background:#ece9e1;color:#5a5751}}
+        .status-error{{background:var(--danger-bg);color:var(--danger)}}
+        .case-workflow-panel{{border-left:4px solid var(--accent);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:16px 18px;margin-bottom:18px}}
+        .workflow-head{{display:flex;align-items:center;gap:10px;margin-bottom:10px}}
+        .workflow-head strong{{font-size:14px}}
+        .workflow-pill{{display:inline-flex;align-items:center;justify-content:center;border-radius:999px;padding:3px 9px;font-size:12px;font-weight:700;background:#ece9e1;color:var(--ink);white-space:nowrap}}
+        .workflow-not_saved{{background:#ece9e1;color:#5a5751}}
+        .workflow-saved_local,.workflow-bound_thread{{background:#dceee7;color:#17624f}}
+        .workflow-sent_discord{{background:#dce9f9;color:#23527c}}
+        .workflow-waiting_hermes{{background:#fff1c9;color:#7a5300}}
+        .workflow-attach_failed{{background:var(--danger-bg);color:var(--danger)}}
+        .workflow-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:8px 14px;font-size:13px}}
+        .workflow-grid span{{min-width:0;overflow-wrap:anywhere}}
+        .workflow-grid b{{display:block;color:var(--muted);font-size:11px;font-weight:600;text-transform:uppercase;margin-bottom:2px}}
+        .workflow-grid a{{color:var(--accent);text-decoration:none}}
         mark{{background:var(--danger-bg);color:var(--danger);padding:1px 3px;border-radius:2px}}
         .highlight-box{{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 12px;font:13px/1.6 "SF Mono","Menlo",monospace;white-space:pre-wrap;word-wrap:break-word;overflow:auto;max-height:480px;user-select:text}}
         .highlight-box mark{{padding:1px 4px;border-radius:3px;cursor:help;border-bottom:2px solid transparent}}
@@ -2508,6 +3151,20 @@ def _page(title: str, body: str) -> str:
         .toast{{position:fixed;top:18px;right:18px;z-index:9999;background:var(--accent);color:#fff;padding:10px 20px;border-radius:var(--radius-sm);box-shadow:0 4px 20px rgba(0,0,0,.15);opacity:0;transform:translateY(-6px);transition:.2s;font-size:13px;font-weight:500}}
         .toast.show{{opacity:1;transform:translateY(0)}}
         .toast.warn{{background:var(--danger)}}
+        .mapping-toolbar{{border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg);padding:10px 12px;margin:10px 0 12px}}
+        .mapping-toolbar-head{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}}
+        .mapping-filter-row{{display:flex;gap:6px;flex-wrap:wrap}}
+        .mapping-filter{{border:1px solid var(--border);border-radius:999px;background:#fff;color:var(--ink);font-size:12px;padding:5px 9px;cursor:pointer}}
+        .mapping-filter span{{color:var(--muted);margin-left:3px}}
+        .mapping-filter.active{{background:var(--accent);border-color:var(--accent);color:#fff}}
+        .mapping-filter.active span{{color:#fff}}
+        .row-tags{{display:flex;gap:4px;flex-wrap:wrap;margin-top:6px}}
+        .row-badge{{display:inline-flex;border:1px solid var(--border);border-radius:999px;background:var(--bg);color:var(--ink);font-size:11px;line-height:1;padding:3px 6px;white-space:nowrap}}
+        .row-badge-restore_risk,.row-badge-delete_candidate{{border-color:#f1b8b1;background:var(--danger-bg);color:var(--danger)}}
+        .sample-summary-panel{{border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:var(--radius-sm);background:#fff;padding:10px 12px;margin:10px 0 12px}}
+        .sample-summary-panel[hidden]{{display:none}}
+        .sample-summary-content{{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:6px;margin-top:8px;font-size:12px}}
+        .sample-summary-content span{{display:block;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:6px 8px}}
         .selection-menu{{position:absolute;z-index:10000;display:none;align-items:center;gap:4px;background:#fff;border:1px solid var(--border);border-radius:var(--radius-sm);box-shadow:0 8px 28px rgba(0,0,0,.18);padding:6px}}
         .selection-menu button{{border:0;border-radius:6px;padding:6px 9px;background:var(--bg);color:var(--ink);font-size:12px;cursor:pointer;white-space:nowrap}}
         .selection-menu button:hover{{background:var(--accent);color:#fff}}
@@ -2529,7 +3186,31 @@ def _page(title: str, body: str) -> str:
       </main>
       <script>
       var _tt;function toast(m,c){{var e=document.getElementById('toast');if(!e)return;e.textContent=m;e.className='toast '+(c||'');clearTimeout(_tt);requestAnimationFrame(function(){{e.classList.add('show');}});_tt=setTimeout(function(){{e.classList.remove('show');}},2500);}}
-      window.addEventListener('message',function(e){{if(e.data&&e.data.type==='toast')toast(e.data.msg,e.data.cls==='warn'?'warn':'');}});
+      var mappingCategoryLabels={json.dumps(MAPPING_REVIEW_CATEGORY_LABELS, ensure_ascii=False)};
+      var mappingCategoryOrder={json.dumps(list(MAPPING_REVIEW_CATEGORY_LABELS), ensure_ascii=False)};
+      var restoreRiskReasonLabels={json.dumps(RESTORE_RISK_REASON_LABELS, ensure_ascii=False)};
+      function renderSampleSummary(summary){{var panel=document.getElementById('sample-summary-panel');var content=document.getElementById('sample-summary-content');if(!panel||!content||!summary)return;var rows=[
+        ['可复用映射',summary.lookup_entries?summary.lookup_entries.length:0],
+        ['删除黑名单候选',summary.delete_blacklist_candidates?summary.delete_blacklist_candidates.length:0],
+        ['已保护跳过',summary.suppressed_risky_entries?summary.suppressed_risky_entries.length:0],
+        ['人工校正总数',summary.manual_corrections||0],
+        ['误识别删除',summary.false_positive_deletes||0],
+        ['漏识别新增',summary.missing_adds||0]
+      ];content.innerHTML=rows.map(function(item){{return '<span><b>'+item[0]+'</b>: '+item[1]+'</span>';}}).join('');panel.hidden=false;}}
+      function mappingRowValue(row,name){{var el=row.querySelector('[name="'+name+'"]');if(!el)return '';if(el.type==='checkbox')return el.checked?el.value:'';return el.value||'';}}
+      function restoreRiskReasonsForRow(row){{var reasons=[];var deleted=!!row.querySelector('input[name="row_delete"]:checked');var restore=mappingRowValue(row,'map_restore_by_default')!=='0';var masked=mappingRowValue(row,'map_masked').trim();if(deleted)reasons.push({{reason_code:'delete_candidate',message:restoreRiskReasonLabels.delete_candidate}});if(!restore)reasons.push({{reason_code:'restore_disabled',message:restoreRiskReasonLabels.restore_disabled}});if(!masked)reasons.push({{reason_code:'empty_mask',message:restoreRiskReasonLabels.empty_mask}});return reasons;}}
+      function mappingOriginalIndex(){{var mapEl=document.getElementById('mapping-json-output');var parsed={{}};try{{parsed=JSON.parse(mapEl?mapEl.value||'{{}}':'{{}}');}}catch(_err){{parsed={{}};}}var index={{}};(parsed.mappings||[]).forEach(function(item){{if(item&&item.original)index[item.original]=item;}});return index;}}
+      function mappingReviewCandidateIndex(){{var el=document.getElementById('mapping-review-candidates');var values=[];try{{values=JSON.parse(el?el.value||'[]':'[]');}}catch(_err){{values=[];}}var index={{}};(Array.isArray(values)?values:[]).forEach(function(text){{if(text)index[String(text)]=true;}});return index;}}
+      function classifyMappingRow(row,originalIndex,reviewCandidateIndex){{var original=mappingRowValue(row,'map_original').trim();var masked=mappingRowValue(row,'map_masked').trim();if(!original&&!masked)return [];var source=mappingRowValue(row,'map_source').trim().toLowerCase();var confidence=parseFloat(mappingRowValue(row,'map_confidence')||'1');var deleted=!!row.querySelector('input[name="row_delete"]:checked');var baseline=originalIndex[original];var cats=[];if((!isNaN(confidence)&&confidence<0.85)||reviewCandidateIndex[original])cats.push('low_confidence');if(source.indexOf('manual')===0||source.indexOf('user')===0||source.indexOf('selection')===0||(!baseline&&['rule','regex','llm'].indexOf(source)<0))cats.push('manual_added');if(baseline&&baseline.masked&&baseline.masked!==masked)cats.push('modified');if(deleted)cats.push('delete_candidate');if(restoreRiskReasonsForRow(row).length)cats.push('restore_risk');if(source.indexOf('sample')>=0)cats.push('sample_reused');return mappingCategoryOrder.filter(function(name){{return cats.indexOf(name)>=0;}});}}
+      function renderMappingRowBadges(row,cats){{var cell=row.querySelector('td:last-child');if(!cell)return;var tags=cell.querySelector('.row-tags');if(!cats.length){{if(tags)tags.remove();return;}}if(!tags){{tags=document.createElement('div');tags.className='row-tags';cell.insertBefore(tags,cell.querySelector('input[type="hidden"]')||null);}}tags.innerHTML='';var restoreReasons=restoreRiskReasonsForRow(row);cats.forEach(function(category){{var badge=document.createElement('span');badge.className='row-badge row-badge-'+category;badge.textContent=mappingCategoryLabels[category]||category;if(category==='restore_risk'&&restoreReasons.length){{badge.dataset.restoreRiskCodes=restoreReasons.map(function(item){{return item.reason_code;}}).join(',');badge.title=restoreReasons.map(function(item){{return item.message;}}).join('；');}}tags.appendChild(badge);}});}}
+      function updateMappingReviewState(form){{form=form||document.getElementById('mapping-edit-form');if(!form)return;var originalIndex=mappingOriginalIndex();var reviewCandidateIndex=mappingReviewCandidateIndex();var counts={{}};mappingCategoryOrder.forEach(function(name){{counts[name]=0;}});var total=0;form.querySelectorAll('[data-map-row]').forEach(function(row){{var cats=classifyMappingRow(row,originalIndex,reviewCandidateIndex);row.dataset.categories=cats.join(' ');renderMappingRowBadges(row,cats);if(mappingRowValue(row,'map_original').trim()&&mappingRowValue(row,'map_masked').trim())total+=1;cats.forEach(function(name){{counts[name]=(counts[name]||0)+1;}});}});document.querySelectorAll('[data-map-filter]').forEach(function(btn){{var category=btn.dataset.mapFilter||'all';var span=btn.querySelector('span');if(span)span.textContent=category==='all'?String(total):String(counts[category]||0);}});}}
+      function activeMappingFilter(){{var active=document.querySelector('[data-map-filter].active');return active?active.dataset.mapFilter||'all':'all';}}
+      function filterMappingRows(category){{updateMappingReviewState();document.querySelectorAll('[data-map-row]').forEach(function(row){{var cats=(row.getAttribute('data-categories')||'').split(/\\s+/).filter(Boolean);row.style.display=(!category||category==='all'||cats.length===0||cats.indexOf(category)>=0)?'':'none';}});document.querySelectorAll('[data-map-filter]').forEach(function(btn){{btn.classList.toggle('active',(btn.dataset.mapFilter||'all')===(category||'all'));}});}}
+      function shouldApplyAutoPrefill(currentValue,lastAutoValue){{var current=(currentValue||'').trim();return !current||current===(lastAutoValue||'');}}
+      window.addEventListener('message',function(e){{if(!e.data)return;if(e.data.type==='toast')toast(e.data.msg,e.data.cls==='warn'?'warn':'');if(e.data.type==='sample_summary'){{renderSampleSummary(e.data.summary);toast(e.data.msg,e.data.cls==='warn'?'warn':'');}}}});
+      document.addEventListener('click',function(e){{var btn=e.target&&e.target.closest?e.target.closest('[data-map-filter]'):null;if(!btn)return;filterMappingRows(btn.dataset.mapFilter||'all');}});
+      document.addEventListener('input',function(e){{var form=e.target&&e.target.closest?e.target.closest('#mapping-edit-form'):null;if(!form)return;filterMappingRows(activeMappingFilter());}});
+      document.addEventListener('change',function(e){{var form=e.target&&e.target.closest?e.target.closest('#mapping-edit-form'):null;if(!form)return;filterMappingRows(activeMappingFilter());}});
       (function(){{var ta=document.getElementById('text-input');if(!ta)return;ta.addEventListener('dragover',function(e){{e.preventDefault();ta.classList.add('dragover');}});ta.addEventListener('dragleave',function(){{ta.classList.remove('dragover');}});ta.addEventListener('drop',function(e){{e.preventDefault();ta.classList.remove('dragover');var f=e.dataTransfer.files[0];if(!f)return;if(['txt','md'].indexOf(f.name.split('.').pop().toLowerCase())<0){{toast('不支持 .'+f.name.split('.').pop(),'warn');return;}}var r=new FileReader();r.onload=function(){{ta.value=r.result;toast('已加载: '+f.name);}};r.readAsText(f,'UTF-8');}});}})();
 	      (function(){{
 	        var input=document.getElementById('source-files');
@@ -2538,18 +3219,24 @@ def _page(title: str, body: str) -> str:
 	          var names=Array.prototype.map.call(input.files||[],function(f){{return f.name;}});
 	          if(!names.length)return;
 	          try{{
-	            var resp=await fetch('/api/suggest-case-location',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{filenames:names}})}});
+	            var currentSourceDir=(document.getElementById('upload-source-dir-input')||{{value:''}}).value||'';
+	            var currentThread=(document.getElementById('discord-thread-url-input')||{{value:''}}).value||'';
+	            var currentRoot=(document.getElementById('case-root-input')||{{value:''}}).value||'';
+	            var resp=await fetch('/api/suggest-case-location',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{filenames:names,source_dir:currentSourceDir,discord_thread_url:currentThread,case_root:currentRoot}})}});
 	            var data=await resp.json();
 	            if(data.status==='ok'){{
 	              var root=document.getElementById('case-root-input');
 	              var folder=document.getElementById('case-folder-input');
 	              var sourceDir=document.getElementById('upload-source-dir-input');
 	              var discordUrl=document.getElementById('discord-thread-url-input');
-	              if(root)root.value=data.case_root||'';
+	              if(root){{
+	                if(shouldApplyAutoPrefill(root.value||'',root.dataset.autoValue||'')){{
+	                  root.value=data.case_root||'';
+	                  root.dataset.autoValue=data.case_root||'';
+	                }}
+	              }}
 	              if(folder){{
-	                var current=(folder.value||'').trim();
-	                var last=folder.dataset.autoValue||'';
-	                if(!current||current===last){{
+	                if(shouldApplyAutoPrefill(folder.value||'',folder.dataset.autoValue||'')){{
 	                  folder.value=data.case_folder||'';
 	                  folder.dataset.autoValue=data.case_folder||'';
 	                }}
@@ -2557,6 +3244,8 @@ def _page(title: str, body: str) -> str:
 	              if(sourceDir)sourceDir.value=data.matched_dir||'';
 	              if(discordUrl&&!discordUrl.value.trim()&&data.discord_thread_url)discordUrl.value=data.discord_thread_url;
 	              toast(data.discord_thread_url?'已识别案件目录和 Discord 链接: '+data.case_folder:'已识别案件目录: '+data.case_folder);
+	            }}else if(data.status==='conflict'){{
+	              toast(data.conflict_message||'案件目录或 Discord 链接存在冲突，请手动确认','warn');
 	            }}else if(data.status==='ambiguous'){{
 	              toast('匹配到多个案件目录，请手动填写案件文件夹名和根目录','warn');
 	            }}else if(data.status==='not_found'){{
@@ -2568,7 +3257,7 @@ def _page(title: str, body: str) -> str:
 	          }}
 	        }});
 	      }})();
-      function addBlankRow(btn){{var tb=btn.parentElement.querySelector('tbody');if(!tb)return;var rows=tb.querySelectorAll('tr');var last=rows[rows.length-1];var c=last.cloneNode(true);var n=rows.length;c.querySelectorAll('input,textarea').forEach(function(e){{if(e.name==='row_delete')e.value=n;if(e.name==='map_type')e.value='manual';if(e.name==='map_original'||e.name==='map_masked'||e.name==='map_role'||e.name==='map_reason')e.value='';if(e.name==='map_source')e.value='manual';if(e.name==='map_confidence')e.value='1.0';if(e.name==='map_restore_by_default')e.value='1';e.checked=false;}});tb.appendChild(c);}}
+      function addBlankRow(btn){{var tb=btn.parentElement.querySelector('tbody');if(!tb)return;var rows=tb.querySelectorAll('tr');var last=rows[rows.length-1];var c=last.cloneNode(true);var n=rows.length;c.dataset.mapRow=String(n);c.dataset.categories='';c.querySelectorAll('input,textarea').forEach(function(e){{if(e.name==='row_delete')e.value=n;if(e.name==='map_type')e.value='manual';if(e.name==='map_original'||e.name==='map_masked'||e.name==='map_role'||e.name==='map_reason')e.value='';if(e.name==='map_source')e.value='manual';if(e.name==='map_confidence')e.value='1.0';if(e.name==='map_restore_by_default')e.value='1';e.checked=false;}});tb.appendChild(c);filterMappingRows(activeMappingFilter());}}
       function saveRow(idx,btn){{var row=btn.closest('tr');var orig=row.querySelector('[name^=orig_]').value;var masked=row.querySelector('[name^=masked_]').value;var reasonEl=row.querySelector('[name^=reason_]');var reason=reasonEl?reasonEl.value:'';fetch('/samples/update/'+idx,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{original:orig,masked:masked,reason:reason}})}}).then(function(r){{return r.json();}}).then(function(d){{toast(d.msg);}});}}
 	      function saveNewRow(total,btn){{var act=document.getElementById('new-action').value;var orig=document.getElementById('new-orig').value;var masked=document.getElementById('new-masked').value;var reasonEl=document.getElementById('new-reason');var reason=reasonEl?reasonEl.value:'';if(!orig||(act!=='delete'&&!masked)){{toast(act==='delete'?'请填写原文':'请填写原文和替换为','warn');return;}}fetch('/samples/add',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:act,original:orig,masked:masked,reason:reason}})}}).then(function(r){{return r.json();}}).then(function(d){{toast(d.msg);setTimeout(function(){{location.reload();}},1000);}});}}
 
@@ -2698,16 +3387,18 @@ def _page(title: str, body: str) -> str:
 	          cell.appendChild(input);
 	          row.appendChild(cell);
 	        }}
-	        function renumberMappingRows(tbody){{
-	          tbody.querySelectorAll('tr').forEach(function(row,index){{
-	            var del=row.querySelector('input[name="row_delete"]');
-	            if(del)del.value=String(index);
-	          }});
-	        }}
+		        function renumberMappingRows(tbody){{
+		          tbody.querySelectorAll('tr').forEach(function(row,index){{
+		            row.dataset.mapRow=String(index);
+		            var del=row.querySelector('input[name="row_delete"]');
+		            if(del)del.value=String(index);
+		          }});
+		        }}
 	        function appendMappingRow(form,entry){{
-	          var tbody=form.querySelector('tbody');
-	          if(!tbody)return;
-	          var tr=document.createElement('tr');
+		          var tbody=form.querySelector('tbody');
+		          if(!tbody)return;
+		          var tr=document.createElement('tr');
+		          tr.dataset.categories='manual_added';
 	          appendTextCell(tr,'map_type',entry.type||'manual',0,'person/org');
 	          appendTextCell(tr,'map_original',entry.original||'',2,'新增要替换的原文');
 	          appendTextCell(tr,'map_masked',entry.masked||'',2,'替换为');
@@ -2737,11 +3428,12 @@ def _page(title: str, body: str) -> str:
 	          var last=rows[rows.length-1];
 	          if(last&&!rowValue(last,'map_original').trim()&&!rowValue(last,'map_masked').trim()){{
 	            tbody.insertBefore(tr,last);
-	          }}else{{
-	            tbody.appendChild(tr);
-	          }}
-	          renumberMappingRows(tbody);
-	        }}
+		          }}else{{
+		            tbody.appendChild(tr);
+		          }}
+		          renumberMappingRows(tbody);
+		          filterMappingRows(activeMappingFilter());
+		        }}
 	      }})();
 
 	      async function sendRedactedToDiscord(threadUrl, filename, textareaId, messageId, buttonEl) {{

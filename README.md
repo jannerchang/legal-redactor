@@ -100,10 +100,34 @@ cd legal-redactor
 `/v1/models` 确认端口上响应的是目标 Qwen 模型；如果端口被其他服务占用会直接报错。
 如果只想临时跳过 MLX，可设置 `LEGAL_REDACTOR_SKIP_MLX=1 ./start.sh`。
 
+首页会显示一个只读系统状态区，也可直接访问机器接口：
+
+```bash
+curl http://127.0.0.1:7860/health
+curl http://127.0.0.1:7860/api/status
+curl http://127.0.0.1:18080/v1/models
+```
+
+`/api/status` 检查 Web 运行配置、固定 MLX 模型、`mlx_lm.server`、`HF_HOME`
+本地缓存、案件库目录、Office API、Hermes MCP 和 Discord 指令通道。状态读取
+不会启动模型、清理缓存、发送 Discord 消息或写入案件文件；响应只返回是否配置
+和下一步动作，不返回 token、原文、样本、映射表或还原全文。
+
 Web 支持粘贴文本、拖拽 txt/md、上传 txt/md/doc/docx/pdf、多文件批量处理
 （统一映射表）。脱敏时可以选填或自动识别案件文件夹；填写或绑定 Discord
 帖子后，脱敏文本和加密映射表会保存到本地案件库，供后续 Hermes/Discord
 还原工作流使用。
+
+脱敏结果页的映射表带有复核筛选：全部、低置信、手工新增、已修改、删除候选、
+还原风险和样本复用。保存为样本时页面不会跳转，会在当前结果页显示本次保存摘要，
+包括可复用映射、删除黑名单候选、被保护跳过项、人工校正总数、误识别删除和
+漏识别新增。真实样本内容仍只保存在本机 `samples/` 目录，不写入文档或远端通知。
+
+脱敏结果页会显示一个案件流程状态：`not_saved`（未保存）、`saved_local`
+（本地已保存）、`bound_thread`（已绑定 Discord 帖子）、`sent_discord`
+（已发送脱敏附件）、`waiting_hermes`（等待 Hermes 建帖写回）、`attach_failed`
+（附件发送失败）。这些状态由服务端根据本地 manifest、线程链接和发送结果重算；
+浏览器提交的 `state/status/bound/sent/conflict_result` 等字段会被拒绝。
 
 ### 命令行
 
@@ -150,12 +174,17 @@ Web 支持粘贴文本、拖拽 txt/md、上传 txt/md/doc/docx/pdf、多文件�
 
 - Web 脱敏时可绑定案件文件夹和 Discord 帖子链接，生成 `manifest.json`。
 - Web 脱敏后也可以填写案由，一键请求 Hermes 新建 Discord 案件帖。
-- Hermes 写回帖子链接后，Web 可自动把脱敏附件和附言发送到绑定帖子。
+- Hermes 写回帖子链接后，Web 可自动把脱敏附件发送到绑定帖子。
 - Office Mac 只在本地保存原始材料、脱敏文件和加密映射表。
 - Home Mac 的 Hermes 通过 MCP adapter 调用 Office 私网 API。
 - 还原结果写回 Office Mac 的案件目录 `restored/`，MCP 响应不返回映射表或还原全文。
+- Office API / MCP 返回 `ok`、`code`、`case`、`restore`、`next_action` 结构；
+  `restore` 只包含 `restored_filename`、`restored_relative_path`、替换数量、
+  `unresolved_placeholder_count` 和时间元数据，不返回占位符数组、绝对路径或全文。
 - 私网地址、token、案件根目录放在本机 JSON 配置中，不提交到 Git。
 - 可选配置 Discord bot token 后，脱敏结果页可一键把脱敏文件作为附件发送到已填写的 Discord 帖子。
+  发送到 Discord/Hermes 的建帖命令只包含请求 ID、案件目录/标题和脱敏附件元数据，
+  不包含 `case_root`、`source_dir`、本地绝对路径、原文、映射表、样本或还原全文。
 
 Office Mac 可以启动只面向私网的还原 API：
 
@@ -240,6 +269,34 @@ HanLP 是可选依赖，未安装时系统会跳过并继续使用现有规则�
 .venv/bin/python -m legal_redactor --eval-gold path/to/gold.json --eval-report output/eval-report.json
 # 或禁用本地 LLM，只评估规则兜底：
 .venv/bin/python -m legal_redactor --llm off --eval-gold path/to/gold.json
+```
+
+需要把评估结果、样本修正摘要和恢复占位符情况汇总成 M6 回归测量报告时，使用
+`--regression-report`。该报告默认只包含聚合指标、每个 gold case 的数量字段、
+样本文件元数据和本地耗时，不复制 `matched` / `missing` / `extra` 原始实体、
+样本文本、映射表原文、还原全文或 debug trace：
+
+```bash
+.venv/bin/python -m legal_redactor \
+  --llm off \
+  --eval-gold path/to/gold.json \
+  --eval-fail-under-recall 0.90 \
+  --eval-fail-under-precision 0.90 \
+  --regression-report output/regression-report.json \
+  --regression-sample-summary output/sample-summary.json \
+  --regression-sample-file samples/_auto.sample.json
+```
+
+如果已有脱敏文本和映射表，也可以补充恢复占位符计数；没有这两项证据时报告会把
+`restore` 写为 `null`，不会猜测：
+
+```bash
+.venv/bin/python -m legal_redactor \
+  --regression-report output/regression-report.json \
+  --regression-redacted output/case.redacted.txt \
+  --regression-map output/redaction_map.enc \
+  --regression-input-at 2026-06-29T08:00:00+00:00 \
+  --regression-saved-at 2026-06-29T08:01:30+00:00
 ```
 
 命令行脱敏可加 `--debug-trace` 输出 `debug_trace.json`；Web 结果页也提供

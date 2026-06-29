@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 from .config import PipelineConfig
@@ -114,6 +115,48 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="评估 precision 低于该值时返回失败",
     )
+    parser.add_argument(
+        "--regression-report",
+        type=str,
+        default="",
+        help="写入 M6 隐私安全回归测量 JSON 报告",
+    )
+    parser.add_argument(
+        "--regression-sample-summary",
+        action="append",
+        default=[],
+        help="读取一个 M5 sample_summary JSON 文件；可重复传入",
+    )
+    parser.add_argument(
+        "--regression-sample-file",
+        type=str,
+        default="",
+        help="样本库 provenance 元数据路径；只输出文件名、mtime、条数等元数据",
+    )
+    parser.add_argument(
+        "--regression-redacted",
+        type=str,
+        default="",
+        help="用于 restore placeholder 计数的脱敏文本路径；需与 --regression-map 同用",
+    )
+    parser.add_argument(
+        "--regression-map",
+        type=str,
+        default="",
+        help="用于 restore placeholder 计数的映射表路径；需与 --regression-redacted 同用",
+    )
+    parser.add_argument(
+        "--regression-input-at",
+        type=str,
+        default="",
+        help="文档输入时间 ISO 字符串，用于 document_input_to_saved_case_ms",
+    )
+    parser.add_argument(
+        "--regression-saved-at",
+        type=str,
+        default="",
+        help="案件保存时间 ISO 字符串，用于 document_input_to_saved_case_ms",
+    )
     return parser
 
 
@@ -126,6 +169,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.eval_gold:
         _do_eval(args)
+        return
+
+    if args.regression_report:
+        _write_regression_report(args, gold_report=None)
         return
 
     if args.restore:
@@ -231,7 +278,13 @@ def _do_eval(args: argparse.Namespace) -> None:
     from .evaluation import evaluate_gold_file, evaluation_report_to_json
 
     config = PipelineConfig.from_llm_mode(args.llm, profile_name="standard", model=args.model)
-    report = evaluate_gold_file(args.eval_gold, config=config)
+    eval_started = time.monotonic()
+    try:
+        report = evaluate_gold_file(args.eval_gold, config=config)
+    except (OSError, ValueError) as exc:
+        print(f"[回归报告错误] {exc}", file=sys.stderr)
+        sys.exit(1)
+    eval_finished = time.monotonic()
     print(
         "[评估] cases={case_count} precision={precision:.4f} recall={recall:.4f} "
         "f1={f1:.4f} tp={true_positive} fp={false_positive} fn={false_negative}".format(**report)
@@ -247,10 +300,73 @@ def _do_eval(args: argparse.Namespace) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(evaluation_report_to_json(report), encoding="utf-8")
         print(f"[评估报告] {output_path}")
+    if args.regression_report:
+        _write_regression_report(
+            args,
+            gold_report=report,
+            gold_evaluation_ms=max(0, int(round((eval_finished - eval_started) * 1000))),
+        )
     if args.eval_fail_under_recall is not None and report["recall"] < args.eval_fail_under_recall:
         sys.exit(2)
     if args.eval_fail_under_precision is not None and report["precision"] < args.eval_fail_under_precision:
         sys.exit(2)
+
+
+def _write_regression_report(
+    args: argparse.Namespace,
+    *,
+    gold_report: dict | None,
+    gold_evaluation_ms: int | None = None,
+) -> None:
+    from .regression import build_regression_report, load_json_object, regression_report_to_json
+
+    report_started = time.monotonic()
+    try:
+        sample_summaries = [
+            load_json_object(path, description="M5 sample_summary")
+            for path in (args.regression_sample_summary or [])
+        ]
+        redacted_text = None
+        redaction_map = None
+        if args.regression_redacted and args.regression_map:
+            redacted_text = read_document(args.regression_redacted)
+            redaction_map = load_redaction_map_auto(args.regression_map)
+        report = build_regression_report(
+            gold_report=gold_report,
+            sample_summaries=sample_summaries,
+            sample_file=args.regression_sample_file or None,
+            redacted_text=redacted_text,
+            redaction_map=redaction_map,
+            report_started_monotonic=report_started,
+            report_finished_monotonic=None,
+            document_input_at=args.regression_input_at or None,
+            saved_case_at=args.regression_saved_at or None,
+            gold_evaluation_ms=gold_evaluation_ms,
+        )
+    except ValueError as exc:
+        print(f"[回归报告错误] {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    output_path = Path(args.regression_report)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(regression_report_to_json(report), encoding="utf-8")
+    print(f"[回归报告] {output_path}")
+    gold = report["gold"]
+    if gold.get("available"):
+        print(
+            "[回归摘要] cases={case_count} precision={precision} recall={recall} f1={f1}".format(
+                **gold
+            )
+        )
+    workflow = report["workflow"]
+    if workflow.get("summary_count"):
+        print(
+            "[样本摘要] summaries={summary_count} manual={manual_corrections} "
+            "delete={false_positive_deletes} add={missing_adds}".format(**workflow)
+        )
+    timing = report["timing"]
+    if timing.get("document_input_to_saved_case_ms") is not None:
+        print(f"[计时] document_input_to_saved_case_ms={timing['document_input_to_saved_case_ms']}")
 
 
 def _start_web(host: str, port: int) -> None:

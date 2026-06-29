@@ -389,6 +389,11 @@ def _sample_lookup_allowed(entry: dict, original: str, masked: str) -> bool:
     return True
 
 
+def is_sample_lookup_allowed(entry: dict, original: str, masked: str) -> bool:
+    """Return whether a sample entry may become a trusted lookup mapping."""
+    return _sample_lookup_allowed(entry, original, masked)
+
+
 def _looks_like_sample_org(original: str, masked: str, sample_type: str) -> bool:
     if not masked.endswith(("公司", "集团")):
         return False

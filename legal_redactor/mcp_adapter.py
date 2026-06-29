@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from .cases import assert_remote_payload_safe
 from .local_config import config_value, load_json_config
 
 
@@ -46,9 +47,9 @@ def _request(method: str, path: str, payload: dict[str, Any] | None = None) -> d
     base_url = raw_base_url.rstrip("/")
     token = os.environ.get("LEGAL_REDACTOR_API_TOKEN") or config_value(config, "api_token")
     if not base_url:
-        return {"ok": False, "error": {"code": "missing_api_url"}}
+        return _safe_error("missing_api_url", None, "Office API URL is not configured", "configure_office_api_url")
     if not token:
-        return {"ok": False, "error": {"code": "missing_api_token"}}
+        return _safe_error("missing_api_token", None, "Office API token is not configured", "configure_office_api_token")
 
     data = None
     headers = {"Authorization": f"Bearer {token}"}
@@ -59,12 +60,18 @@ def _request(method: str, path: str, payload: dict[str, Any] | None = None) -> d
     request = urllib.request.Request(f"{base_url}{path}", data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            return json.loads(response.read().decode("utf-8"))
+            return _safe_success_result(json.loads(response.read().decode("utf-8")))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        return {"ok": False, "error": {"code": "office_api_error", "status": exc.code, "body": body}}
+        office_error = _parse_office_error(body)
+        return _safe_error(
+            "office_api_error",
+            exc.code,
+            "Office API returned an error",
+            office_error.get("next_action") or "check_office_api",
+        )
     except OSError as exc:
-        return {"ok": False, "error": {"code": "office_unreachable", "message": str(exc)}}
+        return _safe_error("office_unreachable", None, "Office API is unreachable", "start_office_api")
 
 
 def run_stdio() -> None:
@@ -93,16 +100,13 @@ def _run_fastmcp_stdio() -> bool:
     def restore_judgment_from_thread_tool(discord_thread_id: str, draft_text: str) -> str:
         """Restore a drafted judgment using the Office Mac mapping bound to a Discord thread."""
 
-        return json.dumps(
-            restore_judgment_from_thread(discord_thread_id, draft_text),
-            ensure_ascii=False,
-        )
+        return _safe_json_text(restore_judgment_from_thread(discord_thread_id, draft_text))
 
     @server.tool(name="get_case_status_by_thread")
     def get_case_status_by_thread_tool(discord_thread_id: str) -> str:
         """Return non-sensitive Office Mac case status for a Discord thread."""
 
-        return json.dumps(get_case_status_by_thread(discord_thread_id), ensure_ascii=False)
+        return _safe_json_text(get_case_status_by_thread(discord_thread_id))
 
     @server.tool(name="bind_discord_thread_to_case")
     def bind_discord_thread_to_case_tool(
@@ -113,10 +117,7 @@ def _run_fastmcp_stdio() -> bool:
     ) -> str:
         """Bind a Discord thread URL to an Office Mac case manifest."""
 
-        return json.dumps(
-            bind_discord_thread_to_case(case_folder, discord_thread_url, source_dir, case_root),
-            ensure_ascii=False,
-        )
+        return _safe_json_text(bind_discord_thread_to_case(case_folder, discord_thread_url, source_dir, case_root))
 
     server.run()
     return True
@@ -179,18 +180,18 @@ def _handle_jsonrpc(message: dict[str, Any]) -> dict[str, Any] | None:
             name = params.get("name")
             arguments = params.get("arguments") or {}
             if name == "restore_judgment_from_thread":
-                result = {"content": [{"type": "text", "text": json.dumps(restore_judgment_from_thread(**arguments), ensure_ascii=False)}]}
+                result = {"content": [{"type": "text", "text": _safe_json_text(restore_judgment_from_thread(**arguments))}]}
             elif name == "get_case_status_by_thread":
-                result = {"content": [{"type": "text", "text": json.dumps(get_case_status_by_thread(**arguments), ensure_ascii=False)}]}
+                result = {"content": [{"type": "text", "text": _safe_json_text(get_case_status_by_thread(**arguments))}]}
             elif name == "bind_discord_thread_to_case":
-                result = {"content": [{"type": "text", "text": json.dumps(bind_discord_thread_to_case(**arguments), ensure_ascii=False)}]}
+                result = {"content": [{"type": "text", "text": _safe_json_text(bind_discord_thread_to_case(**arguments))}]}
             else:
                 raise ValueError(f"unknown tool: {name}")
         else:
             result = {}
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
-    except Exception as exc:
-        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": str(exc)}}
+    except Exception:
+        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": "Adapter error"}}
 
 
 def _read_framed_message(stream) -> dict[str, Any] | None:
@@ -221,6 +222,53 @@ def _write_framed_message(stream, message: dict[str, Any]) -> None:
     stream.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii"))
     stream.write(body)
     stream.flush()
+
+
+def _safe_error(code: str, status: int | None, message: str, next_action: str) -> dict[str, Any]:
+    payload = {
+        "ok": False,
+        "error": {
+            "code": code,
+            "status": status,
+            "message": message,
+            "next_action": next_action,
+        },
+    }
+    assert_remote_payload_safe(payload)
+    return payload
+
+
+def _safe_success_result(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return _safe_error("office_api_error", None, "Office API returned invalid JSON", "check_office_api")
+    try:
+        assert_remote_payload_safe(payload)
+    except ValueError:
+        return _safe_error("office_api_error", None, "Unsafe Office API response was blocked", "check_office_api")
+    return payload
+
+
+def _safe_json_text(payload: dict[str, Any]) -> str:
+    safe_payload = _safe_success_result(payload) if payload.get("ok") is True else payload
+    try:
+        assert_remote_payload_safe(safe_payload)
+    except ValueError:
+        safe_payload = _safe_error("office_api_error", None, "Unsafe MCP response was blocked", "check_office_api")
+    return json.dumps(safe_payload, ensure_ascii=False)
+
+
+def _parse_office_error(body: str) -> dict[str, Any]:
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return {}
+    detail = data.get("detail") if isinstance(data, dict) else None
+    if isinstance(detail, dict):
+        error = detail.get("error")
+        if isinstance(error, dict):
+            return error
+        return detail
+    return {}
 
 
 if __name__ == "__main__":
