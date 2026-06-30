@@ -26,6 +26,7 @@ tests/*
 !tests/test_sample_integration.py
 !tests/test_regression.py
 !tests/test_linear_engine.py
+!tests/test_china_admin.py
 test_new_rules.py
 scratch_test_samples.py
 .ff-state/

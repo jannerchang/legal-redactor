@@ -9,6 +9,8 @@ from .models import Candidate
 SOURCE_PRIORITY: dict[str, int] = {
     "party_section": 100,
     "hebei_admin_db": 95,
+    "china_admin_db": 93,
+    "china_admin_rules": 85,
     "linear_llm_exact": 90,
     "linear_llm_calibrated": 88,
     "linear_full_org": 75,

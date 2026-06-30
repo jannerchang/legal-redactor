@@ -23,6 +23,8 @@ from .detectors import (
     _clean_person_name,
     _is_false_person
 )
+from .admin_division import AdminDivisionDetector
+from .china_admin_rules import detect_china_admin_rule_candidates
 from .hebei_admin import HebeiAdminDivisionDetector
 from .location_utils import get_location_core
 from .models import BatchRedactionResult, Candidate, Leak, MappingEntry, RedactedDocument, RedactionMap, RedactionResult
@@ -130,6 +132,61 @@ def mask_hebei_text(text: str, get_loc_prefix=None) -> str:
     return res if res else text
 
 
+def _levels_allow_admin_overlap(level: str, used_level: str) -> bool:
+    direct_levels = {"province", "city", "county", "county_city", "township"}
+    return level in direct_levels and used_level in direct_levels
+
+
+def _span_overlaps_admin(
+    spans: list[tuple[int, int, str]],
+    start: int,
+    end: int,
+    level: str = "",
+) -> bool:
+    for used_start, used_end, used_level in spans:
+        if end <= used_start or start >= used_end:
+            continue
+        if _levels_allow_admin_overlap(level, used_level):
+            continue
+        return True
+    return False
+
+
+def _append_admin_detection(
+    candidate: Candidate,
+    *,
+    profile: RedactionProfile,
+    sample_blacklist: set[str],
+    mappings: list[MappingEntry],
+    admin_spans: list[tuple[int, int, str]],
+    get_location_prefix,
+    get_admin_prefix,
+) -> None:
+    if candidate.text in sample_blacklist:
+        return
+    if candidate.type == "grassroots_org":
+        allowed = profile.redact_locations or profile.redact_organizations
+    else:
+        allowed = _candidate_allowed(candidate.type, profile)
+    if not allowed:
+        return
+    level = str(candidate.metadata.get("level", "") or "")
+    if _span_overlaps_admin(admin_spans, candidate.start, candidate.end, level):
+        return
+    admin_spans.append((candidate.start, candidate.end, level))
+    mappings.append(
+        MappingEntry(
+            type=candidate.type,
+            original=candidate.text,
+            masked=_admin_candidate_mask(candidate, get_location_prefix, get_admin_prefix),
+            role=None,
+            source=candidate.source,
+            confidence=candidate.confidence,
+            restore_by_default=True,
+        )
+    )
+
+
 def _admin_candidate_mask(
     candidate: Candidate,
     get_loc_prefix,
@@ -143,7 +200,7 @@ def _admin_candidate_mask(
     level = str(candidate.metadata.get("level", "") or "")
     canonical_name = str(candidate.metadata.get("canonical_name", "") or "")
     division_code = str(candidate.metadata.get("division_code", "") or "")
-    prefix = get_admin_prefix(division_code, canonical_name or text)
+    prefix = get_admin_prefix(division_code, text, canonical_name or text)
     suffix = _admin_mask_suffix(level, text, canonical_name)
     return f"{prefix}{suffix}" if suffix else mask_hebei_text(text, get_loc_prefix)
 
@@ -483,6 +540,16 @@ def _filter_mappings_inside_trusted_samples(text: str, mappings: list[MappingEnt
             filtered.append(mapping)
             continue
         spans = _find_all_spans(text, mapping.original)
+        if mapping.type in {"location", "grassroots_org"} and spans and all(
+            len({
+                container
+                for c_start, c_end, container in trusted_spans
+                if c_start >= start and c_end <= end and mapping.original != container
+            })
+            >= 2
+            for start, end in spans
+        ):
+            continue
         if spans and all(
             any(start >= c_start and end <= c_end and mapping.original != container for c_start, c_end, container in trusted_spans)
             for start, end in spans
@@ -877,7 +944,14 @@ def _merge_organization_alias_mappings(mappings: list[MappingEntry]) -> list[Map
     return merged
 
 
-def extract_and_map_geonames(text: str, get_loc_prefix, profile, sample_blacklist, hebei_admin_detector=None) -> list[MappingEntry]:
+def extract_and_map_geonames(
+    text: str,
+    get_loc_prefix,
+    profile,
+    sample_blacklist,
+    hebei_admin_detector=None,
+    china_admin_detector=None,
+) -> list[MappingEntry]:
     if not _candidate_allowed("location", profile):
         return []
 
@@ -885,7 +959,11 @@ def extract_and_map_geonames(text: str, get_loc_prefix, profile, sample_blacklis
     candidates = []
     if hebei_admin_detector:
         candidates.extend(hebei_admin_detector.detect(text))
-    
+    if china_admin_detector:
+        candidates.extend(china_admin_detector.detect(text))
+    if profile and getattr(profile, "redact_locations", True):
+        candidates.extend(detect_china_admin_rule_candidates(text))
+
     # 启发式地名也收集过来
     c_ner = detect_heuristic_ner_candidates(text)
     candidates.extend(c for c in c_ner if c.type in ("location", "grassroots_org"))
@@ -1044,6 +1122,16 @@ class RedactionPipeline:
             HebeiAdminDivisionDetector(self.config.hebei_admin_db_path)
             if self.config.enable_hebei_admin_db else None
         )
+        self.china_admin_detector = (
+            AdminDivisionDetector(
+                self.config.china_admin_db_path,
+                source="china_admin_db",
+                region_label="全国三级行政区划",
+                max_level="county_city",
+                require_canonical_substring=True,
+            )
+            if self.config.enable_china_admin_db else None
+        )
 
     @property
     def _profile(self) -> RedactionProfile:
@@ -1083,14 +1171,14 @@ class RedactionPipeline:
             return location_prefixes[core]
 
         admin_prefixes: dict[str, str] = {}
-        def get_admin_prefix(division_code: str, name: str) -> str:
-            core = get_location_core(name)
+        def get_admin_prefix(division_code: str, surface_name: str, canonical_name: str = "") -> str:
+            core = get_location_core(surface_name)
             if division_code in admin_prefixes:
                 return admin_prefixes[division_code]
             if core in location_prefixes:
                 admin_prefixes[division_code] = location_prefixes[core]
                 return admin_prefixes[division_code]
-            prefix = get_loc_prefix(name)
+            prefix = get_loc_prefix(surface_name)
             if division_code:
                 admin_prefixes[division_code] = prefix
             return prefix
@@ -1119,7 +1207,10 @@ class RedactionPipeline:
                         if pfx != "某" and len(pfx) == 1:
                             location_prefixes[core] = pfx
 
-        high_conf_spans = []
+        high_conf_spans: list[tuple[int, int]] = []
+
+        def overlaps_high_conf(start: int, end: int) -> bool:
+            return any(not (end <= s or start >= e) for s, e in high_conf_spans)
 
         # 1. 提取 Regex 候选 (高风险数字类，包括案号、手机号、身份证、信用代码等)
         if self.config.enable_regex:
@@ -1145,38 +1236,49 @@ class RedactionPipeline:
         # 1.3. 基于人类级联替换逻辑，扫描全文并建立全国地名全称与核心词的一致性映射
         if self.config.enable_heuristic_ner:
             geoname_mappings = extract_and_map_geonames(
-                scan_text, get_loc_prefix, profile, sample_blacklist,
-                hebei_admin_detector=self.hebei_admin_detector
+                scan_text,
+                get_loc_prefix,
+                profile,
+                sample_blacklist,
+                hebei_admin_detector=self.hebei_admin_detector,
+                china_admin_detector=self.china_admin_detector,
             )
             mappings.extend(geoname_mappings)
 
-        # 1.5. Hebei Admin Division Database Candidates
-        if self.config.enable_hebei_admin_db and self.hebei_admin_detector:
-            c_hebei = self.hebei_admin_detector.detect(scan_text)
-            for c in c_hebei:
-                if c.text in sample_blacklist:
+        # 1.5. Administrative division database candidates (Hebei detail + nationwide 三级)
+        admin_span_buffer: list[tuple[int, int, str]] = []
+        for detector in (self.hebei_admin_detector, self.china_admin_detector):
+            if detector is None:
+                continue
+            for candidate in detector.detect(scan_text):
+                before = len(mappings)
+                _append_admin_detection(
+                    candidate,
+                    profile=profile,
+                    sample_blacklist=sample_blacklist,
+                    mappings=mappings,
+                    admin_spans=admin_span_buffer,
+                    get_location_prefix=get_loc_prefix,
+                    get_admin_prefix=get_admin_prefix,
+                )
+                if len(mappings) > before:
+                    high_conf_spans.append((candidate.start, candidate.end))
+        if self.config.enable_china_admin_rules:
+            for candidate in detect_china_admin_rule_candidates(scan_text):
+                if overlaps_high_conf(candidate.start, candidate.end):
                     continue
-                allowed = False
-                if c.type == "grassroots_org":
-                    allowed = _candidate_allowed("location", profile) or _candidate_allowed("organization", profile)
-                else:
-                    allowed = _candidate_allowed(c.type, profile)
-
-                if allowed:
-                    high_conf_spans.append((c.start, c.end))
-                    masked = _admin_candidate_mask(c, get_loc_prefix, get_admin_prefix)
-                    mappings.append(MappingEntry(
-                        type=c.type,
-                        original=c.text,
-                        masked=masked,
-                        role=None,
-                        source="hebei_admin_db",
-                        confidence=c.confidence,
-                        restore_by_default=True
-                    ))
-
-        def overlaps_high_conf(start: int, end: int) -> bool:
-            return any(not (end <= s or start >= e) for s, e in high_conf_spans)
+                before = len(mappings)
+                _append_admin_detection(
+                    candidate,
+                    profile=profile,
+                    sample_blacklist=sample_blacklist,
+                    mappings=mappings,
+                    admin_spans=admin_span_buffer,
+                    get_location_prefix=get_loc_prefix,
+                    get_admin_prefix=get_admin_prefix,
+                )
+                if len(mappings) > before:
+                    high_conf_spans.append((candidate.start, candidate.end))
 
         # 2. 提取所有的启发式/规则候选（包括当事人解析、启发式 NER、人名兜底）
         fallback_persons: list[Candidate] = []
@@ -1536,14 +1638,14 @@ class RedactionPipeline:
             return location_prefixes[core]
 
         admin_prefixes: dict[str, str] = {}
-        def get_admin_prefix(division_code: str, name: str) -> str:
-            core = get_location_core(name)
+        def get_admin_prefix(division_code: str, surface_name: str, canonical_name: str = "") -> str:
+            core = get_location_core(surface_name)
             if division_code in admin_prefixes:
                 return admin_prefixes[division_code]
             if core in location_prefixes:
                 admin_prefixes[division_code] = location_prefixes[core]
                 return admin_prefixes[division_code]
-            prefix = get_location_prefix(name)
+            prefix = get_location_prefix(surface_name)
             if division_code:
                 admin_prefixes[division_code] = prefix
             return prefix
@@ -1570,34 +1672,33 @@ class RedactionPipeline:
                     )
                 )
 
-        admin_candidates = []
-        admin_spans: list[tuple[int, int]] = []
-        if self.config.enable_hebei_admin_db and self.hebei_admin_detector:
-            detected_admin = sorted(
-                self.hebei_admin_detector.detect(scan_text),
-                key=lambda candidate: (candidate.start, -candidate.length),
-            )
-            for candidate in detected_admin:
-                if candidate.text in sample_blacklist:
-                    continue
-                if candidate.type == "grassroots_org":
-                    allowed = profile.redact_locations or profile.redact_organizations
-                else:
-                    allowed = _candidate_allowed(candidate.type, profile)
-                if not allowed:
-                    continue
-                admin_spans.append((candidate.start, candidate.end))
-                mappings.append(
-                    MappingEntry(
-                        type=candidate.type,
-                        original=candidate.text,
-                        masked=_admin_candidate_mask(candidate, get_location_prefix, get_admin_prefix),
-                        role=None,
-                        source="hebei_admin_db",
-                        confidence=candidate.confidence,
-                        restore_by_default=True,
-                    )
+        admin_candidates: list[Candidate] = []
+        admin_spans: list[tuple[int, int, str]] = []
+        for detector in (self.hebei_admin_detector, self.china_admin_detector):
+            if detector is None:
+                continue
+            for candidate in sorted(
+                detector.detect(scan_text),
+                key=lambda item: (item.start, -item.length),
+            ):
+                before = len(mappings)
+                _append_admin_detection(
+                    candidate,
+                    profile=profile,
+                    sample_blacklist=sample_blacklist,
+                    mappings=mappings,
+                    admin_spans=admin_spans,
+                    get_location_prefix=get_location_prefix,
+                    get_admin_prefix=get_admin_prefix,
                 )
+                if len(mappings) == before:
+                    continue
+        if self.config.enable_china_admin_rules:
+            for candidate in detect_china_admin_rule_candidates(scan_text):
+                level = str(candidate.metadata.get("level", "") or "")
+                if _span_overlaps_admin(admin_spans, candidate.start, candidate.end, level):
+                    continue
+                admin_candidates.append(candidate)
 
         hanlp_candidates: list[Candidate] = []
         if self.config.enable_hanlp_ner:
@@ -1618,7 +1719,7 @@ class RedactionPipeline:
                     continue
                 if any(
                     not (candidate.end <= start or candidate.start >= end)
-                    for start, end in admin_spans
+                    for start, end, _level in admin_spans
                 ):
                     continue
                 hanlp_candidates.append(candidate)
@@ -1631,7 +1732,7 @@ class RedactionPipeline:
                     continue
                 if any(
                     not (candidate.end <= start or candidate.start >= end)
-                    for start, end in admin_spans
+                    for start, end, _level in admin_spans
                 ):
                     continue
                 if len(candidate.text) > 8 or any(
@@ -1752,6 +1853,7 @@ class RedactionPipeline:
             sample_blacklist=sample_blacklist,
             get_location_prefix=get_location_prefix,
             use_semantic_rules=not sentence_extraction_success,
+            use_china_admin_rules=self.config.enable_china_admin_rules,
         )
 
         if not sentence_extraction_success:

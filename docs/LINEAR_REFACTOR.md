@@ -87,7 +87,9 @@
 - `candidate_resolution.py`：候选 span 冲突消解，优先保留高可信来源。
 - `pipeline.py`：处理敏感编号、扫描范围、LLM 可选补充、映射应用和泄漏检查。
 - `detectors.py`：提供局部、高可信的实体发现能力。
-- `hebei_admin.py`：提供行政区划及基层组织的确定性识别。
+- `admin_division.py`：SQLite 行政区划库通用检测器。
+- `china_admin_rules.py`：全国省/市/区县三级路径规则与省级校验。
+- `hebei_admin.py`：河北省详细行政区划及基层组织识别（街道/村居级）。
 - `_samples.py`：保存人工纠错，阻止已知误识别再次进入规则表。
 
 ## 后续演进

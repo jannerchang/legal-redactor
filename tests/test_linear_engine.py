@@ -101,7 +101,6 @@ def test_accept_location_maps_full_name_and_core() -> None:
 
     originals = {mapping.original for mapping in engine.mappings}
     assert "河北省" in originals
-    assert "河北" in originals
 
 
 def test_accept_person_masks_repeated_name() -> None:

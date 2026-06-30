@@ -209,6 +209,9 @@ class PipelineConfig:
     enable_title_parser: bool = True
     enable_hebei_admin_db: bool = True
     hebei_admin_db_path: str = "data/hebei_admin_divisions.sqlite"
+    enable_china_admin_db: bool = True
+    china_admin_db_path: str = "data/china_admin_divisions.sqlite"
+    enable_china_admin_rules: bool = True
     enable_heuristic_ner: bool = True
     enable_hanlp_ner: bool = False
     hanlp_model: str = "MSRA_NER_ELECTRA_SMALL_ZH"

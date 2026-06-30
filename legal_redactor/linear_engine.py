@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
 from .candidate_resolution import is_noisy_org_capture, resolve_candidate_overlaps
+from .china_admin_rules import detect_china_admin_rule_candidates
 from .config import RedactionProfile
 from .counters import TypeCounters
 from .detectors import (
@@ -32,7 +33,14 @@ from .lexicon import (
     LEGAL_SUFFIXES,
     ORG_FULL_RE,
 )
-from .location_utils import ADMIN_SUFFIXES, get_location_core, location_suffix
+from .location_utils import (
+    ADMIN_SUFFIXES,
+    get_location_core,
+    is_compound_admin_path,
+    location_suffix,
+    mask_admin_cascade_path,
+    strip_leading_locations,
+)
 from .models import Candidate, MappingEntry
 from .org_masking import (
     CompanyMaskPlan,
@@ -64,6 +72,7 @@ class LinearRuleEngine:
     seen_originals: set[str] = field(default_factory=set)
     source_text: str = ""
     use_semantic_rules: bool = True
+    use_china_admin_rules: bool = True
     _alias_cores_cache: dict[str, frozenset[str]] = field(default_factory=dict, repr=False)
     _organization_plans: dict[str, CompanyMaskPlan] = field(default_factory=dict, repr=False)
 
@@ -121,6 +130,8 @@ class LinearRuleEngine:
 
         if self.use_semantic_rules:
             candidates.extend(detect_fallback_person_candidates(text))
+            if self.use_china_admin_rules:
+                candidates.extend(detect_china_admin_rule_candidates(text))
 
             if not has_local_org_ner:
                 for match in ORG_FULL_RE.finditer(text):
@@ -308,6 +319,16 @@ class LinearRuleEngine:
             return
         value = candidate.text.strip()
         if _looks_like_false_location(self.source_text, candidate.start, candidate.end, value):
+            return
+        if is_compound_admin_path(value):
+            masked = mask_admin_cascade_path(value, self.get_location_prefix)
+            if masked != value:
+                self._add("location", value, masked, candidate)
+                if value.endswith("省") and len(value) > 1:
+                    core = value[:-1]
+                    self.known_locations[value] = masked
+                    self.known_locations[core] = masked
+                    self._add("location", core, masked, candidate)
             return
         core = get_location_core(value)
         if len(core) < 2:
