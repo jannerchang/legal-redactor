@@ -79,7 +79,6 @@ MAPPING_REVIEW_CATEGORY_LABELS = {
 
 RESTORE_RISK_REASON_LABELS = {
     "delete_candidate": "删除候选会影响后续黑名单和还原复核",
-    "restore_disabled": "该行默认不参与还原",
     "empty_mask": "替换为空，无法可靠还原",
     "risky_delete_guard": "短中文人名未写入全局黑名单",
     "lookup_guard": "未进入可复用样本映射",
@@ -1129,6 +1128,7 @@ async def apply_edited_map_page(request: Request) -> str:
     map_reason = form.getlist("map_reason")
     map_restore_by_default = form.getlist("map_restore_by_default")
     row_delete = form.getlist("row_delete")
+    remap_placeholders = str(form.get("remap_placeholders", "")).strip() == "1"
 
     redaction_map = _redaction_map_from_rows(
         version=map_version, created_at=map_created_at, mode=map_mode,
@@ -1138,6 +1138,10 @@ async def apply_edited_map_page(request: Request) -> str:
         map_restore_by_default=map_restore_by_default,
         row_delete=row_delete,
     )
+    warnings = ["已手动调整映射表。"]
+    if remap_placeholders:
+        redaction_map = replace(redaction_map, mappings=_renumber_mapping_placeholders(redaction_map.mappings))
+        warnings.append("已按当前保留的映射重新排列占位符。")
     pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
     documents = _documents_from_bundle_json(original_bundle_json)
     if documents:
@@ -1149,7 +1153,7 @@ async def apply_edited_map_page(request: Request) -> str:
             redaction_map,
             [],
             leaks,
-            ["已手动调整映射表。"],
+            warnings,
             save_dir=save_dir,
             discord_thread_url=discord_thread_url,
             case_root=case_root,
@@ -1165,7 +1169,7 @@ async def apply_edited_map_page(request: Request) -> str:
         redaction_map,
         [],
         leaks,
-        ["已手动调整映射表。"],
+        warnings,
         save_dir=save_dir,
         discord_thread_url=discord_thread_url,
         case_root=case_root,
@@ -1198,12 +1202,15 @@ def _classify_mapping_review_row(
     original_entry: dict[str, Any] | MappingEntry | None = None,
     deleted: bool = False,
     review_candidate_texts: set[str] | None = None,
+    is_new_row: bool = False,
 ) -> list[str]:
     categories: list[str] = []
     review_candidate_texts = review_candidate_texts or set()
     if entry.confidence < 0.85 or entry.original in review_candidate_texts:
         categories.append("low_confidence")
-    if _source_indicates_manual(entry.source) or original_entry is None and entry.source not in {"rule", "regex", "llm"}:
+    if _source_indicates_manual(entry.source) or (
+        is_new_row and entry.source not in {"rule", "regex", "llm"}
+    ):
         categories.append("manual_added")
     if original_entry is not None:
         old_masked = original_entry.masked if isinstance(original_entry, MappingEntry) else str(original_entry.get("masked", ""))
@@ -1224,11 +1231,6 @@ def _restore_risk_reasons(entry: MappingEntry, *, deleted: bool = False) -> list
         reasons.append({
             "reason_code": "delete_candidate",
             "message": RESTORE_RISK_REASON_LABELS["delete_candidate"],
-        })
-    if not entry.restore_by_default:
-        reasons.append({
-            "reason_code": "restore_disabled",
-            "message": RESTORE_RISK_REASON_LABELS["restore_disabled"],
         })
     if not entry.masked:
         reasons.append({
@@ -2013,7 +2015,7 @@ def _render_redaction_result(
         <nav><a href="/">返回首页</a></nav>
         <div class="downloads">
           <a download="{html.escape(redacted_filename)}" href="{redacted_url}" class="btn">下载脱敏文本</a>
-          <a download="redaction_map.json" href="{map_url}" class="btn btn-secondary">下载 redaction_map</a>
+          <a download="redaction_map.json" href="{map_url}" class="btn btn-secondary" onclick="prepareCurrentMapDownload(this)">下载 redaction_map</a>
           <a download="debug_trace.json" href="{debug_url}" class="btn btn-secondary">下载 debug_trace</a>
           <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制脱敏文本</button>
         </div>
@@ -2034,9 +2036,9 @@ def _render_redaction_result(
             </div>
             <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px;">
               <button type="button" class="btn btn-sm" onclick="saveToLocalPath([{{filename: {html.escape(redacted_filename_json)}, content: document.getElementById('redacted-output').value}}], this)">保存脱敏文本</button>
-              <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'redaction_map.json', content: document.getElementById('mapping-json-output').value}}], this)">保存映射表</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'redaction_map.json', content: readCurrentMappingJson()}}], this)">保存映射表</button>
               <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'debug_trace.json', content: document.getElementById('debug-trace-output').value}}], this)">保存调试追踪</button>
-              <button type="button" class="btn btn-sm" style="background: #e18c12; border-color: #e18c12; color: #fff;" onclick="saveToLocalPath([{{filename: {html.escape(redacted_filename_json)}, content: document.getElementById('redacted-output').value}}, {{filename: 'redaction_map.json', content: document.getElementById('mapping-json-output').value}}], this)">一键保存全部</button>
+              <button type="button" class="btn btn-sm" style="background: #e18c12; border-color: #e18c12; color: #fff;" onclick="if(ensureAppliedMappingForText())saveToLocalPath([{{filename: {html.escape(redacted_filename_json)}, content: document.getElementById('redacted-output').value}}, {{filename: 'redaction_map.json', content: readCurrentMappingJson()}}], this)">一键保存全部</button>
             </div>
           </div>
           <script>
@@ -2092,6 +2094,10 @@ def _render_redaction_result(
               <tbody>{_render_mapping_edit_rows(redaction_map, review_candidates)}</tbody>
             </table>
             <button type="button" class="btn btn-secondary btn-sm" onclick="addBlankRow(this)" style="margin-bottom:12px">＋ 新增一行</button>
+            <label style="display:flex; align-items:center; gap:8px; margin:0 0 12px 0; cursor:pointer;">
+              <input type="checkbox" name="remap_placeholders" value="1" style="width:auto; margin:0;">
+              <span>应用时按当前映射重新排列占位符</span>
+            </label>
             <button type="submit" class="btn">应用表格修改/删除</button>
             <button type="submit" formaction="/redact/save-sample" formtarget="save-iframe" class="btn btn-secondary" style="margin-left:8px;">保存为样本</button>
           </form>
@@ -2187,7 +2193,7 @@ def _render_batch_redaction_result(
         <nav><a href="/">返回首页</a></nav>
         <div class="downloads">
           <a download="{combined_filename}" href="{redacted_url}" class="btn">下载合并脱敏文本</a>
-          <a download="redaction_map.json" href="{map_url}" class="btn btn-secondary">下载统一映射表</a>
+          <a download="redaction_map.json" href="{map_url}" class="btn btn-secondary" onclick="prepareCurrentMapDownload(this)">下载统一映射表</a>
           <a download="debug_trace.json" href="{debug_url}" class="btn btn-secondary">下载 debug_trace</a>
           <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制合并文本</button>
         </div>
@@ -2210,9 +2216,9 @@ def _render_batch_redaction_result(
             </div>
             <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px;">
               <button type="button" class="btn btn-sm" onclick="saveToLocalPath([{{filename: {html.escape(combined_filename_json)}, content: document.getElementById('redacted-output').value}}], this)">保存合并文本</button>
-              <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'redaction_map.json', content: document.getElementById('mapping-json-output').value}}], this)">保存统一映射表</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'redaction_map.json', content: readCurrentMappingJson()}}], this)">保存统一映射表</button>
               <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'debug_trace.json', content: document.getElementById('debug-trace-output').value}}], this)">保存调试追踪</button>
-              <button type="button" class="btn btn-sm" style="background: #e18c12; border-color: #e18c12; color: #fff;" onclick="saveToLocalPath([{{filename: {html.escape(combined_filename_json)}, content: document.getElementById('redacted-output').value}}, {{filename: 'redaction_map.json', content: document.getElementById('mapping-json-output').value}}].concat(_individualRedactedFiles), this)">一键保存全部</button>
+              <button type="button" class="btn btn-sm" style="background: #e18c12; border-color: #e18c12; color: #fff;" onclick="if(ensureAppliedMappingForText())saveToLocalPath([{{filename: {html.escape(combined_filename_json)}, content: document.getElementById('redacted-output').value}}, {{filename: 'redaction_map.json', content: readCurrentMappingJson()}}].concat(_individualRedactedFiles), this)">一键保存全部</button>
             </div>
           </div>
           <script>
@@ -2258,6 +2264,10 @@ def _render_batch_redaction_result(
               <tbody>{_render_mapping_edit_rows(redaction_map, review_candidates)}</tbody>
             </table>
             <button type="button" class="btn btn-secondary btn-sm" onclick="addBlankRow(this)" style="margin-bottom:12px">＋ 新增一行</button>
+            <label style="display:flex; align-items:center; gap:8px; margin:0 0 12px 0; cursor:pointer;">
+              <input type="checkbox" name="remap_placeholders" value="1" style="width:auto; margin:0;">
+              <span>应用时按当前映射重新排列占位符</span>
+            </label>
             <button type="submit" class="btn">应用表格修改/删除到全部文书</button>
             <button type="submit" formaction="/redact/save-sample" formtarget="save-iframe" class="btn btn-secondary" style="margin-left:8px;">保存为样本</button>
           </form>
@@ -3113,6 +3123,82 @@ def _find_mapping_by_original(mappings: list[MappingEntry], original: str) -> Ma
     return None
 
 
+def _renumber_mapping_placeholders(mappings: list[MappingEntry]) -> list[MappingEntry]:
+    group_ordinals: dict[tuple[str, str], str] = {}
+    type_counts: dict[str, int] = {}
+    person_counts: dict[str, int] = {}
+    renumbered: list[MappingEntry] = []
+    for entry in mappings:
+        masked = _renumbered_mask_for_entry(entry, group_ordinals, type_counts, person_counts)
+        renumbered.append(replace(entry, masked=masked) if masked != entry.masked else entry)
+    return renumbered
+
+
+def _renumbered_mask_for_entry(
+    entry: MappingEntry,
+    group_ordinals: dict[tuple[str, str], str],
+    type_counts: dict[str, int],
+    person_counts: dict[str, int],
+) -> str:
+    if entry.type == "person":
+        return _renumber_person_mask(entry, group_ordinals, person_counts)
+    if entry.type in {"organization", "individual_business"}:
+        return _renumber_ordinal_prefix_mask(entry, "organization", group_ordinals, type_counts, _manual_organization_suffix)
+    if entry.type in {"location", "grassroots_org"}:
+        return _renumber_ordinal_prefix_mask(entry, "location", group_ordinals, type_counts, _manual_location_suffix)
+    if entry.type == "project":
+        return _renumber_ordinal_prefix_mask(entry, "project", group_ordinals, type_counts, _project_suffix)
+    return entry.masked
+
+
+def _renumber_person_mask(
+    entry: MappingEntry,
+    group_ordinals: dict[tuple[str, str], str],
+    person_counts: dict[str, int],
+) -> str:
+    match = re.match(r"^(.+?某)([甲乙丙丁戊己庚辛壬癸]|\d+)$", entry.masked or "")
+    if match:
+        stem = match.group(1)
+        old_ordinal = match.group(2)
+    elif re.fullmatch(r"[\u4e00-\u9fa5]{2,4}", entry.original or ""):
+        stem = f"{entry.original[0]}某"
+        old_ordinal = entry.masked or entry.original
+    elif entry.masked:
+        return entry.masked
+    else:
+        stem = "自然人"
+        old_ordinal = entry.original
+    key = ("person", f"{stem}:{old_ordinal}")
+    if key not in group_ordinals:
+        person_counts[stem] = person_counts.get(stem, 0) + 1
+        group_ordinals[key] = _ordinal_value(person_counts[stem])
+    return f"{stem}{group_ordinals[key]}"
+
+
+def _renumber_ordinal_prefix_mask(
+    entry: MappingEntry,
+    counter_key: str,
+    group_ordinals: dict[tuple[str, str], str],
+    type_counts: dict[str, int],
+    suffix_from_original,
+) -> str:
+    match = re.match(r"^([甲乙丙丁戊己庚辛壬癸]|\d+)(.*)$", entry.masked or "")
+    old_group = match.group(1) if match else (entry.masked or entry.original)
+    old_suffix = match.group(2) if match else ""
+    key = (counter_key, old_group)
+    if key not in group_ordinals:
+        type_counts[counter_key] = type_counts.get(counter_key, 0) + 1
+        group_ordinals[key] = _ordinal_value(type_counts[counter_key])
+    suffix = old_suffix if match else suffix_from_original(entry.original)
+    return f"{group_ordinals[key]}{suffix}"
+
+
+def _project_suffix(original: str) -> str:
+    if original.endswith("工程"):
+        return "工程"
+    return "项目"
+
+
 def _suggest_manual_mapping_entry(original: str, entity_type: str, existing: list[MappingEntry]) -> MappingEntry:
     value = original.strip()
     masked = _suggest_manual_mask(value, entity_type, existing)
@@ -3467,7 +3553,12 @@ def _page(title: str, body: str) -> str:
         ['漏识别新增',summary.missing_adds||0]
       ];content.innerHTML=rows.map(function(item){{return '<span><b>'+item[0]+'</b>: '+item[1]+'</span>';}}).join('');panel.hidden=false;}}
       function mappingRowValue(row,name){{var el=row.querySelector('[name="'+name+'"]');if(!el)return '';if(el.type==='checkbox')return el.checked?el.value:'';return el.value||'';}}
-      function restoreRiskReasonsForRow(row){{var reasons=[];var deleted=!!row.querySelector('input[name="row_delete"]:checked');var restore=mappingRowValue(row,'map_restore_by_default')!=='0';var masked=mappingRowValue(row,'map_masked').trim();if(deleted)reasons.push({{reason_code:'delete_candidate',message:restoreRiskReasonLabels.delete_candidate}});if(!restore)reasons.push({{reason_code:'restore_disabled',message:restoreRiskReasonLabels.restore_disabled}});if(!masked)reasons.push({{reason_code:'empty_mask',message:restoreRiskReasonLabels.empty_mask}});return reasons;}}
+      function readCurrentMappingJson(){{var form=document.getElementById('mapping-edit-form');var mapEl=document.getElementById('mapping-json-output');if(!mapEl)return'{{}}';if(!form)return mapEl.value||'{{}}';var base={{}};try{{base=JSON.parse(mapEl.value||'{{}}');}}catch(_err){{base={{}};}}var mappings=[];form.querySelectorAll('tbody tr').forEach(function(row){{var deleted=row.querySelector('input[name="row_delete"]');if(deleted&&deleted.checked)return;var original=mappingRowValue(row,'map_original').trim();var masked=mappingRowValue(row,'map_masked').trim();if(!original||!masked)return;var confidence=parseFloat(mappingRowValue(row,'map_confidence')||'1.0');mappings.push({{type:mappingRowValue(row,'map_type').trim()||'manual',original:original,masked:masked,role:mappingRowValue(row,'map_role').trim()||null,source:mappingRowValue(row,'map_source').trim()||'manual',confidence:isNaN(confidence)?1.0:confidence,restore_by_default:mappingRowValue(row,'map_restore_by_default')!=='0',reason:mappingRowValue(row,'map_reason').trim()||null}});}});base.mappings=mappings;return JSON.stringify(base);}}
+      function replacementSignatureFromMapJson(mapJson){{var parsed={{}};try{{parsed=JSON.parse(mapJson||'{{}}');}}catch(_err){{parsed={{}};}}return JSON.stringify((parsed.mappings||[]).map(function(item){{return [String((item&&item.original)||'').trim(),String((item&&item.masked)||'').trim()];}}).filter(function(pair){{return pair[0]&&pair[1];}}));}}
+      function hasUnappliedMappingReplacementEdits(){{var mapEl=document.getElementById('mapping-json-output');if(!mapEl)return false;return replacementSignatureFromMapJson(mapEl.value||'{{}}')!==replacementSignatureFromMapJson(readCurrentMappingJson());}}
+      function ensureAppliedMappingForText(){{if(!hasUnappliedMappingReplacementEdits())return true;toast('映射表替换关系已修改，请先点「应用表格修改」重新生成脱敏文本', 'warn');return false;}}
+      function prepareCurrentMapDownload(link){{if(!link)return true;link.href='data:application/json;charset=utf-8,'+encodeURIComponent(readCurrentMappingJson());return true;}}
+      function restoreRiskReasonsForRow(row){{var reasons=[];var deleted=!!row.querySelector('input[name="row_delete"]:checked');var masked=mappingRowValue(row,'map_masked').trim();if(deleted)reasons.push({{reason_code:'delete_candidate',message:restoreRiskReasonLabels.delete_candidate}});if(!masked)reasons.push({{reason_code:'empty_mask',message:restoreRiskReasonLabels.empty_mask}});return reasons;}}
       function mappingOriginalIndex(){{var mapEl=document.getElementById('mapping-json-output');var parsed={{}};try{{parsed=JSON.parse(mapEl?mapEl.value||'{{}}':'{{}}');}}catch(_err){{parsed={{}};}}var index={{}};(parsed.mappings||[]).forEach(function(item){{if(item&&item.original)index[item.original]=item;}});return index;}}
       function mappingReviewCandidateIndex(){{var el=document.getElementById('mapping-review-candidates');var values=[];try{{values=JSON.parse(el?el.value||'[]':'[]');}}catch(_err){{values=[];}}var index={{}};(Array.isArray(values)?values:[]).forEach(function(text){{if(text)index[String(text)]=true;}});return index;}}
       function classifyMappingRow(row,originalIndex,reviewCandidateIndex){{var original=mappingRowValue(row,'map_original').trim();var masked=mappingRowValue(row,'map_masked').trim();if(!original&&!masked)return [];var source=mappingRowValue(row,'map_source').trim().toLowerCase();var confidence=parseFloat(mappingRowValue(row,'map_confidence')||'1');var deleted=!!row.querySelector('input[name="row_delete"]:checked');var baseline=originalIndex[original];var cats=[];if((!isNaN(confidence)&&confidence<0.85)||reviewCandidateIndex[original])cats.push('low_confidence');if(source.indexOf('manual')===0||source.indexOf('user')===0||source.indexOf('selection')===0||(!baseline&&['rule','regex','llm'].indexOf(source)<0))cats.push('manual_added');if(baseline&&baseline.masked&&baseline.masked!==masked)cats.push('modified');if(deleted)cats.push('delete_candidate');if(restoreRiskReasonsForRow(row).length)cats.push('restore_risk');if(source.indexOf('sample')>=0)cats.push('sample_reused');return mappingCategoryOrder.filter(function(name){{return cats.indexOf(name)>=0;}});}}
@@ -3475,6 +3566,7 @@ def _page(title: str, body: str) -> str:
       function updateMappingReviewState(form){{form=form||document.getElementById('mapping-edit-form');if(!form)return;var originalIndex=mappingOriginalIndex();var reviewCandidateIndex=mappingReviewCandidateIndex();var counts={{}};mappingCategoryOrder.forEach(function(name){{counts[name]=0;}});var total=0;form.querySelectorAll('[data-map-row]').forEach(function(row){{var cats=classifyMappingRow(row,originalIndex,reviewCandidateIndex);row.dataset.categories=cats.join(' ');renderMappingRowBadges(row,cats);if(mappingRowValue(row,'map_original').trim()&&mappingRowValue(row,'map_masked').trim())total+=1;cats.forEach(function(name){{counts[name]=(counts[name]||0)+1;}});}});document.querySelectorAll('[data-map-filter]').forEach(function(btn){{var category=btn.dataset.mapFilter||'all';var span=btn.querySelector('span');if(span)span.textContent=category==='all'?String(total):String(counts[category]||0);}});}}
       function activeMappingFilter(){{var active=document.querySelector('[data-map-filter].active');return active?active.dataset.mapFilter||'all':'all';}}
       function filterMappingRows(category){{updateMappingReviewState();document.querySelectorAll('[data-map-row]').forEach(function(row){{var cats=(row.getAttribute('data-categories')||'').split(/\\s+/).filter(Boolean);row.style.display=(!category||category==='all'||cats.length===0||cats.indexOf(category)>=0)?'':'none';}});document.querySelectorAll('[data-map-filter]').forEach(function(btn){{btn.classList.toggle('active',(btn.dataset.mapFilter||'all')===(category||'all'));}});}}
+      document.addEventListener('DOMContentLoaded',function(){{if(document.getElementById('mapping-edit-form'))filterMappingRows('all');}});
       function shouldApplyAutoPrefill(currentValue,lastAutoValue){{var current=(currentValue||'').trim();return !current||current===(lastAutoValue||'');}}
       window.addEventListener('message',function(e){{if(!e.data)return;if(e.data.type==='toast')toast(e.data.msg,e.data.cls==='warn'?'warn':'');if(e.data.type==='sample_summary'){{renderSampleSummary(e.data.summary);toast(e.data.msg,e.data.cls==='warn'?'warn':'');}}}});
       document.addEventListener('click',function(e){{var btn=e.target&&e.target.closest?e.target.closest('[data-map-filter]'):null;if(!btn)return;filterMappingRows(btn.dataset.mapFilter||'all');}});
@@ -3629,38 +3721,8 @@ def _page(title: str, body: str) -> str:
 	            }}
 	          }});
 	        }}
-	        function rowValue(row,name){{
-	          var el=row.querySelector('[name="'+name+'"]');
-	          if(!el)return '';
-	          if(el.type==='checkbox')return el.checked?el.value:'';
-	          return el.value||'';
-	        }}
-	        function currentMappingJson(form,mapEl){{
-	          var base={{}};
-	          try{{base=JSON.parse(mapEl.value||'{{}}');}}catch(_err){{base={{}};}}
-	          var rows=form.querySelectorAll('tbody tr');
-	          var mappings=[];
-	          rows.forEach(function(row){{
-	            var deleted=row.querySelector('input[name="row_delete"]');
-	            if(deleted&&deleted.checked)return;
-	            var original=rowValue(row,'map_original').trim();
-	            var masked=rowValue(row,'map_masked').trim();
-	            if(!original||!masked)return;
-	            var confidence=parseFloat(rowValue(row,'map_confidence')||'1.0');
-	            mappings.push({{
-	              type:rowValue(row,'map_type').trim()||'manual',
-	              original:original,
-	              masked:masked,
-	              role:rowValue(row,'map_role').trim()||null,
-	              source:rowValue(row,'map_source').trim()||'manual',
-	              confidence:isNaN(confidence)?1.0:confidence,
-	              restore_by_default:rowValue(row,'map_restore_by_default')!=='0',
-	              reason:rowValue(row,'map_reason').trim()||null
-	            }});
-	          }});
-	          base.mappings=mappings;
-	          return JSON.stringify(base);
-	        }}
+	        function rowValue(row,name){{return mappingRowValue(row,name);}}
+	        function currentMappingJson(form,mapEl){{return readCurrentMappingJson();}}
 	        function appendHidden(parent,name,value){{
 	          var input=document.createElement('input');
 	          input.type='hidden';
@@ -3834,7 +3896,6 @@ def _page(title: str, body: str) -> str:
 
 		      async function createDiscordThread(buttonEl) {{
 		        var textEl = document.getElementById(buttonEl.dataset.textareaId || 'redacted-output');
-		        var mapEl = document.getElementById(buttonEl.dataset.mapTextareaId || 'mapping-json-output');
 		        var messageEl = document.getElementById(buttonEl.dataset.messageId || '');
 		        var causeEl = document.getElementById(buttonEl.dataset.caseCauseId || '');
 		        var statusEl = document.getElementById(buttonEl.dataset.statusId || '');
@@ -3843,7 +3904,11 @@ def _page(title: str, body: str) -> str:
           toast('没有可发送的脱敏内容', 'warn');
           return;
         }}
-        if (!mapEl || !mapEl.value) {{
+        if (!ensureAppliedMappingForText()) return;
+        var mapJson = readCurrentMappingJson();
+        var parsedMap = {{}};
+        try {{parsedMap = JSON.parse(mapJson || '{{}}');}} catch (_err) {{parsedMap = {{}};}}
+        if (!parsedMap.mappings || !parsedMap.mappings.length) {{
           toast('缺少映射表，无法绑定案件', 'warn');
           return;
         }}
@@ -3858,7 +3923,7 @@ def _page(title: str, body: str) -> str:
 		          case_cause: causeEl ? causeEl.value : '',
 		          filename: buttonEl.dataset.filename || 'redacted.txt',
 	          content: textEl.value,
-	          map_json: mapEl.value,
+	          map_json: mapJson,
 	          message: messageEl ? messageEl.value : ''
 	        }};
 	        try {{
