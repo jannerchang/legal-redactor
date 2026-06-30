@@ -281,17 +281,21 @@ def _case_root_for_bind(
     if source_root is not None:
         return source_root
 
-    if case_root_override and str(case_root_override).strip():
-        return Path(case_root_override).expanduser()
-
     configured = Path(configured_case_root).expanduser()
+    override_root = Path(case_root_override).expanduser() if case_root_override and str(case_root_override).strip() else None
+    candidates = _bind_case_root_candidates(configured)
+    if override_root is not None and override_root.exists():
+        candidates = [override_root, *candidates]
+
     existing = [
         candidate
-        for candidate in _bind_case_root_candidates(configured)
+        for candidate in candidates
         if (candidate / case_folder.strip()).exists()
     ]
     if existing:
         return max(existing, key=lambda candidate: _case_directory_score(candidate / case_folder.strip()))
+    if override_root is not None and override_root.exists():
+        return override_root
     return configured
 
 

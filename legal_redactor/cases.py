@@ -115,6 +115,10 @@ class CaseManifest:
     source_dir: str | None
     discord_thread_url: str
     discord_thread_id: str
+    hermes_request_id: str = ""
+    hermes_requested_at: str = ""
+    hermes_command_message_id: str = ""
+    hermes_command_channel_id: str = ""
     redacted_dir: str = "redacted"
     mapping_dir: str = "mapping"
     restored_dir: str = "restored"
@@ -144,6 +148,10 @@ class CaseManifest:
             source_dir=data.get("source_dir"),
             discord_thread_url=str(data.get("discord_thread_url", "")),
             discord_thread_id=str(data["discord_thread_id"]),
+            hermes_request_id=str(data.get("hermes_request_id", "")),
+            hermes_requested_at=str(data.get("hermes_requested_at", "")),
+            hermes_command_message_id=str(data.get("hermes_command_message_id", "")),
+            hermes_command_channel_id=str(data.get("hermes_command_channel_id", "")),
             redacted_dir=str(data.get("redacted_dir", "redacted")),
             mapping_dir=str(data.get("mapping_dir", "mapping")),
             restored_dir=str(data.get("restored_dir", "restored")),
@@ -441,6 +449,25 @@ def create_or_update_manifest(
     return manifest
 
 
+def record_hermes_thread_request(
+    case_root: str | Path,
+    case_folder: str,
+    request_id: str,
+    *,
+    source_dir: str | None = None,
+    command_message_id: str = "",
+    command_channel_id: str = "",
+) -> CaseManifest:
+    manifest = create_or_update_manifest(case_root, case_folder, "", source_dir=source_dir)
+    if not manifest.discord_thread_url:
+        manifest.hermes_request_id = str(request_id).strip()
+        manifest.hermes_requested_at = _now_iso()
+        manifest.hermes_command_message_id = str(command_message_id or "")
+        manifest.hermes_command_channel_id = str(command_channel_id or "")
+        save_manifest(case_dir(case_root, case_folder), manifest)
+    return manifest
+
+
 def case_thread_binding_status(
     case_root: str | Path,
     case_folder: str,
@@ -560,6 +587,8 @@ def manifest_safe_summary(case_path: str | Path, manifest: CaseManifest) -> dict
         "case_folder": manifest.case_folder,
         "discord_thread_url": manifest.discord_thread_url,
         "discord_thread_id": manifest.discord_thread_id,
+        "hermes_request_id": manifest.hermes_request_id,
+        "hermes_requested_at": manifest.hermes_requested_at,
         "workflow_state": case_workflow_state(manifest=manifest),
         "redacted_file_count": len(manifest.redacted_files),
         "mapping_present": mapping_path.exists(),
@@ -581,12 +610,12 @@ def case_workflow_state(
         return "attach_failed"
     if attach_status == "sent":
         return "sent_discord"
-    if hermes_requested:
-        return "waiting_hermes"
     if manifest and manifest.discord_thread_url:
         return "bound_thread"
     if discord_thread_url.strip():
         return "bound_thread"
+    if hermes_requested or (manifest and manifest.hermes_request_id):
+        return "waiting_hermes"
     if saved_local or manifest is not None:
         return "saved_local"
     return "not_saved"

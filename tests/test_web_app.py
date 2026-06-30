@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 try:
-    from legal_redactor.cases import create_or_update_manifest, write_last_restore_metadata
+    from legal_redactor.cases import create_or_update_manifest, load_manifest, write_last_restore_metadata
     from legal_redactor.io import redaction_map_to_json, save_redaction_map
     from legal_redactor.models import MappingEntry, RedactedDocument, RedactionMap, RedactionResult
     from legal_redactor.web_app import (
@@ -19,6 +19,7 @@ try:
         _classify_mapping_review_row,
         _decode_text_bytes,
         _persist_optional_case_redaction,
+        _read_input_documents,
         _read_restore_map_text,
         _read_upload_text,
         _render_case_workflow_panel,
@@ -29,6 +30,7 @@ try:
         _should_apply_auto_prefill,
         _suggest_manual_mapping_entry,
         _suggest_case_location_from_filenames,
+        _suggest_case_location_from_relative_paths,
         send_redacted_to_discord,
         attach_to_bound_discord_thread,
         app,
@@ -41,6 +43,7 @@ except RuntimeError as exc:  # Web deps are optional for non-Web unit runs.
     _classify_mapping_review_row = None
     _decode_text_bytes = None
     _persist_optional_case_redaction = None
+    _read_input_documents = None
     _read_restore_map_text = None
     _read_upload_text = None
     _render_case_workflow_panel = None
@@ -51,6 +54,7 @@ except RuntimeError as exc:  # Web deps are optional for non-Web unit runs.
     _should_apply_auto_prefill = None
     _suggest_manual_mapping_entry = None
     _suggest_case_location_from_filenames = None
+    _suggest_case_location_from_relative_paths = None
     send_redacted_to_discord = None
     attach_to_bound_discord_thread = None
     app = None
@@ -133,6 +137,11 @@ class WebAppUploadTests(unittest.TestCase):
 
         self.assertIn("系统状态", page)
         self.assertIn("Office 还原 API", page)
+        self.assertIn('id="case-root-input"', page)
+        self.assertIn("data-auto-value=", page)
+        self.assertIn('id="source-directory-files"', page)
+        self.assertIn('name="case_folder_files"', page)
+        self.assertIn('id="upload-relative-paths-input"', page)
         self.assertNotIn("super-secret-token", page)
 
     def test_status_panel_renders_state_labels(self) -> None:
@@ -429,6 +438,125 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertEqual(data["workflow_state"], "bound_thread")
         self.assertEqual(data["manifest"]["case_folder"], "2026 3624")
 
+    def test_suggest_case_location_api_does_not_scope_to_default_root_value(self) -> None:
+        from pathlib import Path
+        from fastapi.testclient import TestClient
+
+        with tempfile.TemporaryDirectory() as default_root, tempfile.TemporaryDirectory() as search_root:
+            root = Path(search_root)
+            case_path = root / "2026 7777"
+            case_path.mkdir()
+            (case_path / "judgment.docx").write_text("placeholder", encoding="utf-8")
+
+            with (
+                patch.dict(os.environ, {"LEGAL_REDACTOR_CASE_ROOT": default_root}),
+                patch("legal_redactor.cases.case_location_search_roots", return_value=[root]),
+            ):
+                response = TestClient(app).post(
+                    "/api/suggest-case-location",
+                    json={"filenames": ["judgment.docx"], "case_root": default_root},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "ok")
+        self.assertEqual(data["case_folder"], "2026 7777")
+        self.assertEqual(data["case_root"], str(root.resolve()))
+
+    def test_suggest_case_location_api_keeps_manual_root_scope(self) -> None:
+        from pathlib import Path
+        from fastapi.testclient import TestClient
+
+        with (
+            tempfile.TemporaryDirectory() as default_root,
+            tempfile.TemporaryDirectory() as manual_root,
+            tempfile.TemporaryDirectory() as search_root,
+        ):
+            root = Path(search_root)
+            case_path = root / "2026 7777"
+            case_path.mkdir()
+            (case_path / "judgment.docx").write_text("placeholder", encoding="utf-8")
+
+            with (
+                patch.dict(os.environ, {"LEGAL_REDACTOR_CASE_ROOT": default_root}),
+                patch("legal_redactor.cases.case_location_search_roots", return_value=[root]),
+            ):
+                response = TestClient(app).post(
+                    "/api/suggest-case-location",
+                    json={"filenames": ["judgment.docx"], "case_root": manual_root},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "not_found")
+        self.assertEqual(data["workflow_state"], "not_saved")
+
+    def test_suggest_case_location_from_relative_paths_uses_folder_name(self) -> None:
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            case_path = root / "2026 8888"
+            case_path.mkdir()
+
+            result = _suggest_case_location_from_relative_paths(
+                ["2026 8888/judgment.docx", "2026 8888/evidence/证据目录.pdf"],
+                [root],
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["case_folder"], "2026 8888")
+        self.assertEqual(result["case_root"], str(root.resolve()))
+        self.assertEqual(result["matched_dir"], str(case_path.resolve()))
+        self.assertIn({"kind": "upload_relative_path", "case_folder": "2026 8888"}, result["evidence"])
+
+    def test_suggest_case_location_api_prefers_relative_folder_over_same_filename(self) -> None:
+        from pathlib import Path
+        from fastapi.testclient import TestClient
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            old_case = root / "2026 1111"
+            selected_case = root / "2026 8888"
+            old_case.mkdir()
+            selected_case.mkdir()
+            (old_case / "judgment.docx").write_text("old", encoding="utf-8")
+
+            response = TestClient(app).post(
+                "/api/suggest-case-location",
+                json={
+                    "filenames": ["judgment.docx"],
+                    "relative_paths": ["2026 8888/judgment.docx"],
+                    "case_root": tmpdir,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "ok")
+        self.assertEqual(data["case_folder"], "2026 8888")
+        self.assertEqual(data["case_root"], str(root.resolve()))
+
+    def test_read_input_documents_skips_unsupported_case_folder_files(self) -> None:
+        import asyncio
+
+        docs = asyncio.run(
+            _read_input_documents(
+                "",
+                None,
+                [],
+                [
+                    MockUploadFile("2026 8888/judgment.txt", "张三".encode("utf-8")),
+                    MockUploadFile("2026 8888/photo.jpg", b"not text"),
+                    MockUploadFile("2026 8888/._judgment.txt", b"appledouble"),
+                ],
+            )
+        )
+
+        self.assertEqual(len(docs), 1)
+        self.assertEqual(docs[0].source_file, "2026 8888/judgment.txt")
+        self.assertEqual(docs[0].text, "张三")
+
     def test_suggest_case_location_api_returns_ambiguous_shape(self) -> None:
         from pathlib import Path
         from fastapi.testclient import TestClient
@@ -555,6 +683,55 @@ class WebAppUploadTests(unittest.TestCase):
             self.assertEqual(manifest.discord_thread_url, "")
             self.assertEqual(manifest.discord_thread_id, "")
 
+    def test_redact_route_directory_upload_prefers_inferred_root_over_default_root(self) -> None:
+        from pathlib import Path
+        from fastapi.testclient import TestClient
+        from legal_redactor.cases import load_manifest
+
+        class FakePipeline:
+            def __init__(self, config) -> None:
+                self.config = config
+
+            def redact(self, text, source_file=None, base_redaction_map=None):
+                return RedactionResult(
+                    original_text=text,
+                    redacted_text="【PERSON_001】",
+                    redaction_map=RedactionMap.create([]),
+                    candidates=[],
+                    review_candidates=[],
+                    leaks=[],
+                    mode="test",
+                    warnings=[],
+                )
+
+        with tempfile.TemporaryDirectory() as default_root, tempfile.TemporaryDirectory() as actual_root:
+            actual = Path(actual_root)
+            (actual / "2026 8888").mkdir()
+            with (
+                patch.dict(os.environ, {"LEGAL_REDACTOR_CASE_ROOT": default_root}),
+                patch("legal_redactor.web_app._case_location_search_roots", return_value=[actual]),
+                patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
+            ):
+                response = TestClient(app).post(
+                    "/redact",
+                    data={
+                        "case_root": default_root,
+                        "upload_relative_paths": json.dumps(["2026 8888/judgment.txt"], ensure_ascii=False),
+                    },
+                    files=[
+                        (
+                            "case_folder_files",
+                            ("2026 8888/judgment.txt", "张三".encode("utf-8"), "text/plain"),
+                        )
+                    ],
+                )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn('data-workflow-state="saved_local"', response.text)
+            manifest = load_manifest(actual / "2026 8888")
+            self.assertEqual(manifest.case_folder, "2026 8888")
+            self.assertFalse((Path(default_root) / "2026 8888").exists())
+
     def test_suggest_manual_person_mapping_continues_same_surname_counter(self) -> None:
         existing = [
             MappingEntry(
@@ -646,26 +823,77 @@ class WebAppUploadTests(unittest.TestCase):
             calls.append((channel_id, content))
             return {"message_id": "m1", "channel_id": channel_id}
 
-        with patch("legal_redactor.web_app._discord_command_channel_id", return_value="1501248343823880345"):
-            with patch("legal_redactor.web_app._post_discord_channel_message", side_effect=fake_post):
-                response = asyncio.run(
-                    create_discord_thread(
-                        MockJsonRequest(
-                            {
-                                "case_folder": "2026 5987",
-                                "case_cause": "劳动争议纠纷",
-                                "request_id": "lr_test",
-                            }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("legal_redactor.web_app._discord_command_channel_id", return_value="1501248343823880345"):
+                with patch("legal_redactor.web_app._post_discord_channel_message", side_effect=fake_post):
+                    response = asyncio.run(
+                        create_discord_thread(
+                            MockJsonRequest(
+                                {
+                                    "case_root": tmpdir,
+                                    "case_folder": "2026 5987",
+                                    "case_cause": "劳动争议纠纷",
+                                    "request_id": "lr_test",
+                                }
+                            )
                         )
                     )
-                )
+            manifest = load_manifest(os.path.join(tmpdir, "2026 5987"))
 
         self.assertEqual(response.status_code, 200)
         data = json.loads(response.body.decode("utf-8"))
         self.assertEqual(data["status"], "pending")
         self.assertEqual(data["workflow_state"], "waiting_hermes")
         self.assertEqual(data["request_id"], "lr_test")
+        self.assertEqual(manifest.hermes_request_id, "lr_test")
+        self.assertEqual(manifest.hermes_command_message_id, "m1")
         self.assertEqual(calls, [("1501248343823880345", _case_creation_command("2026 5987", "lr_test", "劳动争议纠纷"))])
+
+    def test_create_discord_thread_reuses_pending_hermes_request(self) -> None:
+        import asyncio
+
+        calls = []
+
+        def fake_post(channel_id: str, content: str) -> dict[str, str]:
+            calls.append((channel_id, content))
+            return {"message_id": "m1", "channel_id": channel_id}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("legal_redactor.web_app._discord_command_channel_id", return_value="1501248343823880345"):
+                with patch("legal_redactor.web_app._post_discord_channel_message", side_effect=fake_post):
+                    first = asyncio.run(
+                        create_discord_thread(
+                            MockJsonRequest(
+                                {
+                                    "case_root": tmpdir,
+                                    "case_folder": "2026 5987",
+                                    "case_cause": "劳动争议纠纷",
+                                    "request_id": "lr_test",
+                                }
+                            )
+                        )
+                    )
+                    second = asyncio.run(
+                        create_discord_thread(
+                            MockJsonRequest(
+                                {
+                                    "case_root": tmpdir,
+                                    "case_folder": "2026 5987",
+                                    "case_cause": "劳动争议纠纷",
+                                    "request_id": "lr_second",
+                                }
+                            )
+                        )
+                    )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        data = json.loads(second.body.decode("utf-8"))
+        self.assertEqual(data["status"], "pending")
+        self.assertEqual(data["workflow_state"], "waiting_hermes")
+        self.assertEqual(data["request_id"], "lr_test")
+        self.assertEqual(data["command_message_id"], "m1")
+        self.assertEqual(len(calls), 1)
 
     def test_create_discord_thread_rejects_forged_state(self) -> None:
         import asyncio
@@ -698,25 +926,83 @@ class WebAppUploadTests(unittest.TestCase):
                 io.BytesIO(b'{"message":"/Users/jannerchang/private secret-token-value"}'),
             )
 
-        with patch.dict(os.environ, {"LEGAL_REDACTOR_DISCORD_BOT_TOKEN": "bot-token"}):
-            with patch("legal_redactor.web_app._discord_command_channel_id", return_value="1"):
-                with patch("legal_redactor.web_app.urllib.request.urlopen", side_effect=fail):
-                    response = asyncio.run(
-                        create_discord_thread(
-                            MockJsonRequest(
-                                {
-                                    "case_folder": "2026 5987",
-                                    "case_cause": "劳动争议纠纷",
-                                }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"LEGAL_REDACTOR_DISCORD_BOT_TOKEN": "bot-token"}):
+                with patch("legal_redactor.web_app._discord_command_channel_id", return_value="1"):
+                    with patch("legal_redactor.web_app.urllib.request.urlopen", side_effect=fail):
+                        response = asyncio.run(
+                            create_discord_thread(
+                                MockJsonRequest(
+                                    {
+                                        "case_root": tmpdir,
+                                        "case_folder": "2026 5987",
+                                        "case_cause": "劳动争议纠纷",
+                                    }
+                                )
                             )
                         )
-                    )
 
         data = json.loads(response.body.decode("utf-8"))
         self.assertEqual(response.status_code, 400)
         self.assertEqual(data["code"], "discord_api_error")
         self.assertNotIn("/Users", data["message"])
         self.assertNotIn("secret-token-value", data["message"])
+
+    def test_send_redacted_to_discord_uses_custom_message(self) -> None:
+        import asyncio
+
+        calls = []
+
+        def fake_post(thread_id: str, filename: str, content: str, message: str = "") -> dict[str, str]:
+            calls.append((thread_id, filename, content, message))
+            return {"message_id": "m2", "channel_id": thread_id}
+
+        with patch("legal_redactor.web_app._post_discord_thread_file", side_effect=fake_post):
+            response = asyncio.run(
+                send_redacted_to_discord(
+                    MockJsonRequest(
+                        {
+                            "discord_thread_url": "https://discord.com/channels/1/2/3",
+                            "filename": "redacted.txt",
+                            "content": "脱敏内容",
+                            "message": "请按我填写的附言发送。",
+                        }
+                    )
+                )
+            )
+
+        data = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(calls, [("3", "redacted.txt", "脱敏内容", "请按我填写的附言发送。")])
+
+    def test_send_redacted_to_discord_falls_back_when_message_contains_path(self) -> None:
+        import asyncio
+
+        calls = []
+
+        def fake_post(thread_id: str, filename: str, content: str, message: str = "") -> dict[str, str]:
+            calls.append((thread_id, filename, content, message))
+            return {"message_id": "m2", "channel_id": thread_id}
+
+        with patch("legal_redactor.web_app._post_discord_thread_file", side_effect=fake_post):
+            response = asyncio.run(
+                send_redacted_to_discord(
+                    MockJsonRequest(
+                        {
+                            "discord_thread_url": "https://discord.com/channels/1/2/3",
+                            "filename": "redacted.txt",
+                            "content": "脱敏内容",
+                            "message": "请看 /Users/jannerchang/private/case.docx",
+                        }
+                    )
+                )
+            )
+
+        data = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(calls, [("3", "redacted.txt", "脱敏内容", "脱敏文件已生成，请见附件：redacted.txt")])
 
     def test_attach_bound_discord_thread_waits_for_manifest(self) -> None:
         import asyncio
@@ -793,7 +1079,7 @@ class WebAppUploadTests(unittest.TestCase):
             self.assertEqual(data["status"], "success")
             self.assertEqual(data["workflow_state"], "sent_discord")
             self.assertEqual(data["thread_url"], "https://discord.com/channels/1/2/3")
-            self.assertEqual(calls, [("3", "redacted.txt", "【PERSON_001】", "脱敏文件已生成，请见附件：redacted.txt")])
+            self.assertEqual(calls, [("3", "redacted.txt", "【PERSON_001】", "请见附件")])
             self.assertNotIn("/cases/", calls[0][3])
             self.assertTrue(os.path.exists(os.path.join(tmpdir, "2026 5987 劳动争议纠纷", "redacted", "redacted.txt")))
             self.assertTrue(os.path.exists(os.path.join(tmpdir, "2026 5987 劳动争议纠纷", "mapping", "redaction_map.enc")))

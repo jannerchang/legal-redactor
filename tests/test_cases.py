@@ -19,6 +19,7 @@ from legal_redactor.cases import (
     load_manifest,
     manifest_public_status,
     parse_discord_thread_id,
+    record_hermes_thread_request,
     restore_status_summary,
     sanitize_case_relative_path,
     suggest_case_location_from_filenames,
@@ -68,6 +69,23 @@ def test_create_or_update_manifest_rejects_thread_mismatch(tmp_path) -> None:
     loaded = load_manifest(tmp_path / "2025 8765")
     assert loaded.discord_thread_id == "333"
     assert loaded.discord_thread_url == "https://discord.com/channels/111/222/333"
+
+
+def test_record_hermes_request_marks_manifest_waiting(tmp_path) -> None:
+    manifest = record_hermes_thread_request(
+        tmp_path,
+        "2025 8765",
+        "lr_test",
+        command_message_id="m1",
+        command_channel_id="c1",
+    )
+
+    loaded = load_manifest(tmp_path / "2025 8765")
+    assert manifest.hermes_request_id == loaded.hermes_request_id == "lr_test"
+    assert loaded.hermes_command_message_id == "m1"
+    assert loaded.hermes_command_channel_id == "c1"
+    assert loaded.discord_thread_url == ""
+    assert case_workflow_state(manifest=loaded) == "waiting_hermes"
 
 
 def test_workflow_state_vocabulary_is_fixed() -> None:

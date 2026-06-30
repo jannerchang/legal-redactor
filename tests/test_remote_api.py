@@ -141,6 +141,25 @@ def test_bind_discord_thread_to_case_prefers_source_dir_over_case_root_override(
     assert not (configured_root / "case" / "manifest.json").exists()
 
 
+def test_bind_discord_thread_to_case_ignores_missing_remote_case_root_override(tmp_path, monkeypatch) -> None:
+    configured_root = tmp_path / "configured-root"
+    office_case_root = tmp_path / "office-cases"
+    remote_only_root = tmp_path / "missing-home-mac-root"
+    (office_case_root / "2026 4590").mkdir(parents=True)
+    monkeypatch.setattr("legal_redactor.remote_api._bind_case_root_candidates", lambda configured: [configured_root, office_case_root])
+
+    result = bind_discord_thread_to_case(
+        configured_root,
+        "2026 4590",
+        "https://discord.com/channels/1/2/3",
+        case_root_override=remote_only_root,
+    )
+
+    assert result["ok"] is True
+    assert (office_case_root / "2026 4590" / "manifest.json").exists()
+    assert not (remote_only_root / "2026 4590" / "manifest.json").exists()
+
+
 def test_case_status_by_thread_returns_discord_thread_url(tmp_path, monkeypatch) -> None:
     create_or_update_manifest(tmp_path, "2026 6372", "https://discord.com/channels/1498679306967056394/1520000496138457160")
     monkeypatch.setattr("legal_redactor.remote_api.get_case_root", lambda: tmp_path)

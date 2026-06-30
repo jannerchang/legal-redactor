@@ -15,7 +15,7 @@ import tempfile
 from dataclasses import dataclass, replace
 from datetime import datetime
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from zipfile import BadZipFile
 
@@ -27,13 +27,16 @@ from .cases import (
     case_dir,
     case_root_from_source_dir,
     case_workflow_public,
+    case_workflow_state,
     default_case_root,
     load_manifest,
     manifest_fields_for_case_dir,
     parse_discord_thread_id,
     persist_case_redaction,
     raise_for_forged_workflow_fields,
+    record_hermes_thread_request,
     suggest_case_location_from_filenames as case_suggest_case_location_from_filenames,
+    case_thread_binding_status,
     validate_case_folder_name,
     workflow_state_message,
 )
@@ -93,6 +96,8 @@ SAMPLE_SUMMARY_KEYS = (
     "newest_sample_provenance",
     "regression_suggestions",
 )
+
+SUPPORTED_UPLOAD_SUFFIXES = {".txt", ".md", ".doc", ".docx", ".pdf"}
 
 
 @app.get("/health")
@@ -211,8 +216,17 @@ async def suggest_case_location(request: Request) -> JSONResponse:
     filenames = body.get("filenames", [])
     roots = []
     case_root = str(body.get("case_root", "")).strip()
-    if case_root:
+    if case_root and not _is_default_case_root_value(case_root):
         roots.append(Path(case_root).expanduser())
+    relative_paths = body.get("relative_paths") or body.get("upload_relative_paths") or []
+    if _safe_upload_relative_paths(relative_paths):
+        relative_suggestion = _suggest_case_location_from_relative_paths(
+            relative_paths,
+            roots or None,
+            discord_thread_url=str(body.get("discord_thread_url", "")).strip(),
+        )
+        if relative_suggestion.get("status") != "not_found":
+            return JSONResponse(relative_suggestion)
     suggestion = _suggest_case_location_from_filenames(
         filenames,
         roots or None,
@@ -244,7 +258,7 @@ async def send_redacted_to_discord(request: Request) -> JSONResponse:
             thread_id,
             filename,
             content,
-            _safe_discord_attachment_message(filename),
+            _safe_discord_attachment_message(filename, str(body.get("message", ""))),
         )
     except DiscordApiError as exc:
         return _case_error_response(str(exc), code=exc.code)
@@ -263,6 +277,37 @@ async def create_discord_thread(request: Request) -> JSONResponse:
     case_cause = str(body.get("case_cause", "")).strip()
     if not case_folder:
         return _case_error_response("缺少案件文件夹名")
+    source_dir = str(body.get("source_dir", "")).strip() or None
+    try:
+        source_root = case_root_from_source_dir(source_dir, case_folder) if source_dir else None
+        case_root = str(source_root or str(body.get("case_root", "")).strip() or default_case_root())
+        case_path = case_dir(case_root, case_folder)
+        manifest = load_manifest(case_path) if (case_path / "manifest.json").exists() else None
+    except CaseError as exc:
+        return _case_error_response(str(exc), code=getattr(exc, "code", "case_error"))
+    except Exception as exc:
+        return _case_error_response(f"案件 manifest 读取失败: {exc}")
+    if manifest and manifest.discord_thread_url:
+        return JSONResponse(
+            {
+                "status": "bound",
+                "workflow_state": "bound_thread",
+                "thread_url": manifest.discord_thread_url,
+                "thread_id": manifest.discord_thread_id,
+                "message": "案件已绑定 Discord 帖子",
+            }
+        )
+    if manifest and manifest.hermes_request_id:
+        return JSONResponse(
+            {
+                "status": "pending",
+                "workflow_state": "waiting_hermes",
+                "request_id": manifest.hermes_request_id,
+                "command_message_id": manifest.hermes_command_message_id,
+                "channel_id": manifest.hermes_command_channel_id,
+                "message": "已有 Hermes 建帖请求，继续等待写回帖子链接",
+            }
+        )
     request_id = str(body.get("request_id") or _new_discord_request_id())
     try:
         command = _case_creation_command(
@@ -271,6 +316,14 @@ async def create_discord_thread(request: Request) -> JSONResponse:
             case_cause,
         )
         result = _post_discord_channel_message(_discord_command_channel_id(), command)
+        manifest = record_hermes_thread_request(
+            case_root,
+            case_folder,
+            request_id,
+            source_dir=source_dir,
+            command_message_id=result.get("message_id", ""),
+            command_channel_id=result.get("channel_id", ""),
+        )
     except CaseError as exc:
         return _case_error_response(str(exc), code=getattr(exc, "code", "case_error"))
     except DiscordApiError as exc:
@@ -280,9 +333,9 @@ async def create_discord_thread(request: Request) -> JSONResponse:
     return JSONResponse({
         "status": "pending",
         "workflow_state": "waiting_hermes",
-        "request_id": request_id,
-        "command_message_id": result.get("message_id", ""),
-        "channel_id": result.get("channel_id", ""),
+        "request_id": manifest.hermes_request_id or request_id,
+        "command_message_id": manifest.hermes_command_message_id or result.get("message_id", ""),
+        "channel_id": manifest.hermes_command_channel_id or result.get("channel_id", ""),
         "message": "已发送建帖请求，等待 Hermes 通过 MCP 写回帖子链接",
     })
 
@@ -326,7 +379,7 @@ async def attach_to_bound_discord_thread(request: Request) -> JSONResponse:
             thread_id,
             filename=filename,
             content=content,
-            message=_safe_discord_attachment_message(filename),
+            message=_safe_discord_attachment_message(filename, str(body.get("message", ""))),
         )
         persist_case_redaction(
             case_root,
@@ -396,6 +449,9 @@ def index() -> str:
             <textarea name="text" id="text-input" rows="12" placeholder="粘贴文书原文，或拖拽 txt/md/doc/docx/pdf 文件到此处"></textarea>
             <label>或上传 txt / md / doc / docx / pdf（可多选）</label>
             <input type="file" id="source-files" name="files" accept=".txt,.md,.doc,.docx,.pdf" multiple>
+            <label>或选择案件文件夹（推荐）</label>
+            <input type="file" id="source-directory-files" name="case_folder_files" accept=".txt,.md,.doc,.docx,.pdf" webkitdirectory directory multiple>
+            <input type="hidden" id="upload-relative-paths-input" name="upload_relative_paths" value="">
             <div class="row">
               <p class="hint">统一标准脱敏：人名、地名、机构名称及敏感编号按同一套规则处理。</p>
               <input type="hidden" name="enable_llm" value="1">
@@ -423,7 +479,7 @@ def index() -> str:
               <label>Discord 帖子链接</label>
               <input type="url" id="discord-thread-url-input" name="discord_thread_url" placeholder="可留空，脱敏完成后可请求 Hermes 新建并回写 Discord 链接">
               <label>案件库根目录</label>
-              <input type="text" id="case-root-input" name="case_root" value="{html.escape(str(default_case_root()))}">
+              <input type="text" id="case-root-input" name="case_root" value="{html.escape(str(default_case_root()))}" data-auto-value="{html.escape(str(default_case_root()), quote=True)}">
               <label>原文件所在目录</label>
               <input type="text" id="upload-source-dir-input" name="upload_source_dir" value="" placeholder="可选：自动识别失败时粘贴完整案件目录">
               <p class="hint">浏览器不会提供上传文件的本机绝对路径，所以系统会用文件名在案件库中反查目录。自动识别失败时，可在“原文件所在目录”粘贴完整目录。若未填写 Discord 链接，脱敏结果页可请求 Hermes 新建案件帖并通过 MCP 写回链接；映射表不会上传到 Discord。</p>
@@ -492,6 +548,16 @@ def _status_label(state: str) -> str:
         "error": "错误",
         "skipped": "跳过",
     }.get(state, state)
+
+
+def _is_default_case_root_value(value: str) -> bool:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return False
+    try:
+        return Path(candidate).expanduser().resolve() == default_case_root().expanduser().resolve()
+    except OSError:
+        return Path(candidate).expanduser() == default_case_root().expanduser()
 
 
 @app.post("/analyze", response_class=HTMLResponse)
@@ -872,16 +938,18 @@ async def redact_page(
     discord_thread_url: str = Form(default=""),
     case_root: str = Form(default=""),
     upload_source_dir: str = Form(default=""),
+    upload_relative_paths: str = Form(default=""),
     base_map_file: UploadFile | None = File(default=None),
     file: UploadFile | None = File(default=None),
     files: list[UploadFile] = File(default=[]),
+    case_folder_files: list[UploadFile] = File(default=[]),
 ) -> str:
     form_invalid = _reject_forged_workflow_form_data(await request.form())
     if form_invalid is not None:
         return form_invalid
 
     try:
-        documents = await _read_input_documents(text, file, files)
+        documents = await _read_input_documents(text, file, files, case_folder_files)
     except ValueError as exc:
         return _page("上传失败", str(exc))
 
@@ -906,10 +974,11 @@ async def redact_page(
     )
     pipeline = RedactionPipeline(config=config)
     source_files = [item.source_file for item in documents]
-    inferred_case_location = _resolve_case_location(upload_source_dir, source_files)
+    inferred_case_location = _resolve_case_location(upload_source_dir, source_files, upload_relative_paths)
     inferred_source_dir = str(inferred_case_location.get("matched_dir") or "")
+    manual_case_root = "" if _is_default_case_root_value(case_root) else case_root.strip()
     effective_case_folder = case_folder.strip() or str(inferred_case_location.get("case_folder") or "")
-    effective_case_root = case_root.strip() or str(inferred_case_location.get("case_root") or "")
+    effective_case_root = manual_case_root or str(inferred_case_location.get("case_root") or "") or case_root.strip()
     effective_discord_thread_url = discord_thread_url.strip() or str(inferred_case_location.get("discord_thread_url") or "")
     if len(documents) > 1:
         result = pipeline.redact_many([(item.source_file, item.text) for item in documents], base_redaction_map=base_redaction_map)
@@ -2219,7 +2288,7 @@ def _discord_create_thread_section(
         f'<div style="flex:1;min-width:280px;">'
         f'<h3 style="margin:0 0 8px 0;font-size:14px;font-weight:600;color:var(--ink);">请求 Hermes 新建案件帖</h3>'
         f'<p class="hint" style="margin:0;">向 Discord 指令频道发送建帖请求；Hermes 建帖后通过 MCP 写回链接，系统随后发送脱敏附件并写入本地案件库：{html.escape(case_folder)}</p>'
-        f'<textarea id="{html.escape(message_id, quote=True)}" rows="2" placeholder="可选：发送附件时附言" style="margin-top:10px;max-width:680px;">脱敏文件已生成，请见附件。</textarea>'
+        f'<textarea id="{html.escape(message_id, quote=True)}" rows="2" placeholder="建帖后发送附件时附言" style="margin-top:10px;max-width:680px;">脱敏文件已生成，请见附件。</textarea>'
         f'</div>'
         f'<div style="display:flex;flex-direction:column;gap:8px;align-items:flex-start;min-width:220px;">'
         f'<button type="button" class="btn discord-create-thread-button" '
@@ -2296,14 +2365,157 @@ def _persist_optional_case_redaction(
     )
 
 
-def _resolve_case_location(upload_source_dir: str, source_files: list[str]) -> dict[str, object]:
+def _resolve_case_location(upload_source_dir: str, source_files: list[str], upload_relative_paths: str = "") -> dict[str, object]:
     source_dir = upload_source_dir.strip()
     if source_dir:
         return _suggest_case_location_from_filenames(source_files, source_dir=source_dir)
+    relative_suggestion = _suggest_case_location_from_relative_paths(upload_relative_paths)
+    if relative_suggestion.get("status") == "ok":
+        return relative_suggestion
     suggestion = _suggest_case_location_from_filenames(source_files)
     if suggestion.get("status") == "ok":
         return suggestion
     return {"status": "not_found"}
+
+
+def _suggest_case_location_from_relative_paths(
+    relative_paths: object,
+    search_roots: list[Path] | None = None,
+    *,
+    discord_thread_url: str = "",
+) -> dict[str, object]:
+    paths = _safe_upload_relative_paths(relative_paths)
+    case_folder = _case_folder_from_relative_paths(paths)
+    if not case_folder:
+        return {"status": "not_found", "workflow_state": "not_saved", "evidence": []}
+
+    roots = search_roots or _case_location_search_roots()
+    existing_dirs: list[Path] = []
+    for root in roots:
+        candidate = (Path(root).expanduser() / case_folder)
+        if candidate.exists():
+            existing_dirs.append(candidate.resolve())
+
+    unique_dirs = sorted({path for path in existing_dirs}, key=str)
+    if len(unique_dirs) > 1:
+        return {
+            "status": "ambiguous",
+            "workflow_state": "not_saved",
+            "confidence": 0.0,
+            "matches": [str(path) for path in unique_dirs[:8]],
+            "candidates": [_case_folder_hint_summary(path.parent, case_folder, matched_dir=path) for path in unique_dirs[:8]],
+            "evidence": [{"kind": "ambiguous_case_directory", "count": len(unique_dirs)}],
+        }
+
+    if unique_dirs:
+        result = _case_folder_hint_summary(unique_dirs[0].parent, case_folder, matched_dir=unique_dirs[0])
+        result["confidence"] = 0.98
+    else:
+        root = Path(roots[0]).expanduser() if roots else default_case_root()
+        result = _case_folder_hint_summary(root, case_folder)
+        result["confidence"] = 0.86
+
+    result["status"] = "ok"
+    result["evidence"] = [
+        {"kind": "upload_relative_path", "case_folder": case_folder},
+        *list(result.get("evidence", [])),
+    ]
+    requested_thread = discord_thread_url.strip()
+    if requested_thread:
+        _apply_requested_thread_preflight(result, requested_thread)
+    return result
+
+
+def _safe_upload_relative_paths(value: object) -> list[str]:
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = [raw]
+    else:
+        parsed = value
+    if not isinstance(parsed, list):
+        return []
+
+    paths: list[str] = []
+    for item in parsed:
+        path = str(item or "").replace("\\", "/").strip()
+        if not path or path.startswith("/") or path.startswith("~"):
+            continue
+        pure = PurePosixPath(path)
+        if any(part in {"", ".", ".."} for part in pure.parts):
+            continue
+        if pure.name.startswith("._") or _suffix_for_filename(pure.name) not in SUPPORTED_UPLOAD_SUFFIXES:
+            continue
+        paths.append(str(pure))
+    return paths
+
+
+def _case_folder_from_relative_paths(paths: list[str]) -> str:
+    folder = ""
+    for value in paths:
+        parts = PurePosixPath(value).parts
+        if len(parts) < 2:
+            continue
+        current = parts[0]
+        if not folder:
+            folder = current
+        elif folder != current:
+            return ""
+    if not folder:
+        return ""
+    try:
+        return validate_case_folder_name(folder)
+    except CaseError:
+        return ""
+
+
+def _case_folder_hint_summary(case_root: Path, case_folder: str, *, matched_dir: Path | None = None) -> dict[str, object]:
+    case_path = matched_dir or (case_root / case_folder)
+    result: dict[str, object] = {
+        "case_folder": case_folder,
+        "case_root": str(Path(case_root).expanduser()),
+        "matched_dir": str(matched_dir) if matched_dir else "",
+        "ambiguous": False,
+        "conflict": False,
+    }
+    evidence = list(result.get("evidence", []))
+    manifest_data = manifest_fields_for_case_dir(case_path)
+    result.update(manifest_data)
+    result["evidence"] = evidence + list(manifest_data.get("evidence", []))
+    result.setdefault("workflow_state", case_workflow_state(discord_thread_url=str(result.get("discord_thread_url", ""))))
+    return result
+
+
+def _apply_requested_thread_preflight(result: dict[str, object], requested_thread: str) -> None:
+    try:
+        binding = case_thread_binding_status(
+            str(result.get("case_root", "")),
+            str(result.get("case_folder", "")),
+            requested_thread,
+        )
+    except CaseError as exc:
+        result.update(
+            {
+                "status": "conflict",
+                "conflict": True,
+                "conflict_code": getattr(exc, "code", "case_error"),
+                "conflict_message": str(exc),
+            }
+        )
+        return
+    if binding.get("conflict"):
+        result.update(
+            {
+                "status": "conflict",
+                "conflict": True,
+                "conflict_code": binding.get("code"),
+                "conflict_message": binding.get("message"),
+            }
+        )
 
 
 def _discord_bot_token(config: dict | None = None) -> str:
@@ -2414,9 +2626,8 @@ def _post_discord_channel_message(channel_id: str, content: str) -> dict[str, st
 def _post_discord_thread_file(thread_id: str, filename: str, content: str, message: str = "") -> dict[str, str]:
     config = load_json_config("LEGAL_REDACTOR_API_CONFIG", "api.local.json")
     token = _discord_bot_token(config)
+    message = _safe_discord_attachment_message(filename, message)
 
-    _ = message
-    message = _safe_discord_attachment_message(filename)
     payload = {
         "content": message,
         "attachments": [{"id": 0, "filename": filename}],
@@ -2450,9 +2661,16 @@ def _post_discord_thread_file(thread_id: str, filename: str, content: str, messa
     }
 
 
-def _safe_discord_attachment_message(filename: str) -> str:
+def _safe_discord_attachment_message(filename: str, message: str = "") -> str:
     safe_filename = Path(filename).name or "redacted.txt"
-    return f"脱敏文件已生成，请见附件：{safe_filename}"[:1900]
+    default = f"脱敏文件已生成，请见附件：{safe_filename}"
+    value = re.sub(r"\r\n?", "\n", str(message)).strip()
+    if not value or _contains_local_path_text(value):
+        return default[:1900]
+    value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", value)
+    value = re.sub(r"[ \t]+", " ", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return (value or default)[:1900]
 
 
 def _safe_public_error_message(message: str) -> str:
@@ -2699,7 +2917,12 @@ def _render_blank_mapping_row(index: int) -> str:
     """
 
 
-async def _read_input_documents(text: str, file: UploadFile | None, files: list[UploadFile]) -> list[InputDocument]:
+async def _read_input_documents(
+    text: str,
+    file: UploadFile | None,
+    files: list[UploadFile],
+    case_folder_files: list[UploadFile] | None = None,
+) -> list[InputDocument]:
     documents = []
     if text.strip():
         documents.append(InputDocument(source_file="粘贴文本.txt", text=text))
@@ -2707,8 +2930,22 @@ async def _read_input_documents(text: str, file: UploadFile | None, files: list[
     target_files = []
     if file and file.filename: target_files.append(file)
     if files: target_files.extend([f for f in files if f.filename])
+    folder_target_files = [
+        item
+        for item in (case_folder_files or [])
+        if item.filename and _is_supported_folder_upload_filename(item.filename)
+    ]
     
     for item in target_files:
+        try:
+            content = await _read_upload_text(item)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"读取文件 {item.filename} 失败: {exc}") from exc
+        documents.append(InputDocument(source_file=item.filename, text=content))
+
+    for item in folder_target_files:
         try:
             content = await _read_upload_text(item)
         except ValueError:
@@ -2732,6 +2969,11 @@ def _decode_text_bytes(data: bytes, filename: str) -> str:
 
 def _suffix_for_filename(filename: str) -> str:
     return "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ".txt"
+
+
+def _is_supported_folder_upload_filename(filename: str) -> bool:
+    name = PurePosixPath(str(filename).replace("\\", "/")).name
+    return bool(name and not name.startswith("._") and _suffix_for_filename(name) in SUPPORTED_UPLOAD_SUFFIXES)
 
 
 def _docx_bytes_to_text(data: bytes) -> str:
@@ -3240,16 +3482,34 @@ def _page(title: str, body: str) -> str:
       document.addEventListener('change',function(e){{var form=e.target&&e.target.closest?e.target.closest('#mapping-edit-form'):null;if(!form)return;filterMappingRows(activeMappingFilter());}});
       (function(){{var ta=document.getElementById('text-input');if(!ta)return;ta.addEventListener('dragover',function(e){{e.preventDefault();ta.classList.add('dragover');}});ta.addEventListener('dragleave',function(){{ta.classList.remove('dragover');}});ta.addEventListener('drop',function(e){{e.preventDefault();ta.classList.remove('dragover');var f=e.dataTransfer.files[0];if(!f)return;if(['txt','md'].indexOf(f.name.split('.').pop().toLowerCase())<0){{toast('不支持 .'+f.name.split('.').pop(),'warn');return;}}var r=new FileReader();r.onload=function(){{ta.value=r.result;toast('已加载: '+f.name);}};r.readAsText(f,'UTF-8');}});}})();
 	      (function(){{
-	        var input=document.getElementById('source-files');
-	        if(!input)return;
-	        input.addEventListener('change',async function(){{
-	          var names=Array.prototype.map.call(input.files||[],function(f){{return f.name;}});
-	          if(!names.length)return;
+	        function uploadSuffix(name){{var i=String(name||'').lastIndexOf('.');return i>=0?String(name).slice(i).toLowerCase():'.txt';}}
+	        function isSupportedUpload(name){{return ['.txt','.md','.doc','.docx','.pdf'].indexOf(uploadSuffix(name))>=0&&String(name||'').split('/').pop().indexOf('._')!==0;}}
+	        function fileList(input){{return Array.prototype.slice.call((input&&input.files)||[]);}}
+	        async function suggestCaseFromInput(input,isDirectory){{
+	          var all=fileList(input);
+	          var paths=all.map(function(f){{return f.webkitRelativePath||f.name||'';}}).filter(function(name){{return name&&isSupportedUpload(name);}});
+	          var names=all.map(function(f){{return f.name||'';}}).filter(function(name){{return name&&isSupportedUpload(name);}});
+	          var relativeInput=document.getElementById('upload-relative-paths-input');
+	          if(relativeInput)relativeInput.value=isDirectory?JSON.stringify(paths):'';
+	          if(isDirectory){{
+	            var plainInput=document.getElementById('source-files');
+	            if(plainInput)plainInput.value='';
+	          }}else{{
+	            var dirInput=document.getElementById('source-directory-files');
+	            if(dirInput)dirInput.value='';
+	          }}
+	          if(!names.length){{
+	            if(isDirectory&&all.length)toast('案件文件夹中没有可处理的 txt/md/doc/docx/pdf 文书','warn');
+	            return;
+	          }}
 	          try{{
 	            var currentSourceDir=(document.getElementById('upload-source-dir-input')||{{value:''}}).value||'';
 	            var currentThread=(document.getElementById('discord-thread-url-input')||{{value:''}}).value||'';
-	            var currentRoot=(document.getElementById('case-root-input')||{{value:''}}).value||'';
-	            var resp=await fetch('/api/suggest-case-location',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{filenames:names,source_dir:currentSourceDir,discord_thread_url:currentThread,case_root:currentRoot}})}});
+	            var rootInput=document.getElementById('case-root-input');
+	            var rootAuto=rootInput?(rootInput.dataset.autoValue||''):'';
+	            var rootValue=rootInput?(rootInput.value||''):'';
+	            var currentRoot=shouldApplyAutoPrefill(rootValue,rootAuto)?'':rootValue;
+	            var resp=await fetch('/api/suggest-case-location',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{filenames:names,relative_paths:isDirectory?paths:[],source_dir:currentSourceDir,discord_thread_url:currentThread,case_root:currentRoot}})}});
 	            var data=await resp.json();
 	            if(data.status==='ok'){{
 	              var root=document.getElementById('case-root-input');
@@ -3268,7 +3528,7 @@ def _page(title: str, body: str) -> str:
 	                  folder.dataset.autoValue=data.case_folder||'';
 	                }}
 	              }}
-	              if(sourceDir)sourceDir.value=data.matched_dir||'';
+	              if(sourceDir&&data.matched_dir)sourceDir.value=data.matched_dir||'';
 	              if(discordUrl&&!discordUrl.value.trim()&&data.discord_thread_url)discordUrl.value=data.discord_thread_url;
 	              toast(data.discord_thread_url?'已识别案件目录和 Discord 链接: '+data.case_folder:'已识别案件目录: '+data.case_folder);
 	            }}else if(data.status==='conflict'){{
@@ -3282,7 +3542,11 @@ def _page(title: str, body: str) -> str:
 	            console.debug(err);
 	            toast('案件目录自动识别失败','warn');
 	          }}
-	        }});
+	        }}
+	        var fileInput=document.getElementById('source-files');
+	        if(fileInput)fileInput.addEventListener('change',function(){{suggestCaseFromInput(fileInput,false);}});
+	        var dirInput=document.getElementById('source-directory-files');
+	        if(dirInput)dirInput.addEventListener('change',function(){{suggestCaseFromInput(dirInput,true);}});
 	      }})();
       function addBlankRow(btn){{var tb=btn.parentElement.querySelector('tbody');if(!tb)return;var rows=tb.querySelectorAll('tr');var last=rows[rows.length-1];var c=last.cloneNode(true);var n=rows.length;c.dataset.mapRow=String(n);c.dataset.categories='';c.querySelectorAll('input,textarea').forEach(function(e){{if(e.name==='row_delete')e.value=n;if(e.name==='map_type')e.value='manual';if(e.name==='map_original'||e.name==='map_masked'||e.name==='map_role'||e.name==='map_reason')e.value='';if(e.name==='map_source')e.value='manual';if(e.name==='map_confidence')e.value='1.0';if(e.name==='map_restore_by_default')e.value='1';e.checked=false;}});tb.appendChild(c);filterMappingRows(activeMappingFilter());}}
       function saveRow(idx,btn){{var row=btn.closest('tr');var orig=row.querySelector('[name^=orig_]').value;var masked=row.querySelector('[name^=masked_]').value;var reasonEl=row.querySelector('[name^=reason_]');var reason=reasonEl?reasonEl.value:'';fetch('/samples/update/'+idx,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{original:orig,masked:masked,reason:reason}})}}).then(function(r){{return r.json();}}).then(function(d){{toast(d.msg);}});}}
@@ -3614,6 +3878,18 @@ def _page(title: str, body: str) -> str:
 		            }})
 	          }});
 	          var res = await resp.json();
+	          if (resp.ok && res.status === 'bound') {{
+	            if (statusEl) statusEl.textContent = res.message || '案件已绑定 Discord 帖子，正在发送附件...';
+	            if (linkEl && res.thread_url) {{
+	              linkEl.href = res.thread_url;
+	              linkEl.style.display = 'inline';
+	            }}
+	            document.querySelectorAll('input[name=discord_thread_url]').forEach(function(inp) {{
+	              inp.value = res.thread_url || '';
+	            }});
+	            await attachBoundDiscordThread(buttonEl, payload, statusEl, linkEl);
+	            return;
+	          }}
 	          if (resp.ok && res.status === 'pending') {{
 	            toast('已发送 Hermes 建帖请求');
 	            if (statusEl) statusEl.textContent = (res.message || '等待 Hermes 写回 Discord 帖子链接') + (res.request_id ? '：' + res.request_id : '');
