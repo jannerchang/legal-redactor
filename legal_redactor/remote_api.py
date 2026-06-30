@@ -13,10 +13,13 @@ from .cases import (
     InvalidDiscordThreadError,
     MissingMapError,
     assert_remote_payload_safe,
+    case_location_search_roots,
     case_dir,
+    case_root_from_source_dir,
     create_or_update_manifest,
     default_case_root,
     find_case_by_discord_thread,
+    load_manifest,
     manifest_public_status,
     parse_discord_thread_id,
     restore_status_summary,
@@ -190,18 +193,81 @@ def bind_discord_thread_to_case(
 def find_case_by_thread(thread_id: str) -> tuple[Path, CaseManifest]:
     matches: dict[Path, CaseManifest] = {}
     for root in _bind_case_root_candidates(get_case_root()):
-        try:
-            case_path, manifest = find_case_by_discord_thread(root, thread_id)
-        except DuplicateDiscordThreadError:
-            raise
-        except CaseNotFoundError:
-            continue
-        matches[case_path.resolve()] = manifest
+        for case_path, manifest in _find_case_matches_by_thread(root, thread_id):
+            matches[case_path.resolve()] = manifest
     if not matches:
         raise CaseNotFoundError("未找到绑定该 Discord 帖子的案件")
-    if len(matches) > 1:
+    selected = _select_best_thread_match(matches)
+    if selected is None:
         raise DuplicateDiscordThreadError("多个案件绑定了同一个 Discord 帖子")
-    return next(iter(matches.items()))
+    return selected
+
+
+def _find_case_matches_by_thread(
+    root: str | Path,
+    thread_id: str,
+    *,
+    max_depth: int = 5,
+    max_entries: int = 50000,
+) -> list[tuple[Path, CaseManifest]]:
+    root_path = Path(root).expanduser()
+    if not root_path.exists():
+        return []
+    matches: list[tuple[Path, CaseManifest]] = []
+    visited = 0
+    for current, dirs, files in os.walk(root_path):
+        visited += len(dirs) + len(files)
+        if visited > max_entries:
+            break
+        current_path = Path(current)
+        try:
+            depth = len(current_path.resolve().relative_to(root_path.resolve()).parts)
+        except (OSError, ValueError):
+            depth = 0
+        dirs[:] = [
+            item
+            for item in dirs
+            if not item.startswith(".")
+            and item not in {"__pycache__", ".git", ".venv", ".ff-state", "node_modules"}
+        ]
+        if depth >= max_depth:
+            dirs[:] = []
+        if "manifest.json" not in files:
+            continue
+        try:
+            manifest = load_manifest(current_path)
+        except Exception:
+            continue
+        if manifest.discord_thread_id == str(thread_id):
+            matches.append((current_path, manifest))
+    return matches
+
+
+def _select_best_thread_match(matches: dict[Path, CaseManifest]) -> tuple[Path, CaseManifest] | None:
+    if len(matches) == 1:
+        return next(iter(matches.items()))
+
+    with_mapping = [
+        (path, manifest)
+        for path, manifest in matches.items()
+        if (path / manifest.mapping_file).exists()
+    ]
+    if len(with_mapping) == 1:
+        return with_mapping[0]
+    if len(with_mapping) > 1:
+        return None
+
+    with_case_artifacts = [
+        (path, manifest)
+        for path, manifest in matches.items()
+        if (path / manifest.redacted_dir).exists() or (path / manifest.restored_dir).exists()
+    ]
+    if len(with_case_artifacts) == 1:
+        return with_case_artifacts[0]
+    if len(with_case_artifacts) > 1:
+        return None
+
+    return None
 
 
 def _case_root_for_bind(
@@ -211,22 +277,21 @@ def _case_root_for_bind(
     source_dir: str | None = None,
     case_root_override: str | Path | None = None,
 ) -> Path:
+    source_root = case_root_from_source_dir(source_dir, case_folder)
+    if source_root is not None:
+        return source_root
+
     if case_root_override and str(case_root_override).strip():
         return Path(case_root_override).expanduser()
 
-    source_value = (source_dir or "").strip()
-    if source_value:
-        source_path = Path(source_value).expanduser()
-        if source_path.exists():
-            if source_path.name == case_folder.strip():
-                return source_path.parent
-            if (source_path / case_folder.strip()).exists():
-                return source_path
-
     configured = Path(configured_case_root).expanduser()
-    for candidate in _bind_case_root_candidates(configured):
-        if (candidate / case_folder.strip()).exists():
-            return candidate
+    existing = [
+        candidate
+        for candidate in _bind_case_root_candidates(configured)
+        if (candidate / case_folder.strip()).exists()
+    ]
+    if existing:
+        return max(existing, key=lambda candidate: _case_directory_score(candidate / case_folder.strip()))
     return configured
 
 
@@ -241,12 +306,9 @@ def _ensure_thread_bind_can_write(
     thread_id = parse_discord_thread_id(requested_url)
     target_case_path = case_dir(effective_case_root, case_folder).resolve()
     for root in _bind_case_root_candidates(Path(effective_case_root).expanduser()):
-        try:
-            bound_case_path, _ = find_case_by_discord_thread(root, thread_id)
-        except CaseNotFoundError:
-            continue
-        if bound_case_path.resolve() != target_case_path:
-            raise DuplicateDiscordThreadError("该 Discord 帖子已绑定到其他案件")
+        for bound_case_path, _ in _find_case_matches_by_thread(root, thread_id):
+            if bound_case_path.resolve() != target_case_path:
+                raise DuplicateDiscordThreadError("该 Discord 帖子已绑定到其他案件")
 
 
 def _bind_case_root_candidates(configured_case_root: Path) -> list[Path]:
@@ -255,11 +317,13 @@ def _bind_case_root_candidates(configured_case_root: Path) -> list[Path]:
         default_case_root(),
         Path("~/Documents/legal-redactor-cases").expanduser(),
     ]
+    candidates.extend(case_location_search_roots())
     volumes = Path("/Volumes")
     if volumes.exists():
         for volume in volumes.iterdir():
             if volume.name.startswith("."):
                 continue
+            candidates.append(volume)
             case_materials = volume / "案件资料"
             if case_materials.exists():
                 candidates.append(case_materials)
@@ -274,6 +338,29 @@ def _bind_case_root_candidates(configured_case_root: Path) -> list[Path]:
             seen.add(resolved)
             roots.append(resolved)
     return roots
+
+
+def _case_directory_score(case_path: Path) -> int:
+    score = 0
+    if case_path.exists():
+        score += 1
+    manifest_path = case_path / "manifest.json"
+    if manifest_path.exists():
+        score += 2
+        try:
+            manifest = load_manifest(case_path)
+        except Exception:
+            manifest = None
+        if manifest is not None:
+            if (case_path / manifest.mapping_file).exists():
+                score += 16
+            if (case_path / manifest.redacted_dir).exists():
+                score += 4
+            if (case_path / manifest.restored_dir).exists():
+                score += 2
+    elif (case_path / "mapping" / "redaction_map.enc").exists():
+        score += 16
+    return score
 
 
 def find_unresolved_placeholders(text: str, redaction_map) -> list[str]:

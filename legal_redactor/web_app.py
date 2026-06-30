@@ -25,6 +25,7 @@ from .cases import (
     InvalidDiscordThreadError,
     InvalidWorkflowInputError,
     case_dir,
+    case_root_from_source_dir,
     case_workflow_public,
     default_case_root,
     load_manifest,
@@ -293,8 +294,9 @@ async def attach_to_bound_discord_thread(request: Request) -> JSONResponse:
     if invalid is not None:
         return invalid
     case_folder = str(body.get("case_folder", "")).strip()
-    case_root = str(body.get("case_root", "")).strip() or str(default_case_root())
     source_dir = str(body.get("source_dir", "")).strip() or None
+    source_root = case_root_from_source_dir(source_dir, case_folder) if case_folder else None
+    case_root = str(source_root or str(body.get("case_root", "")).strip() or default_case_root())
     filename = Path(str(body.get("filename", "redacted.txt"))).name or "redacted.txt"
     content = str(body.get("content", ""))
     map_json = str(body.get("map_json", ""))
@@ -913,7 +915,14 @@ async def redact_page(
         result = pipeline.redact_many([(item.source_file, item.text) for item in documents], base_redaction_map=base_redaction_map)
         warnings = list(result.warnings)
         try:
-            _persist_optional_case_redaction(effective_case_root, effective_case_folder, effective_discord_thread_url, result.documents, result.redaction_map)
+            _persist_optional_case_redaction(
+                effective_case_root,
+                effective_case_folder,
+                effective_discord_thread_url,
+                result.documents,
+                result.redaction_map,
+                source_dir=inferred_source_dir,
+            )
         except CaseError as exc:
             return _page("案件保存失败", f"保存错误: {exc}")
         except Exception as exc:
@@ -943,7 +952,14 @@ async def redact_page(
         leaks=result.leaks,
     )
     try:
-        _persist_optional_case_redaction(effective_case_root, effective_case_folder, effective_discord_thread_url, [redacted_doc], result.redaction_map)
+        _persist_optional_case_redaction(
+            effective_case_root,
+            effective_case_folder,
+            effective_discord_thread_url,
+            [redacted_doc],
+            result.redaction_map,
+            source_dir=inferred_source_dir,
+        )
     except CaseError as exc:
         return _page("案件保存失败", f"保存错误: {exc}")
     except Exception as exc:
@@ -2258,6 +2274,8 @@ def _persist_optional_case_redaction(
     discord_thread_url: str,
     documents: list[RedactedDocument],
     redaction_map: RedactionMap,
+    *,
+    source_dir: str = "",
 ) -> None:
     has_case_folder = bool(case_folder.strip())
     has_thread_url = bool(discord_thread_url.strip())
@@ -2265,8 +2283,17 @@ def _persist_optional_case_redaction(
         return
     if not has_case_folder and has_thread_url:
         raise CaseError("填写 Discord 帖子链接时必须同时填写案件文件夹名")
-    root = case_root.strip() or str(default_case_root())
-    persist_case_redaction(root, case_folder, discord_thread_url, documents, redaction_map)
+    source_root = case_root_from_source_dir(source_dir, case_folder)
+    root = str(source_root) if source_root is not None else case_root.strip()
+    root = root or str(default_case_root())
+    persist_case_redaction(
+        root,
+        case_folder,
+        discord_thread_url,
+        documents,
+        redaction_map,
+        source_dir=source_dir.strip() or None,
+    )
 
 
 def _resolve_case_location(upload_source_dir: str, source_files: list[str]) -> dict[str, object]:

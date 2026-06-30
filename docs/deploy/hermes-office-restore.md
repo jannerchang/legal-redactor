@@ -43,7 +43,8 @@ During redaction, optionally fill:
 
 - case folder name, for example `2025 8765`
 - Discord thread URL
-- case root path
+- case root path, used only as a fallback when the uploaded/source document
+  directory cannot identify the case folder
 
 The result page shows one case workflow state: `not_saved`, `saved_local`,
 `bound_thread`, `sent_discord`, `waiting_hermes`, or `attach_failed`. These
@@ -70,6 +71,12 @@ are saved under:
   mapping/redaction_map.enc
   restored/
 ```
+
+If the upload/source directory points at the case folder, the Office Web and
+private API derive `case_root` from that source directory. This keeps the saved
+manifest, redacted files, and encrypted map beside the uploaded matter even when
+the API config has a different default case root. The configured root remains a
+fallback for older/manual flows and smoke tests.
 
 The mapping table is not uploaded to Discord.
 
@@ -147,6 +154,10 @@ Available tools:
 Hermes should pass the current Discord thread id and the drafted judgment text.
 The Office Mac resolves the thread id to a local case manifest, loads the local
 mapping table, restores the draft, and saves the restored text under `restored/`.
+For binding, Hermes should pass `source_dir` when it knows the uploaded/source
+document directory. The Office API uses that directory before the configured
+case root, so empty shell manifests under an old configured root do not hide the
+real case directory containing the map.
 
 The status and restore tools return the Office API envelope:
 

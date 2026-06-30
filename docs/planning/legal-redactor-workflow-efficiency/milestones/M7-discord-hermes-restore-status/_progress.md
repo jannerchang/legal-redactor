@@ -13,19 +13,19 @@
 milestone: M7-discord-hermes-restore-status
 module: discord-hermes-restore-status
 当前阶段: ✅ 完成
-当前 Step: Gate 2 r2 full-pool PASS; tracked closeout complete
-当前批次: /ffcs:build M7-discord-hermes-restore-status
+当前 Step: post-delivery dynamic-root hotfix validated after Gate 2 r2 PASS
+当前批次: /ffcs:build M7-discord-hermes-restore-status --from-step=github-delivery
 complexity: complex
 risk: high
 validation_profile: standard
 effective_profile: strict
 profile_source: local-config default standard; AI upshift for private API/MCP restored-content risk
-时间盒进度: Step 1-4 implemented; r0/r1 findings repaired; Gate 2 r2 full-pool PASS
-最近 commit SHA: 6dc17b6
-分支: main
-HEAD: 6dc17b6
-工作区: existing M3/M4/M5/M6 product/planning changes remain dirty; M7 build changes layered on top and not committed
-待办: optional GitHub delivery from a clean/split branch
+时间盒进度: Step 1-4 implemented; Gate 2 r2 full-pool PASS; dynamic source-dir root fix validated with focused/full tests and live Office/Home smoke
+最近 commit SHA: 291def5 plus dynamic-root hotfix commit
+分支: codex/M7-dynamic-case-root -> origin/main PR
+HEAD: dynamic-root hotfix branch commit
+工作区: clean after dynamic-root hotfix branch commit/push
+待办: PR checks/review then merge to origin/main
 ```
 
 ## §2 · Intent Guard
@@ -139,12 +139,18 @@ and mocked Gate proof when live credentials are absent.
 - **final doc/pre-push**:
   - `.ff-state/logs/M7-build-final-doc-check-2026-06-29.log` · `files_scanned=6 · findings=0`
   - `.ff-state/logs/M7-build-pre-push-checklist-2026-06-29.log` · `severity=pass · blocker_reasons=[]` (`git ls-files` fixture scan skipped with `ENOBUFS`, non-blocking)
+- **post-delivery dynamic-root hotfix · 2026-06-30**:
+  - scope: API/Web case root selection now derives from existing `source_dir` before falling back to configured/default root; thread status lookup searches dynamic case roots and prefers the sole mapped case over empty shell manifests.
+  - focused validation: `LEGAL_REDACTOR_MCP_CONFIG=<empty temp config> .venv/bin/python -m pytest tests/test_cases.py tests/test_remote_api.py tests/test_mcp_adapter.py tests/test_web_app.py -q` · `84 passed`
+  - full validation: `LEGAL_REDACTOR_MCP_CONFIG=<empty temp config> .venv/bin/python -m pytest -q` · `198 passed`
+  - Office live smoke: `GET /health` on `100.121.131.77:8787` returned `{"status":"ok"}`; authenticated status by thread returned `ok=True`, `code=no_restore_yet`, `mapping_present=True`, `restore.status=no_restore_yet`, and no `/Users/` or `/Volumes/` leakage.
+  - Home Mac MCP smoke: `ai.hermes.gateway` restarted and running; `legal_redactor.mcp_adapter` tools list contains `restore_judgment_from_thread,get_case_status_by_thread,bind_discord_thread_to_case`; Home Mac MCP status call returned `ok=True`, `code=no_restore_yet`, `mapping_present=True`, and no absolute-path leakage.
 
 ## §4 · 硬门槛证据追踪
 
 | 层 | 条目 | 状态 | 证据 |
 |---|---|---|---|
-| D | D1-D10 remote restore data/privacy contracts | ✅ | `tests/test_remote_api.py`, `tests/test_mcp_adapter.py`, `tests/test_status.py`, `tests/test_web_app.py`; full suite `194 passed` |
+| D | D1-D10 remote restore data/privacy contracts | ✅ | `tests/test_remote_api.py`, `tests/test_mcp_adapter.py`, `tests/test_status.py`, `tests/test_web_app.py`; full suite `198 passed` |
 | P | P1-P6 pure status/path/error/timing helpers | ✅ | `legal_redactor/cases.py`; `tests/test_cases.py` |
 | S | S1-S5 Office API behavior | ✅ | `legal_redactor/remote_api.py`; duplicate/status/restore/bind tests |
 | N | N1-N3 MCP/Discord boundaries | ✅ | `legal_redactor/mcp_adapter.py`, Discord safe-error Web tests, no restored-output posting path |
@@ -172,6 +178,7 @@ and mocked Gate proof when live credentials are absent.
 | Gate 2 r1 repair | 6dc17b6 | not committed | status/tests | Recursive public details scrub; status `10 passed`; focused `90 passed, 6 subtests passed`; full `194 passed, 11 subtests passed` |
 | Gate 2 r2 signoff | 6dc17b6 | not committed | review artifacts | codex-r2 PASS, grok-r2 PASS, chair PASS `pass_defer`, proof `all_pass=true` |
 | Final closeout checks | 6dc17b6 | not committed | progress/pre-push logs | final doc-check `findings=0`; pre-push checklist `severity=pass` |
+| Post-delivery dynamic-root hotfix | 291def5 | dynamic-root hotfix commit | API/Web/cases/tests/docs | Source directory now wins over configured root when it exists; thread status prefers mapped dynamic case over empty shell; focused `84 passed`; full `198 passed`; Office API and Home Mac MCP live status smoke passed |
 
 ## §6 · grep 留痕
 

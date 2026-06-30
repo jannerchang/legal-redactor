@@ -285,6 +285,33 @@ class WebAppUploadTests(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(tmpdir, "2025 8765", "redacted", "redacted.txt")))
             self.assertTrue(os.path.exists(os.path.join(tmpdir, "2025 8765", "mapping", "redaction_map.enc")))
 
+    def test_optional_case_redaction_prefers_source_dir_over_configured_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            configured_root = os.path.join(tmpdir, "configured-root")
+            source_case_dir = os.path.join(tmpdir, "uploaded-documents", "2025 8765")
+            os.makedirs(source_case_dir)
+            redaction_map = RedactionMap.create([])
+            documents = [
+                RedactedDocument(
+                    source_file="judgment.txt",
+                    original_text="张三",
+                    redacted_text="【PERSON_001】",
+                )
+            ]
+
+            _persist_optional_case_redaction(
+                configured_root,
+                "2025 8765",
+                "https://discord.com/channels/1/2/3",
+                documents,
+                redaction_map,
+                source_dir=source_case_dir,
+            )
+
+            self.assertTrue(os.path.exists(os.path.join(source_case_dir, "manifest.json")))
+            self.assertTrue(os.path.exists(os.path.join(source_case_dir, "mapping", "redaction_map.enc")))
+            self.assertFalse(os.path.exists(os.path.join(configured_root, "2025 8765", "manifest.json")))
+
     def test_optional_case_batch_redaction_uses_safe_output_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             redaction_map = RedactionMap.create(

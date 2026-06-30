@@ -176,6 +176,25 @@ def case_dir(case_root: str | Path, case_folder: str) -> Path:
     return target
 
 
+def case_root_from_source_dir(source_dir: str | Path | None, case_folder: str) -> Path | None:
+    """Infer a case root from the uploaded/source document location."""
+
+    source_value = str(source_dir or "").strip()
+    if not source_value:
+        return None
+    folder = validate_case_folder_name(case_folder)
+    source_path = Path(source_value).expanduser()
+    if not source_path.exists():
+        return None
+    if source_path.is_file():
+        source_path = source_path.parent
+    if source_path.name == folder:
+        return source_path.parent
+    if (source_path / folder).exists():
+        return source_path
+    return None
+
+
 def parse_discord_thread_id(url: str) -> str:
     value = url.strip()
     if not DISCORD_THREAD_RE.match(value):

@@ -18,6 +18,9 @@ build/
 *.egg-info/
 tests/*
 !tests/
+!tests/test_cases.py
+!tests/test_mcp_adapter.py
+!tests/test_remote_api.py
 !tests/test_status.py
 !tests/test_web_app.py
 !tests/test_sample_integration.py
