@@ -28,7 +28,6 @@ from .detectors import (
 from .lexicon import (
     BARE_COMPANY_ALIAS_RE,
     FACT_SECTION_BOUNDARY_RE,
-    INDUSTRY_TERMS,
     INSTITUTION_SUFFIXES,
     LEGAL_SUFFIXES,
     ORG_FULL_RE,
@@ -39,7 +38,6 @@ from .location_utils import (
     is_compound_admin_path,
     location_suffix,
     mask_admin_cascade_path,
-    strip_leading_locations,
 )
 from .models import Candidate, MappingEntry
 from .org_masking import (
@@ -318,9 +316,18 @@ class LinearRuleEngine:
         if not self.profile.redact_locations:
             return
         value = candidate.text.strip()
-        if _looks_like_false_location(self.source_text, candidate.start, candidate.end, value):
+        parts = candidate.metadata.get("parts") if isinstance(candidate.metadata, dict) else None
+        is_rule_admin_path = (
+            candidate.source == "china_admin_rules"
+            and isinstance(parts, dict)
+            and len(parts) >= 2
+        )
+        if (
+            not is_rule_admin_path
+            and _looks_like_false_location(self.source_text, candidate.start, candidate.end, value)
+        ):
             return
-        if is_compound_admin_path(value):
+        if is_compound_admin_path(value) or is_rule_admin_path:
             masked = mask_admin_cascade_path(value, self.get_location_prefix)
             if masked != value:
                 self._add("location", value, masked, candidate)

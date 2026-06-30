@@ -36,6 +36,14 @@ class ChinaAdminRulesTests(unittest.TestCase):
         texts = {candidate.text for candidate in candidates}
         self.assertTrue("北京市" in texts or "北京市海淀区" in texts)
         self.assertTrue(any("海淀" in value for value in texts))
+        self.assertEqual(decompose_admin_path("北京市海淀区"), {"prov": "北京市", "county": "海淀区"})
+
+    def test_detect_china_admin_rule_trims_leading_context_before_municipality(self) -> None:
+        text = "原告后搬至北京市海淀区。"
+        candidates = detect_china_admin_rule_candidates(text)
+        texts = {candidate.text for candidate in candidates}
+        self.assertIn("北京市海淀区", texts)
+        self.assertNotIn("后搬至北京市海淀区", texts)
 
     def test_detect_city_after_address_marker(self) -> None:
         text = "被告：李四，住宁波市。"
@@ -71,6 +79,28 @@ class ChinaAdminRulesTests(unittest.TestCase):
         self.assertNotIn("南山区", result.redacted_text)
         originals = {entry.original for entry in result.redaction_map.mappings}
         self.assertTrue({"广东省", "深圳市", "南山区", "广东省深圳市南山区"} & originals)
+
+    def test_nationwide_pipeline_masks_municipality_without_china_db(self) -> None:
+        config = replace(
+            PipelineConfig.offline_without_llm(),
+            enable_hebei_admin_db=False,
+            enable_china_admin_db=True,
+            china_admin_db_path="/tmp/legal-redactor-missing-china-admin.sqlite",
+            enable_china_admin_rules=True,
+        )
+        pipeline = RedactionPipeline(config=config)
+        text = "原告张三住广东省深圳市南山区科技园，后搬至北京市海淀区。"
+        with mock.patch("legal_redactor.pipeline.load_all_samples", return_value=({}, set())):
+            with mock.patch("legal_redactor.pipeline.load_trusted_sample_mappings", return_value=[]):
+                result = pipeline.redact(text)
+
+        self.assertNotIn("广东省", result.redacted_text)
+        self.assertNotIn("深圳市", result.redacted_text)
+        self.assertNotIn("南山区", result.redacted_text)
+        self.assertNotIn("北京市", result.redacted_text)
+        self.assertNotIn("海淀区", result.redacted_text)
+        originals = {entry.original for entry in result.redaction_map.mappings}
+        self.assertIn("北京市海淀区", originals)
 
 
 def _write_sample_china_db(path: Path) -> None:

@@ -119,6 +119,10 @@ def normalize_province_name(value: str) -> str | None:
 
 def decompose_admin_path(text: str) -> dict[str, str]:
     value = text.strip()
+    if any(value.startswith(municipality) for municipality in MUNICIPALITIES):
+        compact_parts = _decompose_compact_admin_path(value)
+        if compact_parts:
+            return compact_parts
     match = ADMIN_PATH_RE.match(value)
     if match:
         parts = {key: part for key, part in match.groupdict().items() if part}
@@ -308,7 +312,7 @@ def _looks_like_org_context(text: str, start: int, end: int) -> bool:
 
 
 def _split_county_suffix(rest: str) -> tuple[str, str | None]:
-    for length in range(3, min(len(rest), 11)):
+    for length in range(3, min(len(rest), 10) + 1):
         candidate = rest[-length:]
         if re.fullmatch(r"[\u4e00-\u9fa5]{2,8}(?:(?<!社)区|县|旗|市)", candidate):
             return rest[:-length], candidate
@@ -324,6 +328,19 @@ def _normalize_rule_fragment(text: str, start: int, end: int) -> tuple[str, int,
         if len(trimmed) < 2:
             return None
         return trimmed, start + len(marker), end
+    known_start = _known_admin_start(fragment)
+    if known_start > 0:
+        fragment = fragment[known_start:]
+        start += known_start
     if any(fragment.startswith(marker) for marker in FALSE_LOCATION_TERMS):
         return None
     return fragment, start, end
+
+
+def _known_admin_start(fragment: str) -> int:
+    matches = [
+        index
+        for name in (*PROVINCE_FULL_NAMES, *PROVINCE_SHORT_NAMES)
+        if (index := fragment.find(name)) >= 0
+    ]
+    return min(matches) if matches else -1
