@@ -2015,7 +2015,7 @@ def _render_redaction_result(
         <nav><a href="/">返回首页</a></nav>
         <div class="downloads">
           <a download="{html.escape(redacted_filename)}" href="{redacted_url}" class="btn">下载脱敏文本</a>
-          <a download="redaction_map.json" href="{map_url}" class="btn btn-secondary">下载 redaction_map</a>
+          <a download="redaction_map.json" href="{map_url}" class="btn btn-secondary" onclick="prepareCurrentMapDownload(this)">下载 redaction_map</a>
           <a download="debug_trace.json" href="{debug_url}" class="btn btn-secondary">下载 debug_trace</a>
           <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制脱敏文本</button>
         </div>
@@ -2038,7 +2038,7 @@ def _render_redaction_result(
               <button type="button" class="btn btn-sm" onclick="saveToLocalPath([{{filename: {html.escape(redacted_filename_json)}, content: document.getElementById('redacted-output').value}}], this)">保存脱敏文本</button>
               <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'redaction_map.json', content: readCurrentMappingJson()}}], this)">保存映射表</button>
               <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'debug_trace.json', content: document.getElementById('debug-trace-output').value}}], this)">保存调试追踪</button>
-              <button type="button" class="btn btn-sm" style="background: #e18c12; border-color: #e18c12; color: #fff;" onclick="saveToLocalPath([{{filename: {html.escape(redacted_filename_json)}, content: document.getElementById('redacted-output').value}}, {{filename: 'redaction_map.json', content: readCurrentMappingJson()}}], this)">一键保存全部</button>
+              <button type="button" class="btn btn-sm" style="background: #e18c12; border-color: #e18c12; color: #fff;" onclick="if(ensureAppliedMappingForText())saveToLocalPath([{{filename: {html.escape(redacted_filename_json)}, content: document.getElementById('redacted-output').value}}, {{filename: 'redaction_map.json', content: readCurrentMappingJson()}}], this)">一键保存全部</button>
             </div>
           </div>
           <script>
@@ -2193,7 +2193,7 @@ def _render_batch_redaction_result(
         <nav><a href="/">返回首页</a></nav>
         <div class="downloads">
           <a download="{combined_filename}" href="{redacted_url}" class="btn">下载合并脱敏文本</a>
-          <a download="redaction_map.json" href="{map_url}" class="btn btn-secondary">下载统一映射表</a>
+          <a download="redaction_map.json" href="{map_url}" class="btn btn-secondary" onclick="prepareCurrentMapDownload(this)">下载统一映射表</a>
           <a download="debug_trace.json" href="{debug_url}" class="btn btn-secondary">下载 debug_trace</a>
           <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制合并文本</button>
         </div>
@@ -2218,7 +2218,7 @@ def _render_batch_redaction_result(
               <button type="button" class="btn btn-sm" onclick="saveToLocalPath([{{filename: {html.escape(combined_filename_json)}, content: document.getElementById('redacted-output').value}}], this)">保存合并文本</button>
               <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'redaction_map.json', content: readCurrentMappingJson()}}], this)">保存统一映射表</button>
               <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'debug_trace.json', content: document.getElementById('debug-trace-output').value}}], this)">保存调试追踪</button>
-              <button type="button" class="btn btn-sm" style="background: #e18c12; border-color: #e18c12; color: #fff;" onclick="saveToLocalPath([{{filename: {html.escape(combined_filename_json)}, content: document.getElementById('redacted-output').value}}, {{filename: 'redaction_map.json', content: readCurrentMappingJson()}}].concat(_individualRedactedFiles), this)">一键保存全部</button>
+              <button type="button" class="btn btn-sm" style="background: #e18c12; border-color: #e18c12; color: #fff;" onclick="if(ensureAppliedMappingForText())saveToLocalPath([{{filename: {html.escape(combined_filename_json)}, content: document.getElementById('redacted-output').value}}, {{filename: 'redaction_map.json', content: readCurrentMappingJson()}}].concat(_individualRedactedFiles), this)">一键保存全部</button>
             </div>
           </div>
           <script>
@@ -3554,6 +3554,10 @@ def _page(title: str, body: str) -> str:
       ];content.innerHTML=rows.map(function(item){{return '<span><b>'+item[0]+'</b>: '+item[1]+'</span>';}}).join('');panel.hidden=false;}}
       function mappingRowValue(row,name){{var el=row.querySelector('[name="'+name+'"]');if(!el)return '';if(el.type==='checkbox')return el.checked?el.value:'';return el.value||'';}}
       function readCurrentMappingJson(){{var form=document.getElementById('mapping-edit-form');var mapEl=document.getElementById('mapping-json-output');if(!mapEl)return'{{}}';if(!form)return mapEl.value||'{{}}';var base={{}};try{{base=JSON.parse(mapEl.value||'{{}}');}}catch(_err){{base={{}};}}var mappings=[];form.querySelectorAll('tbody tr').forEach(function(row){{var deleted=row.querySelector('input[name="row_delete"]');if(deleted&&deleted.checked)return;var original=mappingRowValue(row,'map_original').trim();var masked=mappingRowValue(row,'map_masked').trim();if(!original||!masked)return;var confidence=parseFloat(mappingRowValue(row,'map_confidence')||'1.0');mappings.push({{type:mappingRowValue(row,'map_type').trim()||'manual',original:original,masked:masked,role:mappingRowValue(row,'map_role').trim()||null,source:mappingRowValue(row,'map_source').trim()||'manual',confidence:isNaN(confidence)?1.0:confidence,restore_by_default:mappingRowValue(row,'map_restore_by_default')!=='0',reason:mappingRowValue(row,'map_reason').trim()||null}});}});base.mappings=mappings;return JSON.stringify(base);}}
+      function replacementSignatureFromMapJson(mapJson){{var parsed={{}};try{{parsed=JSON.parse(mapJson||'{{}}');}}catch(_err){{parsed={{}};}}return JSON.stringify((parsed.mappings||[]).map(function(item){{return [String((item&&item.original)||'').trim(),String((item&&item.masked)||'').trim()];}}).filter(function(pair){{return pair[0]&&pair[1];}}));}}
+      function hasUnappliedMappingReplacementEdits(){{var mapEl=document.getElementById('mapping-json-output');if(!mapEl)return false;return replacementSignatureFromMapJson(mapEl.value||'{{}}')!==replacementSignatureFromMapJson(readCurrentMappingJson());}}
+      function ensureAppliedMappingForText(){{if(!hasUnappliedMappingReplacementEdits())return true;toast('映射表替换关系已修改，请先点「应用表格修改」重新生成脱敏文本', 'warn');return false;}}
+      function prepareCurrentMapDownload(link){{if(!link)return true;link.href='data:application/json;charset=utf-8,'+encodeURIComponent(readCurrentMappingJson());return true;}}
       function restoreRiskReasonsForRow(row){{var reasons=[];var deleted=!!row.querySelector('input[name="row_delete"]:checked');var masked=mappingRowValue(row,'map_masked').trim();if(deleted)reasons.push({{reason_code:'delete_candidate',message:restoreRiskReasonLabels.delete_candidate}});if(!masked)reasons.push({{reason_code:'empty_mask',message:restoreRiskReasonLabels.empty_mask}});return reasons;}}
       function mappingOriginalIndex(){{var mapEl=document.getElementById('mapping-json-output');var parsed={{}};try{{parsed=JSON.parse(mapEl?mapEl.value||'{{}}':'{{}}');}}catch(_err){{parsed={{}};}}var index={{}};(parsed.mappings||[]).forEach(function(item){{if(item&&item.original)index[item.original]=item;}});return index;}}
       function mappingReviewCandidateIndex(){{var el=document.getElementById('mapping-review-candidates');var values=[];try{{values=JSON.parse(el?el.value||'[]':'[]');}}catch(_err){{values=[];}}var index={{}};(Array.isArray(values)?values:[]).forEach(function(text){{if(text)index[String(text)]=true;}});return index;}}
@@ -3900,6 +3904,7 @@ def _page(title: str, body: str) -> str:
           toast('没有可发送的脱敏内容', 'warn');
           return;
         }}
+        if (!ensureAppliedMappingForText()) return;
         var mapJson = readCurrentMappingJson();
         var parsedMap = {{}};
         try {{parsedMap = JSON.parse(mapJson || '{{}}');}} catch (_err) {{parsedMap = {{}};}}

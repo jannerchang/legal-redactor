@@ -1371,6 +1371,9 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertIn("filterMappingRows(activeMappingFilter())", html)
         self.assertIn("function readCurrentMappingJson()", html)
         self.assertIn("readCurrentMappingJson()", html)
+        self.assertIn("function ensureAppliedMappingForText()", html)
+        self.assertIn("function prepareCurrentMapDownload(link)", html)
+        self.assertIn("if (!ensureAppliedMappingForText()) return", html)
         self.assertNotIn("mapping-json-output').value}}], this)", html)
         self.assertIn("DOMContentLoaded", html)
 
