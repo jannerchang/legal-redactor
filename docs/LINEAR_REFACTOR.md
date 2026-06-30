@@ -81,6 +81,10 @@
 ## 模块职责
 
 - `linear_engine.py`：按原文顺序确认实体并扩展替换规则。
+- `location_utils.py`：`linear_engine` 与 `pipeline` 共用的地名 core、后缀与机构前缀剥离逻辑。
+- `lexicon.py`：法律后缀、省份、行业词与机构正则等共享词表。
+- `org_masking.py`：机构解析、别名推导与假名生成。
+- `candidate_resolution.py`：候选 span 冲突消解，优先保留高可信来源。
 - `pipeline.py`：处理敏感编号、扫描范围、LLM 可选补充、映射应用和泄漏检查。
 - `detectors.py`：提供局部、高可信的实体发现能力。
 - `hebei_admin.py`：提供行政区划及基层组织的确定性识别。

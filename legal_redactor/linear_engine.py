@@ -12,6 +12,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
+from .candidate_resolution import is_noisy_org_capture, resolve_candidate_overlaps
+from .config import RedactionProfile
 from .counters import TypeCounters
 from .detectors import (
     _clean_organization_text,
@@ -22,230 +24,37 @@ from .detectors import (
     detect_party_candidates,
     detect_title_candidates,
 )
+from .lexicon import (
+    BARE_COMPANY_ALIAS_RE,
+    FACT_SECTION_BOUNDARY_RE,
+    INDUSTRY_TERMS,
+    INSTITUTION_SUFFIXES,
+    LEGAL_SUFFIXES,
+    ORG_FULL_RE,
+)
+from .location_utils import ADMIN_SUFFIXES, get_location_core, location_suffix
 from .models import Candidate, MappingEntry
-
-
-ADMIN_SUFFIXES = (
-    "居民委员会",
-    "村民委员会",
-    "居委会",
-    "村委会",
-    "特别行政区",
-    "自治区",
-    "自治州",
-    "街道",
-    "社区",
-    "省",
-    "市",
-    "区",
-    "县",
-    "旗",
-    "镇",
-    "乡",
-    "村",
+from .org_masking import (
+    CompanyMaskPlan,
+    alias_mask_for_organization,
+    build_company_mask_plan,
+    derived_organization_alias_cores,
+    explicit_organization_aliases,
+    has_explicit_bare_brand_alias,
+    looks_like_complete_bare_company_body,
+    mask_institution,
 )
 
-LEGAL_SUFFIXES = (
-    "有限责任公司",
-    "股份有限公司",
-    "集团有限公司",
-    "有限公司",
-    "幼儿园",
-    "公司",
-    "集团",
-)
-
-INSTITUTION_SUFFIXES = (
-    "保险股份有限公司",
-    "保险有限公司",
-    "保险公司",
-    "商业银行股份有限公司",
-    "股份制商业银行",
-    "农村商业银行",
-    "商业银行",
-    "银行",
-    "人民法院",
-    "人民检察院",
-    "公安局",
-    "税务局",
-)
-
-INDUSTRY_TERMS = (
-    "房地产开发",
-    "饮料",
-    "建筑工程",
-    "建设工程",
-    "电力建设",
-    "电力工程",
-    "园林绿化工程",
-    "装饰工程",
-    "设计",
-    "新能源",
-    "运输",
-    "物流",
-    "科技",
-    "教育科技",
-    "文化传媒",
-    "物业管理",
-    "人力资源服务",
-    "燃气",
-    "水务",
-    "医药",
-    "药业",
-    "钢铁",
-    "电子商务",
-    "贸易",
-    "商贸",
-    "咨询",
-    "服务",
-)
-
-PROVINCE_NAMES = (
-    "北京", "天津", "河北", "山西", "内蒙古", "辽宁", "吉林", "黑龙江",
-    "上海", "江苏", "浙江", "安徽", "福建", "江西", "山东", "河南",
-    "湖北", "湖南", "广东", "广西", "海南", "重庆", "四川", "贵州",
-    "云南", "西藏", "陕西", "甘肃", "青海", "宁夏", "新疆",
-)
-
-ORG_FULL_RE = re.compile(
-    r"(?:^|(?<=[\s，,。；;：:、（(与和及由向对给找]))"
-    r"[\u4e00-\u9fa5A-Za-z0-9（）()·]{2,30}?"
-    r"(?:有限责任公司|股份有限公司|集团有限公司|有限公司|"
-    r"律师事务所|会计师事务所|保险公司|商业银行|幼儿园|公司|集团|银行)"
-)
-BARE_COMPANY_ALIAS_RE = re.compile(
-    r"(?:^|[，。；、\n：:]|找到的|从未找|未找|直接找|找|与|和|由|对|"
-    r"证据[一二三四五六七八九十\d]+中|"
-    r"原告|被告[一二三四五六七八九十\d]?|第三人)"
-    r"(?P<alias>(?!(?:原告|被告|第三人|从未找|未找|直接找|找|聊天记录首先|证据[一二三四五六七八九十\d]+中))"
-    r"[\u4e00-\u9fa5A-Za-z0-9·]{2,8}(?:公司|集团))"
-)
-
-
-def _location_core(value: str) -> str:
-    if value.endswith("小镇"):
-        return value
-    for suffix in ADMIN_SUFFIXES:
-        if value.endswith(suffix) and len(value) - len(suffix) >= 2:
-            return value[: -len(suffix)]
-    return value
-
-
-def _location_suffix(value: str) -> str:
-    for suffix in ADMIN_SUFFIXES:
-        if value.endswith(suffix):
-            return suffix
-    return "地"
-
-
-def _simple_legal_suffix(value: str) -> str:
-    if value.endswith("集团"):
-        return "集团"
-    if value.endswith("幼儿园"):
-        return "幼儿园"
-    return "公司"
-
-
-def _strip_leading_locations(value: str, known_locations: dict[str, str]) -> tuple[str, str]:
-    prefix = ""
-    remaining = value
-    for location in sorted(known_locations, key=len, reverse=True):
-        if remaining.startswith(location) and len(remaining) > len(location):
-            prefix += known_locations[location]
-            remaining = remaining[len(location) :]
-            break
-    return prefix, remaining
-
-
-def _strip_parenthetical_admin(value: str) -> str:
-    def replace(match: re.Match[str]) -> str:
-        inner = match.group(1).strip()
-        if inner in PROVINCE_NAMES or inner.endswith(("省", "市", "区", "县", "镇", "乡")):
-            return ""
-        return match.group(0)
-
-    return re.sub(r"[（(]([\u4e00-\u9fa5]{2,8})[）)]", replace, value)
-
-
-def _has_explicit_bare_brand_alias(text: str, brand: str) -> bool:
-    if not brand:
-        return False
-    escaped = re.escape(brand)
-    return bool(re.search(rf"(?:以下简称|简称|下称)[“\"'「『（(]?\s*{escaped}(?!公司|集团)\s*[”\"'」』）)]?", text))
-
-
-def _strip_known_place_prefix(value: str) -> str:
-    body = value
-    for province in PROVINCE_NAMES:
-        for prefix in (province, f"{province}省"):
-            if body.startswith(prefix) and len(body) > len(prefix) + 1:
-                body = body[len(prefix):]
-                return body
-    return body
-
-
-def _derived_organization_alias_cores(organization: str) -> set[str]:
-    """Derive conservative short company aliases from an accepted full name."""
-    legal_suffix = next((suffix for suffix in LEGAL_SUFFIXES if organization.endswith(suffix)), "")
-    if not legal_suffix:
-        return set()
-    body = _strip_parenthetical_admin(organization[: -len(legal_suffix)]).strip("（）() ")
-    body = _strip_known_place_prefix(body)
-    aliases: set[str] = set()
-    if len(body) >= 2:
-        aliases.add(body)
-    industry = next(
-        (term for term in sorted(INDUSTRY_TERMS, key=len, reverse=True) if body.endswith(term)),
-        "",
-    )
-    brand = body[: -len(industry)] if industry else body
-    brand = brand.strip("（）() ")
-    if len(brand) >= 2:
-        aliases.add(brand)
-    if len(brand) >= 4:
-        aliases.add(brand[:2])
-        aliases.add(brand[2:])
-    if "电力建设" in body:
-        aliases.add("电建")
-    if re.search(r"第[一二三四五六七八九十]+工程", body):
-        number = re.search(r"第([一二三四五六七八九十]+)工程", body)
-        if number:
-            aliases.add(f"{number.group(1)}建")
-    return {alias for alias in aliases if len(alias) >= 2}
-
-
-def _looks_like_complete_bare_company_body(body: str) -> bool:
-    return (
-        len(body) >= 5
-        and not _is_false_org(f"{body}公司")
-        and any(term in body for term in ("电力", "建设", "工程", "建筑", "新能源", "能源"))
-    )
-
-
-def _explicit_organization_aliases(text: str, organization: str) -> list[str]:
-    """Extract aliases that the document explicitly ties to one organization."""
-    aliases: list[str] = []
-    escaped = re.escape(organization)
-    org_pattern = ORG_FULL_RE.pattern
-    alias_pattern = r"[\u4e00-\u9fa5A-Za-z0-9·]{2,20}(?:公司|集团)"
-    for match in re.finditer(escaped, text):
-        window = text[match.end() : min(len(text), match.end() + 180)]
-        for pattern in (
-            rf"[（(][^）)]{{0,30}}(?:原名称|原名|曾用名|原公司名称|原为|原系)\s*[：:为]?\s*(?P<alias>{org_pattern})[^）)]*[）)]",
-            rf"(?:原名称|原名|曾用名|原公司名称|原为|原系)\s*[：:为]?\s*(?P<alias>{org_pattern})",
-            rf"(?:以下简称|简称为|简称|下称)\s*[“\"'「『（(]?\s*(?P<alias>{alias_pattern})\s*[”\"'」』）)]?",
-        ):
-            for alias_match in re.finditer(pattern, window):
-                alias = _clean_organization_text(alias_match.group("alias"))
-                if alias and alias != organization and alias not in aliases:
-                    aliases.append(alias)
-    return aliases
+# Backward-compatible re-exports for pipeline/tests.
+_derived_organization_alias_cores = derived_organization_alias_cores
+_has_explicit_bare_brand_alias = has_explicit_bare_brand_alias
+_explicit_organization_aliases = explicit_organization_aliases
 
 
 @dataclass
 class LinearRuleEngine:
     counters: TypeCounters
-    profile: object
+    profile: RedactionProfile
     sample_blacklist: set[str]
     get_location_prefix: Callable[[str], str]
     mappings: list[MappingEntry] = field(default_factory=list)
@@ -255,16 +64,28 @@ class LinearRuleEngine:
     seen_originals: set[str] = field(default_factory=set)
     source_text: str = ""
     use_semantic_rules: bool = True
+    _alias_cores_cache: dict[str, frozenset[str]] = field(default_factory=dict, repr=False)
+    _organization_plans: dict[str, CompanyMaskPlan] = field(default_factory=dict, repr=False)
 
     def discover(
         self,
         text: str,
         admin_candidates: Iterable[Candidate] = (),
         llm_analysis: dict | None = None,
+        *,
+        respect_fact_section_boundary: bool = True,
     ) -> list[MappingEntry]:
-        self.source_text = text
-        candidates = self.collect_candidates(text, admin_candidates, llm_analysis or {})
-        candidates = self._apply_llm_verdicts(candidates, text, llm_analysis or {})
+        scan_text = text
+        if respect_fact_section_boundary:
+            boundary_match = FACT_SECTION_BOUNDARY_RE.search(text)
+            if boundary_match:
+                scan_text = text[: boundary_match.start()]
+
+        self.source_text = scan_text
+        candidates = self.collect_candidates(scan_text, admin_candidates, llm_analysis or {})
+        candidates = self._apply_llm_verdicts(candidates, scan_text, llm_analysis or {})
+        candidates = resolve_candidate_overlaps(candidates)
+
         for candidate in sorted(candidates, key=lambda item: (item.start, -item.length, -item.confidence)):
             if (
                 candidate.text in self.sample_blacklist
@@ -279,6 +100,8 @@ class LinearRuleEngine:
                 self.accept_organization(candidate)
             elif candidate.type == "project":
                 self.accept_project(candidate)
+
+        self._expand_discovered_aliases()
         return self.mappings
 
     def collect_candidates(
@@ -297,10 +120,8 @@ class LinearRuleEngine:
         candidates.extend(detect_title_candidates(text))
 
         if self.use_semantic_rules:
-            # Fallback person patterns have explicit legal-language context.
             candidates.extend(detect_fallback_person_candidates(text))
 
-            # Generic organization discovery is restricted to complete legal names.
             if not has_local_org_ner:
                 for match in ORG_FULL_RE.finditer(text):
                     value = _clean_organization_text(match.group(0))
@@ -436,6 +257,7 @@ class LinearRuleEngine:
         if not isinstance(value, str) or len(value) < 2:
             return
         start = -1
+        had_window = False
         if item and window_by_id:
             window_id = item.get("window")
             if isinstance(window_id, str):
@@ -448,8 +270,13 @@ class LinearRuleEngine:
                         span_start = 0
                         span_end = 0
                     if span_end > span_start:
+                        had_window = True
                         start = text.find(value, span_start, span_end)
-        if start < 0:
+        if start < 0 and had_window:
+            occurrences = [match.start() for match in re.finditer(re.escape(value), text)]
+            if len(occurrences) == 1 and entity_type in {"person", "location", "project"}:
+                start = occurrences[0]
+        elif start < 0 and not had_window:
             start = text.find(value)
         if start < 0:
             return
@@ -477,15 +304,15 @@ class LinearRuleEngine:
         return list(best.values())
 
     def accept_location(self, candidate: Candidate) -> None:
-        if not getattr(self.profile, "redact_locations", True):
+        if not self.profile.redact_locations:
             return
         value = candidate.text.strip()
         if _looks_like_false_location(self.source_text, candidate.start, candidate.end, value):
             return
-        core = _location_core(value)
+        core = get_location_core(value)
         if len(core) < 2:
             return
-        suffix = _location_suffix(value)
+        suffix = location_suffix(value)
         prefix = self.get_location_prefix(core)
         masked = f"{prefix}{suffix}"
         self.known_locations[value] = masked
@@ -495,12 +322,12 @@ class LinearRuleEngine:
             self._add("location", core, masked, candidate)
 
     def accept_person(self, candidate: Candidate) -> None:
-        if not getattr(self.profile, "redact_persons", True):
+        if not self.profile.redact_persons:
             return
         value = candidate.text.strip()
         if (
             value in self.known_people
-            or not re.fullmatch(r"[\u4e00-\u9fa5]{2,4}", value)
+            or not re.fullmatch(r"[\u4e00-\u9fa5·]{2,6}", value)
             or _is_false_person(value)
             or any(word in value for word in ("当事", "应予", "应当", "予以"))
         ):
@@ -510,7 +337,7 @@ class LinearRuleEngine:
         self._add("person", value, masked, candidate)
 
     def accept_organization(self, candidate: Candidate) -> None:
-        if not getattr(self.profile, "redact_organizations", True):
+        if not self.profile.redact_organizations:
             return
         raw_value = candidate.text.strip(" ：:，,。；;\n\t")
         value = _clean_organization_text(raw_value)
@@ -518,14 +345,15 @@ class LinearRuleEngine:
             value = raw_value
         if not value or value in self.known_organizations:
             return
+        if is_noisy_org_capture(value):
+            return
 
         if any(suffix in value for suffix in INSTITUTION_SUFFIXES):
-            masked = value
-            for location in sorted(self.known_locations, key=len, reverse=True):
-                masked = masked.replace(location, self.known_locations[location])
-            if masked != value:
-                self.known_organizations.add(value)
-                self._add("organization", value, masked, candidate)
+            masked = mask_institution(value, self.known_locations)
+            if masked is None:
+                return
+            self.known_organizations.add(value)
+            self._add("organization", value, masked, candidate)
             return
 
         legal_suffix = next((suffix for suffix in LEGAL_SUFFIXES if value.endswith(suffix)), "")
@@ -534,68 +362,90 @@ class LinearRuleEngine:
                 suffix = "局" if value.endswith("局") else "机构"
                 self._add("organization", value, f"{self.counters.next('group_prefix')}{suffix}", candidate)
             return
+
         body = value[: -len(legal_suffix)]
         if candidate.source.startswith("hanlp_ner") and body.endswith(ADMIN_SUFFIXES):
             return
-        location_mask, body = _strip_leading_locations(body, self.known_locations)
-        body = _strip_parenthetical_admin(body).strip("（）() ")
-        if not location_mask:
-            province = next(
-                (name for name in PROVINCE_NAMES if body.startswith(name) and len(body) > len(name) + 1),
-                "",
-            )
-            if province:
-                location_prefix = self.get_location_prefix(province)
-                location_mask = f"{location_prefix}省"
-                self.known_locations[province] = location_mask
-                self._add("location", province, location_mask, candidate)
-                body = body[len(province) :]
 
         if (
             legal_suffix in {"公司", "集团"}
             and candidate.source in {"linear_full_org", "hanlp_ner", "heuristic_ner"}
-            and not _looks_like_complete_bare_company_body(body)
+            and not looks_like_complete_bare_company_body(body)
             and not self._known_organization_allows_short_alias(body)
         ):
             return
 
-        industry = next(
-            (term for term in sorted(INDUSTRY_TERMS, key=len, reverse=True) if body.endswith(term)),
-            "",
+        plan = build_company_mask_plan(
+            value=value,
+            source_text=self.source_text,
+            known_locations=self.known_locations,
+            get_location_prefix=self.get_location_prefix,
+            next_brand_mask=lambda: self.counters.next("group_prefix"),
         )
-        brand = body[: -len(industry)] if industry else body
-        brand = brand.strip("（）() ")
-        if len(brand) < 2 or (
-            legal_suffix in {"公司", "集团"} and _is_false_org(f"{brand}公司")
-        ):
+        if plan is None:
             return
 
-        brand_mask = self.counters.next("group_prefix")
-        full_mask = f"{location_mask}{brand_mask}{industry}{_simple_legal_suffix(legal_suffix)}"
-        self.known_organizations.add(value)
-        self._add("organization", value, full_mask, candidate)
-        for alias in _explicit_organization_aliases(self.source_text, value):
-            alias_mask = f"{brand_mask}公司" if alias.endswith("公司") and not any(alias.endswith(s) for s in LEGAL_SUFFIXES[:-1]) else full_mask
-            self._add("organization", alias, alias_mask, candidate)
-        if _has_explicit_bare_brand_alias(self.source_text, brand):
-            self._add("organization", brand, brand_mask, candidate)
+        for province, location_mask in plan.location_updates:
+            self.known_locations[province] = location_mask
+            self._add("location", province, location_mask, candidate)
 
-        company_alias = f"{brand}公司"
+        self.known_organizations.add(value)
+        self._alias_cores_cache[value] = derived_organization_alias_cores(value)
+        self._organization_plans[value] = plan
+        self._add("organization", value, plan.full_mask, candidate)
+
+        for alias in plan.aliases:
+            self._add("organization", alias, alias_mask_for_organization(alias, plan), candidate)
+        if has_explicit_bare_brand_alias(self.source_text, plan.brand):
+            self._add("organization", plan.brand, plan.brand_mask, candidate)
+
+        company_alias = f"{plan.brand}公司"
         if company_alias in self.source_text:
-            self._add("organization", company_alias, f"{brand_mask}公司", candidate)
+            self._add("organization", company_alias, f"{plan.brand_mask}公司", candidate)
 
     def _known_organization_allows_short_alias(self, alias_core: str) -> bool:
         if not alias_core or len(alias_core) < 2:
             return False
-        if _has_explicit_bare_brand_alias(self.source_text, alias_core):
+        if has_explicit_bare_brand_alias(self.source_text, alias_core):
             return True
         for organization in self.known_organizations:
-            if alias_core in _derived_organization_alias_cores(organization):
+            cores = self._alias_cores_cache.get(organization)
+            if cores is None:
+                cores = derived_organization_alias_cores(organization)
+                self._alias_cores_cache[organization] = cores
+            if alias_core in cores:
                 return True
         return False
 
+    def _expand_discovered_aliases(self) -> None:
+        for organization in list(self.known_organizations):
+            plan = self._organization_plans.get(organization)
+            if plan is None:
+                continue
+            for alias in explicit_organization_aliases(self.source_text, organization):
+                if alias in self.seen_originals or alias in self.known_organizations:
+                    continue
+                start = self.source_text.find(alias)
+                if start < 0:
+                    continue
+                self._add(
+                    "organization",
+                    alias,
+                    alias_mask_for_organization(alias, plan),
+                    Candidate(
+                        type="organization",
+                        text=alias,
+                        start=start,
+                        end=start + len(alias),
+                        source="linear_alias_expand",
+                        confidence=0.9,
+                        risk_level="medium",
+                        auto_redact=True,
+                    ),
+                )
+
     def accept_project(self, candidate: Candidate) -> None:
-        if not getattr(self.profile, "redact_projects", True):
+        if not self.profile.redact_projects:
             return
         value = candidate.text.strip(" ：:，,。；;\n\t")
         if (
@@ -653,7 +503,7 @@ class LinearRuleEngine:
         if candidate.source != "linear_llm_exact":
             return False
         if entity_type == "person":
-            return bool(re.fullmatch(r"[\u4e00-\u9fa5]{2,4}", original))
+            return bool(re.fullmatch(r"[\u4e00-\u9fa5·]{2,6}", original))
         if entity_type == "organization":
             return any(original.endswith(suffix) for suffix in LEGAL_SUFFIXES + INSTITUTION_SUFFIXES)
         return False

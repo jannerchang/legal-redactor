@@ -24,6 +24,7 @@ from .detectors import (
     _is_false_person
 )
 from .hebei_admin import HebeiAdminDivisionDetector
+from .location_utils import get_location_core
 from .models import BatchRedactionResult, Candidate, Leak, MappingEntry, RedactedDocument, RedactionMap, RedactionResult
 from ._samples import load_all_samples, load_trusted_sample_mappings
 
@@ -60,28 +61,6 @@ def map_case_number(case_num: str, prov_mapping: dict[str, str]) -> str:
             mapped_abbr = prov_mapping[abbr]
             return case_num.replace(abbr, mapped_abbr)
     return case_num
-
-
-def _get_location_core(name: str) -> str:
-    """提取地名的核心部分，递归去除行政区划与基层组织后缀。"""
-    if name.endswith("小镇"):
-        return name
-    suffixes = (
-        "居民委员会", "村民委员会", "居委会", "村委会", "自治区",
-        "自治州", "街道", "社区", "省", "市", "区", "县", "旗", "镇", "乡", "村"
-    )
-    core = name
-    while True:
-        stripped = False
-        for sfx in suffixes:
-            if core.endswith(sfx) and len(core) > len(sfx):
-                if len(core) - len(sfx) >= 2:
-                    core = core[:-len(sfx)]
-                    stripped = True
-                    break
-        if not stripped:
-            break
-    return core
 
 
 def mask_hebei_text(text: str, get_loc_prefix=None) -> str:
@@ -395,7 +374,7 @@ def _analysis_entity_texts(analysis: dict) -> set[str]:
 
 
 def _organization_alias_cores_from_candidates(candidates: list[Candidate]) -> set[str]:
-    from .linear_engine import _derived_organization_alias_cores
+    from .org_masking import derived_organization_alias_cores as _derived_organization_alias_cores
 
     aliases: set[str] = set()
     for candidate in candidates:
@@ -594,7 +573,7 @@ def _filter_fragments_inside_longer_entities(text: str, mappings: list[MappingEn
 
 def _filter_org_alias_prefixed_locations(mappings: list[MappingEntry]) -> list[MappingEntry]:
     """Drop pseudo-locations formed as organization alias + an already accepted location."""
-    from .linear_engine import _derived_organization_alias_cores
+    from .org_masking import derived_organization_alias_cores as _derived_organization_alias_cores
 
     org_aliases: set[str] = set()
     location_originals = {
@@ -695,7 +674,8 @@ def _organization_alias_profile(
     mapping: MappingEntry,
     place_prefixes: set[str],
 ) -> dict[str, set[str] | str]:
-    from .linear_engine import INDUSTRY_TERMS, LEGAL_SUFFIXES, _derived_organization_alias_cores
+    from .lexicon import INDUSTRY_TERMS, LEGAL_SUFFIXES
+    from .org_masking import derived_organization_alias_cores as _derived_organization_alias_cores
 
     cleaned = _clean_organization_text(mapping.original) or mapping.original.strip()
     cleaned = re.sub(r"\s+", "", cleaned.strip(" ：:，,。；;、\n\t"))
@@ -770,7 +750,7 @@ def _organization_canonical_score(mapping: MappingEntry) -> tuple[int, int, str]
 
 def _merge_organization_alias_mappings(mappings: list[MappingEntry]) -> list[MappingEntry]:
     """Make same-subject organization variants share one mask inside a batch map."""
-    from .linear_engine import PROVINCE_NAMES
+    from .lexicon import PROVINCE_NAMES
 
     org_indices = [index for index, mapping in enumerate(mappings) if mapping.type == "organization"]
     if len(org_indices) < 2:
@@ -786,7 +766,7 @@ def _merge_organization_alias_mappings(mappings: list[MappingEntry]) -> list[Map
         original = _clean_unbalanced_brackets(mapping.original.strip(" ：:，,。；;、\n\t"))
         if 2 <= len(original) <= 10:
             place_prefixes.add(original)
-        core = _get_location_core(original)
+        core = get_location_core(original)
         if 2 <= len(core) <= 8:
             place_prefixes.add(core)
 
@@ -937,49 +917,49 @@ def extract_and_map_geonames(text: str, get_loc_prefix, profile, sample_blacklis
         if m:
             if m.group("prov"):
                 p_text = m.group("prov")
-                prov_list.append((p_text, _get_location_core(p_text)))
+                prov_list.append((p_text, get_location_core(p_text)))
             if m.group("city"):
                 c_text = m.group("city")
-                city_list.append((c_text, _get_location_core(c_text)))
+                city_list.append((c_text, get_location_core(c_text)))
             if m.group("county"):
                 co_text = m.group("county")
-                county_list.append((co_text, _get_location_core(co_text)))
+                county_list.append((co_text, get_location_core(co_text)))
             if m.group("town"):
                 t_text = m.group("town")
-                town_list.append((t_text, _get_location_core(t_text)))
+                town_list.append((t_text, get_location_core(t_text)))
             if m.group("village"):
                 v_text = m.group("village")
-                village_list.append((v_text, _get_location_core(v_text)))
+                village_list.append((v_text, get_location_core(v_text)))
         else:
             # 备用地名后缀归类
             level = None
             for suffix in ("省", "自治区"):
                 if full.endswith(suffix) and len(full) > len(suffix):
-                    prov_list.append((full, _get_location_core(full)))
+                    prov_list.append((full, get_location_core(full)))
                     level = "province"
                     break
             if not level:
                 for suffix in ("市", "自治州", "盟"):
                     if full.endswith(suffix) and len(full) > len(suffix):
-                        city_list.append((full, _get_location_core(full)))
+                        city_list.append((full, get_location_core(full)))
                         level = "city"
                         break
             if not level:
                 for suffix in ("区", "县", "旗"):
                     if full.endswith(suffix) and len(full) > len(suffix):
-                        county_list.append((full, _get_location_core(full)))
+                        county_list.append((full, get_location_core(full)))
                         level = "county"
                         break
             if not level:
                 for suffix in ("街道", "镇", "乡"):
                     if full.endswith(suffix) and len(full) > len(suffix):
-                        town_list.append((full, _get_location_core(full)))
+                        town_list.append((full, get_location_core(full)))
                         level = "town"
                         break
             if not level:
                 for suffix in ("居民委员会", "居委会", "村民委员会", "村委会", "社区", "村"):
                     if full.endswith(suffix) and len(full) > len(suffix):
-                        village_list.append((full, _get_location_core(full)))
+                        village_list.append((full, get_location_core(full)))
                         level = "village"
                         break
 
@@ -1097,14 +1077,14 @@ class RedactionPipeline:
         # 统一地名脱敏前缀注册，确保同核心地名的缩写、全称使用相同的字母前缀（例如 河北省、河北 均脱敏为 甲省）
         location_prefixes: dict[str, str] = {}
         def get_loc_prefix(name: str) -> str:
-            core = _get_location_core(name)
+            core = get_location_core(name)
             if core not in location_prefixes:
                 location_prefixes[core] = counters.next('location')
             return location_prefixes[core]
 
         admin_prefixes: dict[str, str] = {}
         def get_admin_prefix(division_code: str, name: str) -> str:
-            core = _get_location_core(name)
+            core = get_location_core(name)
             if division_code in admin_prefixes:
                 return admin_prefixes[division_code]
             if core in location_prefixes:
@@ -1132,7 +1112,7 @@ class RedactionPipeline:
             base_mappings = list(base_redaction_map.mappings)
             for m in base_mappings:
                 if m.type == "location" and m.masked:
-                    core = _get_location_core(m.original)
+                    core = get_location_core(m.original)
                     prefix_match = re.match(r"^([A-Z]|[\u4e00-\u9fa5]+)", m.masked)
                     if prefix_match:
                         pfx = prefix_match.group(1)
@@ -1544,20 +1524,20 @@ class RedactionPipeline:
         for mapping in base_mappings:
             if mapping.type != "location" or not mapping.masked:
                 continue
-            core = _get_location_core(mapping.original)
+            core = get_location_core(mapping.original)
             match = re.match(r"^([\u4e00-\u9fa5])", mapping.masked)
             if match and match.group(1) != "某":
                 location_prefixes[core] = match.group(1)
 
         def get_location_prefix(name: str) -> str:
-            core = _get_location_core(name)
+            core = get_location_core(name)
             if core not in location_prefixes:
                 location_prefixes[core] = counters.next("location")
             return location_prefixes[core]
 
         admin_prefixes: dict[str, str] = {}
         def get_admin_prefix(division_code: str, name: str) -> str:
-            core = _get_location_core(name)
+            core = get_location_core(name)
             if division_code in admin_prefixes:
                 return admin_prefixes[division_code]
             if core in location_prefixes:

@@ -10,6 +10,7 @@ from legal_redactor import mcp_adapter
 def test_mcp_adapter_requires_api_url(monkeypatch) -> None:
     monkeypatch.delenv("LEGAL_REDACTOR_API_URL", raising=False)
     monkeypatch.setenv("LEGAL_REDACTOR_API_TOKEN", "token")
+    monkeypatch.setattr(mcp_adapter, "load_json_config", lambda *args, **kwargs: {})
 
     result = mcp_adapter.restore_judgment_from_thread("3", "draft")
 
