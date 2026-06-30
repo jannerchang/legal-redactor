@@ -26,6 +26,7 @@ try:
         _page,
         _render_redaction_result,
         _render_status_panel,
+        _renumber_mapping_placeholders,
         _restore_risk_reasons,
         _should_apply_auto_prefill,
         _suggest_manual_mapping_entry,
@@ -50,6 +51,7 @@ except RuntimeError as exc:  # Web deps are optional for non-Web unit runs.
     _page = None
     _render_redaction_result = None
     _render_status_panel = None
+    _renumber_mapping_placeholders = None
     _restore_risk_reasons = None
     _should_apply_auto_prefill = None
     _suggest_manual_mapping_entry = None
@@ -780,6 +782,104 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertEqual(org.masked, "乙公司")
         self.assertEqual(loc.masked, "乙区")
 
+    def test_renumber_mapping_placeholders_compacts_current_rows(self) -> None:
+        entries = [
+            MappingEntry(
+                type="organization",
+                original="河北成城房地产开发有限公司",
+                masked="丁公司",
+                role=None,
+                source="rule",
+                confidence=1.0,
+                restore_by_default=True,
+            ),
+            MappingEntry(
+                type="organization",
+                original="明显误识别机构",
+                masked="14机构",
+                role=None,
+                source="manual",
+                confidence=1.0,
+                restore_by_default=True,
+            ),
+            MappingEntry(
+                type="person",
+                original="张三",
+                masked="张某丁",
+                role=None,
+                source="rule",
+                confidence=1.0,
+                restore_by_default=True,
+            ),
+        ]
+
+        renumbered = _renumber_mapping_placeholders(entries)
+
+        self.assertEqual([entry.masked for entry in renumbered], ["甲公司", "乙机构", "张某甲"])
+
+    def test_renumber_mapping_placeholders_keeps_aliases_in_same_group(self) -> None:
+        entries = [
+            MappingEntry(
+                type="organization",
+                original="拓欧",
+                masked="丁",
+                role=None,
+                source="rule",
+                confidence=1.0,
+                restore_by_default=True,
+            ),
+            MappingEntry(
+                type="organization",
+                original="拓欧公司",
+                masked="丁公司",
+                role=None,
+                source="rule",
+                confidence=1.0,
+                restore_by_default=True,
+            ),
+            MappingEntry(
+                type="location",
+                original="裕华区",
+                masked="8区",
+                role=None,
+                source="rule",
+                confidence=1.0,
+                restore_by_default=True,
+            ),
+        ]
+
+        renumbered = _renumber_mapping_placeholders(entries)
+
+        self.assertEqual([entry.masked for entry in renumbered], ["甲", "甲公司", "甲区"])
+
+    def test_apply_edited_map_can_renumber_placeholders(self) -> None:
+        from fastapi.testclient import TestClient
+
+        response = TestClient(app).post(
+            "/redact/apply-edited-map",
+            data={
+                "original_text": "河北成城房地产开发有限公司与张三签订合同。",
+                "map_version": "1.0",
+                "map_created_at": "2026-06-30T10:00:00+08:00",
+                "map_mode": "normal",
+                "map_source_file": "",
+                "map_type": ["organization", "person"],
+                "map_original": ["河北成城房地产开发有限公司", "张三"],
+                "map_masked": ["丁公司", "张某丁"],
+                "map_role": ["", ""],
+                "map_source": ["rule", "rule"],
+                "map_confidence": ["1.0", "1.0"],
+                "map_reason": ["", ""],
+                "map_restore_by_default": ["1", "1"],
+                "remap_placeholders": "1",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("甲公司与张某甲签订合同", response.text)
+        self.assertIn("已按当前保留的映射重新排列占位符", response.text)
+        self.assertNotIn("丁公司与张某丁签订合同", response.text)
+
     def test_case_creation_command_formats_case_folder_for_hermes(self) -> None:
         command = _case_creation_command("2026 5987 劳动争议纠纷", "lr_test")
 
@@ -1204,6 +1304,15 @@ class WebAppUploadTests(unittest.TestCase):
                     confidence=1.0,
                     restore_by_default=True,
                 ),
+                MappingEntry(
+                    type="case_number",
+                    original="（2025）冀01民终123号",
+                    masked="",
+                    role=None,
+                    source="court_case_number_parser",
+                    confidence=1.0,
+                    restore_by_default=False,
+                ),
             ]
         )
 
@@ -1243,7 +1352,8 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertIn("manual_added", html)
         self.assertIn("restore_risk", html)
         self.assertIn("sample_reused", html)
-        self.assertIn('data-restore-risk-codes="restore_disabled"', html)
+        self.assertIn('data-restore-risk-codes="empty_mask"', html)
+        self.assertNotIn("restore_disabled", html)
         self.assertIn('id="mapping-review-candidates"', html)
         self.assertIn("甲公司", html)
         self.assertIn("reviewCandidateIndex[original]", html)
@@ -1259,6 +1369,47 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertIn("baseline&&baseline.masked&&baseline.masked!==masked", html)
         self.assertIn("if(deleted)cats.push('delete_candidate')", html)
         self.assertIn("filterMappingRows(activeMappingFilter())", html)
+        self.assertIn("function readCurrentMappingJson()", html)
+        self.assertIn("readCurrentMappingJson()", html)
+        self.assertNotIn("mapping-json-output').value}}], this)", html)
+        self.assertIn("DOMContentLoaded", html)
+
+    def test_mapping_review_classifier_skips_pipeline_sources_for_manual_added(self) -> None:
+        for source in ("local_llm", "court_case_number_parser", "sample_library:add", "geoname_hierarchy"):
+            with self.subTest(source=source):
+                entry = MappingEntry(
+                    type="organization",
+                    original="测试公司",
+                    masked="甲公司",
+                    role=None,
+                    source=source,
+                    confidence=0.95,
+                    restore_by_default=True,
+                )
+                categories = _classify_mapping_review_row(entry)
+                self.assertNotIn("manual_added", categories)
+
+        manual = MappingEntry(
+            type="person",
+            original="王五",
+            masked="王某甲",
+            role=None,
+            source="manual_selection",
+            confidence=1.0,
+            restore_by_default=True,
+        )
+        self.assertIn("manual_added", _classify_mapping_review_row(manual))
+
+        new_row = MappingEntry(
+            type="person",
+            original="赵六",
+            masked="赵某甲",
+            role=None,
+            source="court_case_number_parser",
+            confidence=1.0,
+            restore_by_default=True,
+        )
+        self.assertIn("manual_added", _classify_mapping_review_row(new_row, is_new_row=True))
 
     def test_mapping_review_classifier_marks_modified_delete_and_restore_reasons(self) -> None:
         original = MappingEntry(
@@ -1282,11 +1433,13 @@ class WebAppUploadTests(unittest.TestCase):
 
         categories = _classify_mapping_review_row(edited, original_entry=original, deleted=True)
         reason_codes = {item["reason_code"] for item in _restore_risk_reasons(edited, deleted=True)}
+        not_deleted_categories = _classify_mapping_review_row(edited, original_entry=original, deleted=False)
 
         self.assertIn("modified", categories)
         self.assertIn("delete_candidate", categories)
         self.assertIn("restore_risk", categories)
-        self.assertEqual(reason_codes, {"delete_candidate", "restore_disabled"})
+        self.assertEqual(reason_codes, {"delete_candidate"})
+        self.assertNotIn("restore_risk", not_deleted_categories)
 
     def test_case_workflow_panel_renders_all_states(self) -> None:
         cases = [
