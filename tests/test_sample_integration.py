@@ -49,37 +49,55 @@ def mock_samples(tmp_path):
     return tmp_path, filepath
 
 
-def test_pipeline_sample_blacklist_and_lookup(mock_samples, monkeypatch):
+def test_pipeline_reuses_modify_samples_without_delete_blacklist(mock_samples, monkeypatch):
     tmp_path, filepath = mock_samples
 
-    # 1. 使用 monkeypatch 强制 _samples 模块使用我们的临时样本库目录
     import legal_redactor._samples
     monkeypatch.setattr(legal_redactor._samples, "DEFAULT_SAMPLES_DIR", tmp_path)
 
-    # 2. 初始化 Pipeline (离线模式)
     config = PipelineConfig.offline_without_llm()
     pipeline = RedactionPipeline(config=config)
-
-    # 3. 构造包含这三个特征词的测试文书文本
-    # "来我去公司" - 本来包含“公司”后缀，在标准模式下通常会被启发式机构规则识别为 organization；但因拉黑（黑名单）应被保留
-    # "张小明" - 历史 modify 样本来自用户校正，应优先使用特制掩码
-    # "绝密代号" - 由于移除了正向直接数据库匹配，在离线且没有 LLM 提取的情况下，将不会被脱敏且保留原样
     test_text = "原告：张小明。被告：来我去公司。案件涉及绝密代号。"
 
-    # 4. 执行脱敏
     result = pipeline.redact(test_text, mode="standard")
 
-    # 5. 断言验证
-    # "来我去公司" 必须保留原样，不能被脱敏
-    assert "来我去公司" in result.redacted_text
-
-    # "张小明" 使用历史特制掩码，优先于标准通用人名规则
     assert "张小明" not in result.redacted_text
     assert "【小明特制掩码】" in result.redacted_text
-
-    # "绝密代号" 保持原样，不会被错误强行替换为 "【代号X】"
     assert "绝密代号" in result.redacted_text
     assert "【代号X】" not in result.redacted_text
+
+
+def test_delete_samples_remain_for_optimization(mock_samples, monkeypatch):
+    tmp_path, _filepath = mock_samples
+
+    import legal_redactor._samples as samples_module
+    monkeypatch.setattr(samples_module, "DEFAULT_SAMPLES_DIR", tmp_path)
+
+    _, optimization_blacklist = load_all_samples(samples_dir=tmp_path)
+    assert "来我去公司" in optimization_blacklist
+    assert "来我去公司" in get_few_shot_examples(samples_dir=tmp_path)
+
+
+def test_delete_blacklist_does_not_block_party_org_redaction(tmp_path, monkeypatch):
+    import legal_redactor._samples as samples_module
+
+    save_sample_auto(
+        [{"action": "delete", "type": "organization", "original": "华北制药股份有限公司"}],
+        samples_dir=tmp_path,
+    )
+    monkeypatch.setattr(samples_module, "DEFAULT_SAMPLES_DIR", tmp_path)
+
+    assert "华北制药股份有限公司" in load_all_samples(samples_dir=tmp_path)[1]
+
+    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
+    result = pipeline.redact(
+        "原告华北制药股份有限公司诉被告张三、李四，第三人赵仁川合同纠纷一案。",
+        mode="standard",
+    )
+
+    orgs = [mapping for mapping in result.redaction_map.mappings if mapping.type == "organization"]
+    assert any(mapping.original == "华北制药股份有限公司" for mapping in orgs)
+    assert "华北制药股份有限公司" not in result.redacted_text
 
 
 def test_trusted_added_company_samples_are_reused_narrowly(tmp_path):

@@ -98,10 +98,7 @@ class LinearRuleEngine:
         candidates = resolve_candidate_overlaps(candidates)
 
         for candidate in sorted(candidates, key=lambda item: (item.start, -item.length, -item.confidence)):
-            if (
-                candidate.text in self.sample_blacklist
-                and not self._llm_exact_overrides_sample_blacklist(candidate.type, candidate.text, candidate)
-            ):
+            if candidate.text in self.sample_blacklist:
                 continue
             if candidate.type in {"location", "grassroots_org"}:
                 self.accept_location(candidate)
@@ -584,10 +581,7 @@ class LinearRuleEngine:
         if (
             not original
             or original in self.seen_originals
-            or (
-                original in self.sample_blacklist
-                and not self._llm_exact_overrides_sample_blacklist(entity_type, original, candidate)
-            )
+            or original in self.sample_blacklist
             or original == masked
         ):
             return
@@ -604,16 +598,4 @@ class LinearRuleEngine:
             )
         )
 
-    @staticmethod
-    def _llm_exact_overrides_sample_blacklist(
-        entity_type: str,
-        original: str,
-        candidate: Candidate,
-    ) -> bool:
-        if candidate.source != "linear_llm_exact":
-            return False
-        if entity_type == "person":
-            return bool(re.fullmatch(r"[\u4e00-\u9fa5·]{2,6}", original))
-        if entity_type == "organization":
-            return any(original.endswith(suffix) for suffix in LEGAL_SUFFIXES + INSTITUTION_SUFFIXES)
-        return False
+

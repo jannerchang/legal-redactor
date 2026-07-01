@@ -433,8 +433,6 @@ async def suggest_mapping_entry(request: Request) -> JSONResponse:
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
-    from ._samples import load_all_samples
-    sample_lookup, sample_blacklist = load_all_samples()
     sample_info = ""
     status_panel = _render_status_panel(_status_payload())
 
