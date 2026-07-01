@@ -31,6 +31,20 @@ from .models import BatchRedactionResult, Candidate, Leak, MappingEntry, Redacte
 from ._samples import load_all_samples, load_trusted_sample_mappings
 
 
+_COMPANY_SUFFIXES_FOR_ALIAS_BOUNDARY = (
+    "有限责任公司",
+    "股份有限公司",
+    "集团有限公司",
+    "有限公司",
+    "公司",
+    "集团",
+)
+_ORG_ALIAS_LONGER_COMPANY_RE = re.compile(
+    r"^[\u4e00-\u9fa5A-Za-z0-9·]{1,16}(?:"
+    + "|".join(re.escape(suffix) for suffix in _COMPANY_SUFFIXES_FOR_ALIAS_BOUNDARY)
+    + r")"
+)
+
 
 # ── 行业与法律通用高频品牌词黑名单（防止超脱敏误伤普通词汇） ──
 GENERIC_BRAND_BLACKLIST = {
@@ -489,6 +503,26 @@ def _find_all_spans(text: str, needle: str) -> list[tuple[int, int]]:
         spans.append((start, start + len(needle)))
         start = text.find(needle, start + 1)
     return spans
+
+
+def _should_skip_short_org_alias_replacement(
+    text: str,
+    start: int,
+    end: int,
+    mapping: MappingEntry,
+) -> bool:
+    """Avoid replacing a stated short org alias inside a different longer company name."""
+    if mapping.type not in {"organization", "individual_business"}:
+        return False
+    original = mapping.original.strip()
+    if not original or len(original) > 6:
+        return False
+    if any(original.endswith(suffix) for suffix in _COMPANY_SUFFIXES_FOR_ALIAS_BOUNDARY):
+        return False
+    following = text[end : end + 24]
+    if following.startswith(("公司", "集团")):
+        return True
+    return bool(_ORG_ALIAS_LONGER_COMPANY_RE.match(following))
 
 
 def _filter_locations_inside_organizations(
@@ -2022,11 +2056,31 @@ class RedactionPipeline:
         return remove_court_signatures(self.apply_mappings(text, redaction_map.mappings))
 
     def apply_mappings(self, text: str, mappings: list[MappingEntry]) -> str:
-        if not mappings: return text
+        if not mappings:
+            return text
         sorted_mappings = sorted((m for m in mappings if m.original), key=lambda m: len(m.original), reverse=True)
+        replacements: list[tuple[int, int, str]] = []
+        occupied: list[tuple[int, int]] = []
         for entry in sorted_mappings:
-            text = text.replace(entry.original, entry.masked)
-        return text
+            start = 0
+            while True:
+                index = text.find(entry.original, start)
+                if index < 0:
+                    break
+                end = index + len(entry.original)
+                start = index + 1
+                if any(not (end <= used_start or index >= used_end) for used_start, used_end in occupied):
+                    continue
+                if _should_skip_short_org_alias_replacement(text, index, end, entry):
+                    continue
+                replacements.append((index, end, entry.masked))
+                occupied.append((index, end))
+        if not replacements:
+            return text
+        chars = list(text)
+        for start, end, masked in sorted(replacements, key=lambda item: item[0], reverse=True):
+            chars[start:end] = list(masked)
+        return "".join(chars)
 
     def scan_high_risk_leaks(self, text: str) -> list[Leak]:
         leaks: list[Leak] = []

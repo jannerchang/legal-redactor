@@ -214,11 +214,11 @@ def parse_party_line(line: str, line_start: int = 0) -> PartyLine | None:
 
 
 def _extract_party_entity(body: str) -> str:
-    body = body.strip(" ：:，,。；;")
+    body = body.strip(" ：:，,。；;、")
     if re.match(r"^(?:位于|在|因|与|起诉|诉称|称|认为|主张|住所地|经常居住地|现住|地址|系)", body):
         return ""
     body = re.sub(r"^(?:自然人|公民|公司|单位|个体工商户)\s*", "", body)
-    field = re.split(r"[，,。；;\n]", body, maxsplit=1)[0].strip()
+    field = re.split(r"[，,。；;、\n]", body, maxsplit=1)[0].strip()
     
     if not field:
         return ""
@@ -241,7 +241,7 @@ def _extract_party_entity(body: str) -> str:
 
     # 2. 如果不是机构，移除可能存在的尾部括号（如人名的曾用名、简称等）
     field_clean = re.sub(r"（.*?）|\(.*?\)", "", field).strip()
-    field_clean = field_clean.strip(" ：:，,。；;")
+    field_clean = field_clean.strip(" ：:，,。；;、")
     
     if not field_clean:
         return ""
@@ -343,6 +343,64 @@ def detect_party_candidates(text: str) -> tuple[list[Candidate], list[PartyLine]
             )
         )
     return candidates, party_lines
+
+
+INLINE_PERSON_LIST_ROLE_RE = re.compile(
+    rf"(?:^|[，,。；;\n\s]|诉|与|和|及)"
+    rf"(?P<role>{'|'.join(ROLE_NAMES)})(?:[一二三四五六七八九十\d]+)?(?:[：:])?"
+)
+INLINE_PERSON_LIST_STOP_RE = re.compile(
+    rf"[。；;\n]|(?:诉|与|和|及)?(?:{'|'.join(ROLE_NAMES)})(?:[一二三四五六七八九十\d]+)?(?:[：:])?"
+)
+INLINE_PERSON_CASE_TAIL_RE = re.compile(
+    r"(?:合同纠纷|劳动争议|民间借贷|侵权责任|买卖合同|建设工程|"
+    r"纠纷一案|纠纷案|一案).*$"
+)
+
+
+def detect_inline_party_person_list_candidates(text: str) -> list[Candidate]:
+    """Detect people listed after inline party roles, e.g. 第三人张三、李四."""
+    candidates: list[Candidate] = []
+    seen: set[tuple[str, int]] = set()
+    for match in INLINE_PERSON_LIST_ROLE_RE.finditer(text):
+        role = match.group("role")
+        tail = text[match.end() :]
+        stop = INLINE_PERSON_LIST_STOP_RE.search(tail)
+        if stop:
+            tail = tail[: stop.start()]
+        tail = INLINE_PERSON_CASE_TAIL_RE.sub("", tail).strip(" ：:，,。；;\n\t")
+        if not tail:
+            continue
+        parts = re.split(r"[、,，]|(?:和|及)(?=[\u4e00-\u9fa5]{2,4}(?:[、,，]|$))", tail)
+        for part in parts:
+            raw = part.strip(" ：:，,。；;\n\t")
+            raw = re.split(r"(?:男|女|汉族|住|住所地|身份证|公民身份)", raw, maxsplit=1)[0]
+            value = _clean_person_name(raw)
+            if _is_false_person(value) or not re.fullmatch(r"[\u4e00-\u9fa5·]{2,6}", value):
+                continue
+            local_start = text.find(value, match.end())
+            if local_start < 0:
+                continue
+            key = (value, local_start)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(
+                Candidate(
+                    type="person",
+                    text=value,
+                    start=local_start,
+                    end=local_start + len(value),
+                    source="inline_party_person_list",
+                    confidence=0.93,
+                    risk_level=risk_for("person"),
+                    auto_redact=True,
+                    role=role,
+                    reason="行内当事人/第三人名单解析",
+                    metadata={"context": text[max(0, match.start() - 20) : min(len(text), local_start + len(value) + 40)]},
+                )
+            )
+    return candidates
 
 
 def detect_standard_regex_candidates(text: str) -> list[Candidate]:

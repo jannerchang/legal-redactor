@@ -33,7 +33,7 @@ def get_context_paragraphs(text: str, max_chars: int = 8000) -> str:
 def build_sentence_windows(text: str, max_chars: int = 6000, max_windows: int = 40) -> list[dict[str, str]]:
     """Split text into target sentence windows with previous/next context."""
     spans: list[tuple[str, int, int]] = []
-    pattern = re.compile(r"[^\n。！？；;]+[。！？；;]?|[^\n]+")
+    pattern = re.compile(r"[^\n。！？；;，,、]+[。！？；;，,、]?|[^\n]+")
     for match in pattern.finditer(text):
         sentence = match.group(0).strip()
         if not sentence:

@@ -108,13 +108,15 @@ def explicit_organization_aliases(text: str, organization: str) -> list[str]:
     aliases: list[str] = []
     escaped = re.escape(organization)
     org_pattern = ORG_FULL_RE.pattern
-    alias_pattern = r"[\u4e00-\u9fa5A-Za-z0-9·]{2,20}(?:公司|集团)"
+    suffixed_alias_pattern = r"[\u4e00-\u9fa5A-Za-z0-9·]{2,20}(?:公司|集团)"
+    bare_alias_pattern = r"[\u4e00-\u9fa5A-Za-z0-9·]{2,20}"
     for match in re.finditer(escaped, text):
         window = text[match.end() : min(len(text), match.end() + 180)]
         for pattern in (
             rf"[（(][^）)]{{0,30}}(?:原名称|原名|曾用名|原公司名称|原为|原系)\s*[：:为]?\s*(?P<alias>{org_pattern})[^）)]*[）)]",
             rf"(?:原名称|原名|曾用名|原公司名称|原为|原系)\s*[：:为]?\s*(?P<alias>{org_pattern})",
-            rf"(?:以下简称|简称为|简称|下称)\s*[“\"'「『（(]?\s*(?P<alias>{alias_pattern})\s*[”\"'」』）)]?",
+            rf"(?:以下简称|简称为|简称|下称)\s*[“\"'「『（(]?\s*(?P<alias>{suffixed_alias_pattern})\s*[”\"'」』）)]?",
+            rf"(?:以下简称|简称为|简称|下称)\s*[“\"'「『（(]?\s*(?P<alias>{bare_alias_pattern})\s*[”\"'」』）)]?",
         ):
             for alias_match in re.finditer(pattern, window):
                 alias = _clean_organization_text(alias_match.group("alias"))

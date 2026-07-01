@@ -22,6 +22,7 @@ from .detectors import (
     _is_false_org,
     _looks_like_false_location,
     detect_fallback_person_candidates,
+    detect_inline_party_person_list_candidates,
     detect_party_candidates,
     detect_title_candidates,
 )
@@ -49,12 +50,15 @@ from .org_masking import (
     has_explicit_bare_brand_alias,
     looks_like_complete_bare_company_body,
     mask_institution,
+    simple_legal_suffix,
 )
 
 # Backward-compatible re-exports for pipeline/tests.
 _derived_organization_alias_cores = derived_organization_alias_cores
 _has_explicit_bare_brand_alias = has_explicit_bare_brand_alias
 _explicit_organization_aliases = explicit_organization_aliases
+
+SENTENCE_SPLIT_RE = re.compile(r"[^\n。！？；;，,、]+[。！？；;，,、]?")
 
 
 @dataclass
@@ -122,53 +126,105 @@ class LinearRuleEngine:
             candidate.type == "organization" and candidate.source.startswith("hanlp_ner")
             for candidate in candidates
         )
-        party_candidates, _ = detect_party_candidates(text)
-        candidates.extend(party_candidates)
         candidates.extend(detect_title_candidates(text))
+        candidates.extend(detect_inline_party_person_list_candidates(text))
+        party_candidates: list[Candidate] = []
+        fallback_people: list[Candidate] = []
+        local_orgs: list[Candidate] = []
+        for segment, offset in self._sentence_spans(text):
+            segment_party, _ = detect_party_candidates(segment)
+            party_candidates.extend(self._offset_candidates(segment_party, offset))
+            if self.use_semantic_rules:
+                fallback_people.extend(
+                    self._offset_candidates(
+                        detect_fallback_person_candidates(segment),
+                        offset,
+                    )
+                )
+                if not has_local_org_ner:
+                    local_orgs.extend(self._organization_candidates(segment, offset))
+        candidates.extend(party_candidates)
 
         if self.use_semantic_rules:
-            candidates.extend(detect_fallback_person_candidates(text))
+            candidates.extend(fallback_people)
             if self.use_china_admin_rules:
                 candidates.extend(detect_china_admin_rule_candidates(text))
 
-            if not has_local_org_ner:
-                for match in ORG_FULL_RE.finditer(text):
-                    value = _clean_organization_text(match.group(0))
-                    if "与" in value:
-                        value = value.rsplit("与", 1)[-1]
-                    if value:
-                        start = match.start() + match.group(0).find(value)
-                        candidates.append(
-                            Candidate(
-                                type="organization",
-                                text=value,
-                                start=start,
-                                end=start + len(value),
-                                source="linear_full_org",
-                                confidence=0.9,
-                                risk_level="medium",
-                                auto_redact=True,
-                            )
-                        )
-                for match in BARE_COMPANY_ALIAS_RE.finditer(text):
-                    value = _clean_organization_text(match.group("alias"))
-                    if value and not _is_false_org(value):
-                        start = match.start("alias")
-                        candidates.append(
-                            Candidate(
-                                type="organization",
-                                text=value,
-                                start=start,
-                                end=start + len(value),
-                                source="linear_bare_org_alias",
-                                confidence=0.91,
-                                risk_level="medium",
-                                auto_redact=True,
-                            )
-                        )
+            candidates.extend(local_orgs)
 
         candidates.extend(self._llm_candidates(text, analysis))
         return self._deduplicate_candidates(candidates)
+
+    @staticmethod
+    def _sentence_spans(text: str) -> list[tuple[str, int]]:
+        spans = [
+            (match.group(0), match.start())
+            for match in SENTENCE_SPLIT_RE.finditer(text)
+            if match.group(0).strip()
+        ]
+        return spans or [(text, 0)]
+
+    @staticmethod
+    def _offset_candidates(candidates: Iterable[Candidate], offset: int) -> list[Candidate]:
+        if offset == 0:
+            return list(candidates)
+        return [
+            Candidate(
+                type=candidate.type,
+                text=candidate.text,
+                start=candidate.start + offset,
+                end=candidate.end + offset,
+                source=candidate.source,
+                confidence=candidate.confidence,
+                risk_level=candidate.risk_level,
+                auto_redact=candidate.auto_redact,
+                role=candidate.role,
+                reason=candidate.reason,
+                suggested_mask_type=candidate.suggested_mask_type,
+                needs_review=candidate.needs_review,
+                metadata=candidate.metadata,
+            )
+            for candidate in candidates
+        ]
+
+    @staticmethod
+    def _organization_candidates(text: str, offset: int = 0) -> list[Candidate]:
+        candidates: list[Candidate] = []
+        for match in ORG_FULL_RE.finditer(text):
+            value = _clean_organization_text(match.group(0))
+            if "与" in value:
+                value = value.rsplit("与", 1)[-1]
+            if value:
+                start = offset + match.start() + match.group(0).find(value)
+                candidates.append(
+                    Candidate(
+                        type="organization",
+                        text=value,
+                        start=start,
+                        end=start + len(value),
+                        source="linear_full_org",
+                        confidence=0.9,
+                        risk_level="medium",
+                        auto_redact=True,
+                    )
+                )
+        for match in BARE_COMPANY_ALIAS_RE.finditer(text):
+            value = _clean_organization_text(match.group("alias"))
+            if value and not _is_false_org(value):
+                start = offset + match.start("alias")
+                candidates.append(
+                    Candidate(
+                        type="organization",
+                        text=value,
+                        start=start,
+                        end=start + len(value),
+                        source="linear_bare_org_alias",
+                        confidence=0.91,
+                        risk_level="medium",
+                        auto_redact=True,
+                    )
+                )
+        return candidates
 
     @staticmethod
     def _apply_llm_verdicts(
@@ -283,7 +339,18 @@ class LinearRuleEngine:
                         start = text.find(value, span_start, span_end)
         if start < 0 and had_window:
             occurrences = [match.start() for match in re.finditer(re.escape(value), text)]
-            if len(occurrences) == 1 and entity_type in {"person", "location", "project"}:
+            is_complete_organization = (
+                entity_type == "organization"
+                and any(
+                    value.endswith(suffix)
+                    for suffix in LEGAL_SUFFIXES + INSTITUTION_SUFFIXES
+                    if suffix not in {"公司", "集团"}
+                )
+            )
+            if len(occurrences) == 1 and (
+                entity_type in {"person", "location", "project"}
+                or is_complete_organization
+            ):
                 start = occurrences[0]
         elif start < 0 and not had_window:
             start = text.find(value)
@@ -424,12 +491,27 @@ class LinearRuleEngine:
 
         for alias in plan.aliases:
             self._add("organization", alias, alias_mask_for_organization(alias, plan), candidate)
+            if self._is_bare_explicit_organization_alias(alias):
+                suffixed_alias = f"{alias}{simple_legal_suffix(plan.legal_suffix)}"
+                if suffixed_alias in self.source_text:
+                    self._add(
+                        "organization",
+                        suffixed_alias,
+                        alias_mask_for_organization(suffixed_alias, plan),
+                        candidate,
+                    )
         if has_explicit_bare_brand_alias(self.source_text, plan.brand):
             self._add("organization", plan.brand, plan.brand_mask, candidate)
 
         company_alias = f"{plan.brand}公司"
         if company_alias in self.source_text:
             self._add("organization", company_alias, f"{plan.brand_mask}公司", candidate)
+
+    @staticmethod
+    def _is_bare_explicit_organization_alias(alias: str) -> bool:
+        if not alias or len(alias) < 2:
+            return False
+        return not any(alias.endswith(suffix) for suffix in LEGAL_SUFFIXES + INSTITUTION_SUFFIXES)
 
     def _known_organization_allows_short_alias(self, alias_core: str) -> bool:
         if not alias_core or len(alias_core) < 2:

@@ -11,7 +11,7 @@ from legal_redactor.org_masking import (
     has_explicit_bare_brand_alias,
 )
 from legal_redactor.location_utils import get_location_core, location_suffix, strip_leading_locations
-from legal_redactor.models import Candidate
+from legal_redactor.models import Candidate, MappingEntry
 
 
 @dataclass
@@ -76,6 +76,14 @@ def test_explicit_organization_aliases_finds_former_name_and_short_name() -> Non
     aliases = explicit_organization_aliases(text, "石家庄裕华精密铸造有限公司")
     assert "鹿泉市裕华精密铸造有限公司" in aliases
     assert "裕华公司" in aliases
+
+
+def test_explicit_organization_aliases_finds_bare_short_name() -> None:
+    text = "华北制药股份有限公司（以下简称华药）与中技公司签订合同。华药确认事实。"
+
+    aliases = explicit_organization_aliases(text, "华北制药股份有限公司")
+
+    assert "华药" in aliases
 
 
 def test_has_explicit_bare_brand_alias_detects_parenthetical_short_name() -> None:
@@ -294,3 +302,81 @@ def test_discover_respects_sample_blacklist_for_rules() -> None:
     originals = {mapping.original for mapping in mappings}
     assert "办公区" not in originals
     assert "河北星河建筑工程有限公司" in originals
+
+
+def test_sentence_windows_split_commas_and_dunhao_for_extraction() -> None:
+    from legal_redactor.llm import build_sentence_windows
+
+    windows = build_sentence_windows("原告张三、李四，被告王五。")
+
+    assert [item["target"] for item in windows] == ["原告张三、", "李四，", "被告王五。"]
+    assert windows[1]["previous"] == "原告张三、"
+    assert windows[1]["next"] == "被告王五。"
+
+
+def test_discover_detects_inline_party_person_lists() -> None:
+    engine = _engine()
+    text = (
+        "原告华北制药股份有限公司诉被告张三、李四，"
+        "第三人赵仁川、王利杰、王兴国、张熠焯、崔松豪、余湘北合同纠纷一案。"
+    )
+
+    mappings = engine.discover(text)
+
+    originals = {mapping.original for mapping in mappings}
+    assert {"张三", "李四", "赵仁川", "王利杰", "王兴国", "张熠焯", "崔松豪", "余湘北"} <= originals
+
+
+def test_discover_maps_explicit_bare_company_alias_as_organization() -> None:
+    engine = _engine()
+    text = "华北制药股份有限公司（以下简称华药）与中技公司签订合同。华药公司提交说明，华药确认事实。"
+
+    mappings = engine.discover(text)
+
+    by_original = {mapping.original: mapping for mapping in mappings}
+    assert by_original["华药"].type == "organization"
+    assert by_original["华药"].masked.endswith("公司")
+    assert by_original["华药公司"].masked == by_original["华药"].masked
+
+
+def test_apply_mappings_does_not_replace_bare_alias_inside_different_company() -> None:
+    from legal_redactor.config import PipelineConfig
+    from legal_redactor.pipeline import RedactionPipeline
+
+    engine = _engine()
+    text = (
+        "华北制药股份有限公司（以下简称华药）提交说明。"
+        "华药公司认可事实，华药生物公司另行提交材料，华药研发公司另行提交材料，华药继续陈述。"
+    )
+    mappings = engine.discover(text)
+    by_original = {mapping.original: mapping for mapping in mappings}
+
+    redacted = RedactionPipeline(config=PipelineConfig.offline_without_llm()).apply_mappings(text, mappings)
+
+    assert by_original["华药公司"].masked == by_original["华药"].masked
+    assert by_original["华药生物公司"].masked != by_original["华药"].masked
+    assert by_original["华药研发公司"].masked != by_original["华药"].masked
+    assert "华药公司" not in redacted
+    assert "华药生物公司" not in redacted
+    assert "华药研发公司" not in redacted
+    assert "公司生物公司" not in redacted
+    assert "公司研发公司" not in redacted
+    assert "华药继续陈述" not in redacted
+
+
+def test_apply_mappings_skips_bare_alias_inside_unmapped_company_name() -> None:
+    from legal_redactor.config import PipelineConfig
+    from legal_redactor.pipeline import RedactionPipeline
+
+    text = "华药公司认可事实，华药生物公司另行提交材料，华药继续陈述。"
+    mappings = [
+        MappingEntry("organization", "华药公司", "甲公司", None, "test", 1.0, True),
+        MappingEntry("organization", "华药", "甲公司", None, "test", 1.0, True),
+    ]
+
+    redacted = RedactionPipeline(config=PipelineConfig.offline_without_llm()).apply_mappings(text, mappings)
+
+    assert "甲公司认可事实" in redacted
+    assert "华药生物公司" in redacted
+    assert "甲公司生物公司" not in redacted
+    assert "甲公司继续陈述" in redacted
