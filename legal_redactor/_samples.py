@@ -278,7 +278,10 @@ def load_recent_error_samples(
 
 
 def load_all_samples(samples_dir: str | Path | None = None) -> tuple[dict[str, str], set[str]]:
-    """加载所有样本，返回 (original→masked, 黑名单)。"""
+    """加载样本 lookup 与 delete/modify-old 黑名单。
+
+    黑名单仅供 few-shot、recent-errors 等优化流程使用；脱敏运行时不会读取。
+    """
     if samples_dir is None:
         samples_dir = DEFAULT_SAMPLES_DIR
     lookup: dict[str, str] = {}
@@ -308,6 +311,12 @@ def load_all_samples(samples_dir: str | Path | None = None) -> tuple[dict[str, s
             continue
 
     return lookup, blacklist
+
+
+def load_sample_blacklist_for_optimization(samples_dir: str | Path | None = None) -> set[str]:
+    """Return delete/modify-old blacklist for LLM few-shot and rule tuning only."""
+    _, blacklist = load_all_samples(samples_dir)
+    return blacklist
 
 
 def load_trusted_sample_mappings(samples_dir: str | Path | None = None) -> list[MappingEntry]:

@@ -28,7 +28,7 @@ from .china_admin_rules import detect_china_admin_rule_candidates
 from .hebei_admin import HebeiAdminDivisionDetector
 from .location_utils import get_location_core
 from .models import BatchRedactionResult, Candidate, Leak, MappingEntry, RedactedDocument, RedactionMap, RedactionResult
-from ._samples import load_all_samples, load_trusted_sample_mappings
+from ._samples import load_trusted_sample_mappings
 
 
 _COMPANY_SUFFIXES_FOR_ALIAS_BOUNDARY = (
@@ -591,26 +591,6 @@ def _filter_mappings_inside_trusted_samples(text: str, mappings: list[MappingEnt
             continue
         filtered.append(mapping)
     return filtered
-
-
-def _mapping_overrides_sample_blacklist(mapping: MappingEntry) -> bool:
-    if mapping.source != "linear:linear_llm_exact":
-        return False
-    if mapping.type == "person":
-        return bool(re.fullmatch(r"[\u4e00-\u9fa5]{2,4}", mapping.original))
-    if mapping.type == "organization":
-        return mapping.original.endswith((
-            "有限责任公司",
-            "股份有限公司",
-            "集团有限公司",
-            "有限公司",
-            "保险公司",
-            "商业银行",
-            "公司",
-            "集团",
-            "银行",
-        ))
-    return False
 
 
 def _filter_fragments_inside_longer_entities(text: str, mappings: list[MappingEntry]) -> list[MappingEntry]:
@@ -1219,7 +1199,7 @@ class RedactionPipeline:
 
         # 0. 加载本地样本库的精准匹配词与黑名单
         if self.config.enable_sample_library:
-            _, sample_blacklist = load_all_samples()
+            sample_blacklist: set[str] = set()
             sample_mappings = [
                 mapping
                 for mapping in load_trusted_sample_mappings()
@@ -1599,7 +1579,7 @@ class RedactionPipeline:
                 unique_mappings.append(m)
 
         for m in sorted(mappings, key=lambda x: len(x.original), reverse=True):
-            if m.original in sample_blacklist and not _mapping_overrides_sample_blacklist(m):
+            if m.original in sample_blacklist:
                 continue
             if m.original not in seen_orig:
                 seen_orig.add(m.original)
@@ -1645,7 +1625,7 @@ class RedactionPipeline:
         scan_text = text[: boundary_match.start()] if boundary_match else text
 
         if self.config.enable_sample_library:
-            _, sample_blacklist = load_all_samples()
+            sample_blacklist: set[str] = set()
             sample_mappings = [
                 mapping
                 for mapping in load_trusted_sample_mappings()
@@ -1950,10 +1930,7 @@ class RedactionPipeline:
         for mapping in sorted(mappings, key=lambda item: len(item.original), reverse=True):
             if (
                 mapping.original in seen_originals
-                or (
-                    mapping.original in sample_blacklist
-                    and not _mapping_overrides_sample_blacklist(mapping)
-                )
+                or mapping.original in sample_blacklist
             ):
                 continue
             seen_originals.add(mapping.original)
