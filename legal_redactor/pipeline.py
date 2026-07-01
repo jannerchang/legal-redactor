@@ -28,7 +28,7 @@ from .china_admin_rules import detect_china_admin_rule_candidates
 from .hebei_admin import HebeiAdminDivisionDetector
 from .location_utils import get_location_core
 from .models import BatchRedactionResult, Candidate, Leak, MappingEntry, RedactedDocument, RedactionMap, RedactionResult
-from ._samples import load_all_samples, load_trusted_sample_mappings
+from ._samples import load_trusted_sample_mappings
 
 
 _COMPANY_SUFFIXES_FOR_ALIAS_BOUNDARY = (
