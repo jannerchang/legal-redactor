@@ -6,6 +6,7 @@ from legal_redactor._samples import (
     get_few_shot_examples,
     load_all_samples,
     load_recent_error_samples,
+    load_sample_blacklist_for_optimization,
     load_trusted_sample_mappings,
     DEFAULT_SAMPLES_DIR,
     AUTO_SAMPLE_FILE,
@@ -75,6 +76,7 @@ def test_delete_samples_remain_for_optimization(mock_samples, monkeypatch):
 
     _, optimization_blacklist = load_all_samples(samples_dir=tmp_path)
     assert "来我去公司" in optimization_blacklist
+    assert "来我去公司" in load_sample_blacklist_for_optimization(samples_dir=tmp_path)
     assert "来我去公司" in get_few_shot_examples(samples_dir=tmp_path)
 
 
@@ -87,7 +89,7 @@ def test_delete_blacklist_does_not_block_party_org_redaction(tmp_path, monkeypat
     )
     monkeypatch.setattr(samples_module, "DEFAULT_SAMPLES_DIR", tmp_path)
 
-    assert "华北制药股份有限公司" in load_all_samples(samples_dir=tmp_path)[1]
+    assert "华北制药股份有限公司" in load_sample_blacklist_for_optimization(samples_dir=tmp_path)
 
     pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
     result = pipeline.redact(
@@ -98,6 +100,51 @@ def test_delete_blacklist_does_not_block_party_org_redaction(tmp_path, monkeypat
     orgs = [mapping for mapping in result.redaction_map.mappings if mapping.type == "organization"]
     assert any(mapping.original == "华北制药股份有限公司" for mapping in orgs)
     assert "华北制药股份有限公司" not in result.redacted_text
+
+
+def test_generic_false_positive_rules_do_not_require_runtime_blacklist():
+    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
+    result = pipeline.redact(
+        "甲方签约后提交银行流水。合同一、合同二并列出现。",
+        mode="standard",
+    )
+
+    blocked = {mapping.original for mapping in result.redaction_map.mappings}
+    assert "甲方" not in blocked
+    assert "银行流水" not in blocked
+    assert "合同一" not in blocked
+    assert "甲方" in result.redacted_text
+
+
+def test_modify_sample_with_company_mask_is_treated_as_organization(tmp_path):
+    save_sample_auto(
+        [
+            {
+                "action": "modify",
+                "type": "person",
+                "old_original": "兴代",
+                "new_original": "兴代",
+                "old_masked": "兴某甲",
+                "new_masked": "丁公司",
+            },
+            {
+                "action": "modify",
+                "type": "organization",
+                "old_original": "兴代公司",
+                "new_original": "兴代公司",
+                "old_masked": "乙省乙装饰工程公司",
+                "new_masked": "乙省丁公司",
+            },
+        ],
+        samples_dir=tmp_path,
+    )
+
+    mappings = load_trusted_sample_mappings(samples_dir=tmp_path)
+    by_original = {mapping.original: mapping for mapping in mappings}
+
+    assert by_original["兴代"].type == "organization"
+    assert by_original["兴代"].masked == "丁公司"
+    assert by_original["兴代公司"].masked == "乙省丁公司"
 
 
 def test_trusted_added_company_samples_are_reused_narrowly(tmp_path):

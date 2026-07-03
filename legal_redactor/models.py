@@ -11,10 +11,10 @@ CN_TZ = timezone(timedelta(hours=8))
 _MAPPING_TYPE_ORDER = {
     "organization": 0,
     "individual_business": 0,
-    "project": 0,
     "location": 1,
     "grassroots_org": 1,
     "person": 2,
+    "project": 3,
 }
 
 
@@ -24,7 +24,6 @@ def sort_mapping_entries(mappings: list["MappingEntry"]) -> list["MappingEntry"]
         mappings,
         key=lambda entry: (
             _MAPPING_TYPE_ORDER.get(entry.type, 9),
-            entry.masked or "",
             -len(entry.original or ""),
             entry.original or "",
         ),

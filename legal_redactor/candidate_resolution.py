@@ -41,6 +41,8 @@ NOISY_ORG_PREFIXES = (
     "该聊天",
     "首先",
     "原名",
+    "否认其",
+    "否认与",
 )
 
 
@@ -51,6 +53,8 @@ def is_noisy_org_capture(text: str) -> bool:
         or "的管理" in text
         or "聊天记录" in text
         or "主张过" in text
+        or "系关联公司" in text
+        or re.fullmatch(r"合同[一二三四五六七八九十百零\d]+", text)
     )
 
 

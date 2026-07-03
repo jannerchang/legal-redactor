@@ -353,7 +353,7 @@ def load_trusted_sample_mappings(samples_dir: str | Path | None = None) -> list[
             if not original or not masked or original in seen or original == masked:
                 continue
             seen.add(original)
-            mapping_type = _trusted_added_mapping_type(entry) or entry.get("type", "sample")
+            mapping_type = _trusted_sample_mapping_type(entry, original, masked)
             mappings.append(
                 MappingEntry(
                     type=mapping_type,
@@ -367,6 +367,17 @@ def load_trusted_sample_mappings(samples_dir: str | Path | None = None) -> list[
             )
 
     return mappings
+
+
+def _trusted_sample_mapping_type(entry: dict, original: str, masked: str) -> str:
+    """Resolve the runtime entity type for a trusted keep/modify sample."""
+    declared = str(entry.get("type") or "sample")
+    if declared == "person" and masked.endswith(
+        ("公司", "集团", "律所", "事务所", "机构", "商行", "经营部", "合作社")
+    ):
+        return "organization"
+    promoted = _trusted_added_mapping_type(entry)
+    return promoted or declared
 
 
 def _trusted_added_mapping_type(entry: dict) -> str:

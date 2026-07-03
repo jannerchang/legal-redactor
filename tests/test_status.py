@@ -8,6 +8,7 @@ from legal_redactor.status import (
     EXPECTED_MLX_MODEL,
     StatusItem,
     build_status_payload,
+    ensure_mlx_server_ready,
     probe_case_root,
     probe_mlx_runtime,
     probe_mlx_server,
@@ -234,3 +235,29 @@ def test_status_payload_does_not_expose_secrets_or_sensitive_text(tmp_path, monk
     assert "张三" not in text
     assert "【PERSON_001】" not in text
     assert all(set(item) <= {"id", "label", "state", "message", "action", "details"} for item in payload["components"])
+
+
+def test_ensure_mlx_server_ready_skips_start_when_already_ready(monkeypatch) -> None:
+    ready = StatusItem("mlx_server", "MLX", "ready", "ok", "none")
+    monkeypatch.setattr("legal_redactor.status.probe_mlx_server", lambda **kwargs: ready)
+    monkeypatch.setattr(
+        "legal_redactor.status.subprocess.run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not start")),
+    )
+    assert ensure_mlx_server_ready().state == "ready"
+
+
+def test_ensure_mlx_server_ready_attempts_start_when_missing(monkeypatch) -> None:
+    calls = {"start": 0, "probe": 0}
+
+    def fake_probe(**kwargs):
+        calls["probe"] += 1
+        if calls["probe"] == 1:
+            return StatusItem("mlx_server", "MLX", "missing", "down", "start")
+        return StatusItem("mlx_server", "MLX", "ready", "ok", "none")
+
+    monkeypatch.setattr("legal_redactor.status.probe_mlx_server", fake_probe)
+    monkeypatch.setattr("legal_redactor.status.subprocess.run", lambda *args, **kwargs: calls.__setitem__("start", calls["start"] + 1) or type("CP", (), {"returncode": 0})())
+    item = ensure_mlx_server_ready()
+    assert item.state == "ready"
+    assert calls["start"] == 1

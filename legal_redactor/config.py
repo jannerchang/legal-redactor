@@ -242,7 +242,8 @@ class PipelineConfig:
             model=MAX_EFFECT_LLM_MODEL,
             fallback_models=MAX_EFFECT_FALLBACK_MODELS,
             context_window=8192,
-            timeout_seconds=300,
+            timeout_seconds=120,
+            fail_open=True,
         )
         return cls(
             semantic_llm_first=True,
@@ -259,6 +260,7 @@ class PipelineConfig:
             fallback_models=BALANCED_FALLBACK_MODELS,
             context_window=8192,
             timeout_seconds=180,
+            fail_open=False,
         )
         return cls(
             semantic_llm_first=True,

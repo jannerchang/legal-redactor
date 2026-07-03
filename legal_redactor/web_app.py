@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import os
@@ -43,10 +44,12 @@ from .cases import (
 from .counters import CN_ORDINALS, TypeCounters
 from .io import is_encrypted_map, load_redaction_map_encrypted, redaction_map_from_json, redaction_map_to_json
 from .local_config import config_value, load_json_config
-from .models import MappingEntry, RedactedDocument, RedactionMap
-from .pipeline import RedactionPipeline
+from .models import MappingEntry, RedactedDocument, RedactionMap, sort_mapping_entries
+from .org_masking import derived_organization_alias_cores
+from .llm import is_noise_entity_text
+from .pipeline import RedactionPipeline, _filter_noise_entity_mappings
 from .restore import preview_restore, restore_docx
-from .status import build_status_payload
+from .status import build_status_payload, ensure_mlx_server_ready
 
 try:
     from fastapi import FastAPI, File, Form, Request, UploadFile
@@ -99,6 +102,26 @@ SAMPLE_SUMMARY_KEYS = (
 SUPPORTED_UPLOAD_SUFFIXES = {".txt", ".md", ".doc", ".docx", ".pdf"}
 
 
+def _entity_group_is_noise(group: dict) -> bool:
+    full = str(group.get("full_name", "")).strip()
+    if full and is_noise_entity_text(full):
+        return True
+    aliases = group.get("aliases", [])
+    if isinstance(aliases, list):
+        for alias in aliases:
+            alias_text = str(alias).strip()
+            if alias_text and is_noise_entity_text(alias_text):
+                return True
+    return False
+
+
+def _sanitize_redaction_map(redaction_map: RedactionMap) -> RedactionMap:
+    filtered = _filter_noise_entity_mappings(redaction_map.mappings)
+    if len(filtered) == len(redaction_map.mappings):
+        return redaction_map
+    return replace(redaction_map, mappings=sort_mapping_entries(filtered))
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "bind_host": "127.0.0.1", "network": "offline"}
@@ -107,6 +130,33 @@ def health() -> dict[str, str]:
 @app.get("/api/status")
 def api_status() -> dict:
     return _status_payload()
+
+
+@app.post("/api/ensure-mlx")
+def api_ensure_mlx() -> dict:
+    item = ensure_mlx_server_ready()
+    payload = item.to_dict()
+    payload["status"] = "ok" if item.state in {"ready", "skipped"} else "error"
+    return payload
+
+
+def _mlx_not_ready_page(item) -> str | None:
+    if item.state in {"ready", "skipped"}:
+        return None
+    return _page(
+        "MLX 本地模型未就绪",
+        f"<p>{html.escape(item.message)}</p>"
+        f"<p><b>建议：</b>{html.escape(item.action)}</p>"
+        "<p>也可双击桌面「启动文书脱敏系统」重新启动全套服务。</p>",
+    )
+
+
+def _redaction_failure_body(exc: Exception, *, enable_hanlp: bool) -> str:
+    if enable_hanlp:
+        suggestion = "建议：先取消勾选 HanLP，并确认 MLX 状态为就绪后重试。"
+    else:
+        suggestion = "建议：确认 MLX 状态为就绪后重试；当前未启用 HanLP，问题不在 HanLP 勾选项。"
+    return f"<p>{html.escape(str(exc))}</p><p>{html.escape(suggestion)}</p>"
 
 
 def _reject_forged_workflow_fields(body: dict) -> JSONResponse | None:
@@ -441,7 +491,7 @@ def index() -> str:
         status_panel + sample_info + f"""
         <section>
           <h2>脱敏</h2>
-          <form action="/redact" method="post" enctype="multipart/form-data">
+          <form id="redact-form" action="/redact" method="post" enctype="multipart/form-data">
             <label>粘贴文本</label>
             <textarea name="text" id="text-input" rows="12" placeholder="粘贴文书原文，或拖拽 txt/md/doc/docx/pdf 文件到此处"></textarea>
             <label>或上传 txt / md / doc / docx / pdf（可多选）</label>
@@ -481,7 +531,14 @@ def index() -> str:
               <input type="text" id="upload-source-dir-input" name="upload_source_dir" value="" placeholder="可选：自动识别失败时粘贴完整案件目录">
               <p class="hint">浏览器不会提供上传文件的本机绝对路径，所以系统会用文件名在案件库中反查目录。自动识别失败时，可在“原文件所在目录”粘贴完整目录。若未填写 Discord 链接，脱敏结果页可请求 Hermes 新建案件帖并通过 MCP 写回链接；映射表不会上传到 Discord。</p>
             </fieldset>
-            <button type="submit" class="btn">一键脱敏</button>
+            <div class="redact-submit-row">
+              <button type="submit" class="btn" id="redact-submit-btn">一键脱敏</button>
+              <div id="redact-progress" class="redact-progress" hidden>
+                <div class="redact-progress-track" aria-hidden="true"><div class="redact-progress-fill"></div></div>
+                <span id="redact-progress-text" class="redact-progress-text">准备中…</span>
+                <span id="redact-elapsed" class="redact-elapsed">已用时 0:00</span>
+              </div>
+            </div>
           </form>
         </section>
         <section>
@@ -506,7 +563,8 @@ def index() -> str:
     )
 
 def _hanlp_checked_attr() -> str:
-    return "checked" if importlib.util.find_spec("hanlp") is not None else ""
+    # LLM 主路径下 HanLP 为可选增强；默认不勾选，避免与 MLX 同时占满内存导致进程被系统杀掉。
+    return ""
 
 
 def _status_payload() -> dict:
@@ -572,12 +630,15 @@ async def analyze_page(
         
     profile = "standard"
     llm_mode = "max-effect"
+    mlx_block = _mlx_not_ready_page(ensure_mlx_server_ready())
+    if mlx_block is not None:
+        return mlx_block
     config = PipelineConfig.from_llm_mode(llm_mode, profile_name=profile)
     pipeline = RedactionPipeline(config=config)
-    
-    # 执行语义审计
+
+    # 执行语义审计（后台线程，避免阻塞 /health 等轻量请求）
     raw_text = "\n\n".join(doc.text for doc in documents)
-    analysis = pipeline.analyze(raw_text)
+    analysis = await asyncio.to_thread(pipeline.analyze, raw_text)
     
     return _render_audit_dashboard(
         analysis=analysis,
@@ -711,6 +772,11 @@ async def redact_confirmed_page(request: Request) -> str:
     is_batch = len(docs_data) > 1
 
     analysis = json.loads(analysis_json)
+    analysis["entity_groups"] = [
+        group
+        for group in analysis.get("entity_groups", [])
+        if isinstance(group, dict) and not _entity_group_is_noise(group)
+    ]
     prev_data = json.loads(previous_map_json) if previous_map_json else {}
     prev_mappings_dicts: list[dict] = prev_data.get("mappings", [])
     prev_confirmed_texts: set[str] = set(prev_data.get("confirmed_texts", []))
@@ -824,7 +890,9 @@ async def redact_confirmed_page(request: Request) -> str:
 
     # 应用所有已确认映射
     pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm(profile))
-    redaction_map = RedactionMap.create(mappings=all_mappings, mode=profile)
+    redaction_map = _sanitize_redaction_map(
+        RedactionMap.create(mappings=all_mappings, mode=profile)
+    )
 
     # 当前轮次的映射数据（传给下一轮）
     current_map_json = json.dumps({
@@ -876,7 +944,7 @@ async def redact_confirmed_page(request: Request) -> str:
     # 对已脱敏文本做新一轮 LLM 分析
     config = PipelineConfig.from_llm_mode(llm_mode, profile_name=profile)
     pipeline2 = RedactionPipeline(config=config)
-    new_analysis = pipeline2.analyze(redacted_text)
+    new_analysis = await asyncio.to_thread(pipeline2.analyze, redacted_text)
 
     # 过滤掉已确认和已排除的实体
     new_groups = []
@@ -959,6 +1027,9 @@ async def redact_page(
             return _page("已有映射表解析失败", f"解析错误: {exc}")
 
     llm_mode = "max-effect"
+    mlx_block = _mlx_not_ready_page(ensure_mlx_server_ready())
+    if mlx_block is not None:
+        return mlx_block
     config = PipelineConfig.from_llm_mode(
         llm_mode,
         profile_name="standard",
@@ -977,9 +1048,28 @@ async def redact_page(
     effective_case_folder = case_folder.strip() or str(inferred_case_location.get("case_folder") or "")
     effective_case_root = manual_case_root or str(inferred_case_location.get("case_root") or "") or case_root.strip()
     effective_discord_thread_url = discord_thread_url.strip() or str(inferred_case_location.get("discord_thread_url") or "")
+    try:
+        if len(documents) > 1:
+            result = await asyncio.to_thread(
+                pipeline.redact_many,
+                [(item.source_file, item.text) for item in documents],
+                base_redaction_map=base_redaction_map,
+            )
+        else:
+            result = await asyncio.to_thread(
+                pipeline.redact,
+                documents[0].text,
+                source_file=documents[0].source_file,
+                base_redaction_map=base_redaction_map,
+            )
+    except Exception as exc:
+        return _page(
+            "脱敏失败",
+            _redaction_failure_body(exc, enable_hanlp=bool(enable_hanlp)),
+        )
+    result = replace(result, redaction_map=_sanitize_redaction_map(result.redaction_map))
+    warnings = list(result.warnings)
     if len(documents) > 1:
-        result = pipeline.redact_many([(item.source_file, item.text) for item in documents], base_redaction_map=base_redaction_map)
-        warnings = list(result.warnings)
         try:
             _persist_optional_case_redaction(
                 effective_case_root,
@@ -1008,9 +1098,6 @@ async def redact_page(
             case_folder=effective_case_folder,
             source_dir=inferred_source_dir,
         )
-    
-    result = pipeline.redact(documents[0].text, source_file=documents[0].source_file, base_redaction_map=base_redaction_map)
-    warnings = list(result.warnings)
     redacted_doc = RedactedDocument(
         source_file=documents[0].source_file,
         original_text=result.original_text,
@@ -1055,7 +1142,7 @@ async def apply_map_page(
     original_bundle_json: str = Form(default=""),
 ) -> str:
     try:
-        redaction_map = redaction_map_from_json(map_json)
+        redaction_map = _sanitize_redaction_map(redaction_map_from_json(map_json))
     except Exception as exc:
         return _page("映射表解析失败", f"错误详情: {exc}")
 
@@ -1128,17 +1215,22 @@ async def apply_edited_map_page(request: Request) -> str:
     row_delete = form.getlist("row_delete")
     remap_placeholders = str(form.get("remap_placeholders", "")).strip() == "1"
 
-    redaction_map = _redaction_map_from_rows(
-        version=map_version, created_at=map_created_at, mode=map_mode,
-        source_file=map_source_file, map_type=map_type, map_original=map_original,
-        map_masked=map_masked, map_role=map_role, map_source=map_source,
-        map_confidence=map_confidence, map_reason=map_reason,
-        map_restore_by_default=map_restore_by_default,
-        row_delete=row_delete,
+    redaction_map = _sanitize_redaction_map(
+        _redaction_map_from_rows(
+            version=map_version, created_at=map_created_at, mode=map_mode,
+            source_file=map_source_file, map_type=map_type, map_original=map_original,
+            map_masked=map_masked, map_role=map_role, map_source=map_source,
+            map_confidence=map_confidence, map_reason=map_reason,
+            map_restore_by_default=map_restore_by_default,
+            row_delete=row_delete,
+        )
     )
     warnings = ["已手动调整映射表。"]
     if remap_placeholders:
-        redaction_map = replace(redaction_map, mappings=_renumber_mapping_placeholders(redaction_map.mappings))
+        redaction_map = replace(
+            redaction_map,
+            mappings=sort_mapping_entries(_renumber_mapping_placeholders(redaction_map.mappings)),
+        )
         warnings.append("已按当前保留的映射重新排列占位符。")
     pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
     documents = _documents_from_bundle_json(original_bundle_json)
@@ -2872,9 +2964,10 @@ def _review_candidate_texts_json(review_candidates: list | None = None) -> str:
 
 def _render_mapping_edit_rows(redaction_map: RedactionMap, review_candidates: list | None = None) -> str:
     review_texts = _review_candidate_text_set(review_candidates or [])
+    mappings = sort_mapping_entries(list(redaction_map.mappings))
     rows = [
         _render_mapping_edit_row(i, e, review_candidate_texts=review_texts)
-        for i, e in enumerate(redaction_map.mappings)
+        for i, e in enumerate(mappings)
     ]
     rows.append(_render_blank_mapping_row(len(rows)))
     return "".join(rows)
@@ -3109,8 +3202,13 @@ def _redaction_map_from_rows(
             restore_by_default=_form_list_value(map_restore_by_default, index) != "0",
             reason=_form_list_value(map_reason, index).strip() or None,
         ))
-    return RedactionMap(version=version or "1.0", created_at=created_at,
-                        mode=mode or "normal", source_file=source_file or None, mappings=mappings)
+    return RedactionMap(
+        version=version or "1.0",
+        created_at=created_at,
+        mode=mode or "normal",
+        source_file=source_file or None,
+        mappings=sort_mapping_entries(mappings),
+    )
 
 
 def _find_mapping_by_original(mappings: list[MappingEntry], original: str) -> MappingEntry | None:
@@ -3121,74 +3219,167 @@ def _find_mapping_by_original(mappings: list[MappingEntry], original: str) -> Ma
     return None
 
 
+_ORG_ALIAS_SUFFIXES = (
+    "有限责任公司",
+    "股份有限公司",
+    "集团有限公司",
+    "有限公司",
+    "公司",
+    "集团",
+    "银行",
+    "信用社",
+    "合作社",
+    "事务所",
+    "律所",
+    "学校",
+    "医院",
+    "法院",
+    "检察院",
+    "委员会",
+    "村委会",
+    "居委会",
+    "商行",
+    "经营部",
+    "店",
+    "厂",
+    "机构",
+)
+
+
+def _organization_originals_are_aliases(left: str, right: str) -> bool:
+    a = left.strip()
+    b = right.strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    if longer.startswith(shorter):
+        tail = longer[len(shorter):]
+        if not tail or tail in _ORG_ALIAS_SUFFIXES:
+            return True
+    for full_name in (a, b):
+        if full_name.endswith(_ORG_ALIAS_SUFFIXES):
+            cores = derived_organization_alias_cores(full_name)
+            other = b if full_name == a else a
+            if other in cores or f"{other}公司" == full_name or other == full_name.replace("公司", ""):
+                return True
+    return False
+
+
+def _mapping_entries_share_entity(left: MappingEntry, right: MappingEntry) -> bool:
+    if left.type == right.type == "person":
+        return left.original.strip() == right.original.strip()
+    if left.type in {"organization", "individual_business"} and right.type in {"organization", "individual_business"}:
+        return _organization_originals_are_aliases(left.original, right.original)
+    return left.type == right.type and left.original.strip() == right.original.strip()
+
+
+def _mapping_entity_group_ids(mappings: list[MappingEntry]) -> list[int]:
+    parent = list(range(len(mappings)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        root_left, root_right = find(left), find(right)
+        if root_left != root_right:
+            parent[root_right] = root_left
+
+    for left in range(len(mappings)):
+        for right in range(left + 1, len(mappings)):
+            if _mapping_entries_share_entity(mappings[left], mappings[right]):
+                union(left, right)
+
+    leaders: dict[int, int] = {}
+    group_ids: list[int] = []
+    for index in range(len(mappings)):
+        root = find(index)
+        if root not in leaders:
+            leaders[root] = len(leaders)
+        group_ids.append(leaders[root])
+    return group_ids
+
+
 def _renumber_mapping_placeholders(mappings: list[MappingEntry]) -> list[MappingEntry]:
-    group_ordinals: dict[tuple[str, str], str] = {}
+    if not mappings:
+        return []
+    group_ids = _mapping_entity_group_ids(mappings)
+    members: dict[int, list[int]] = {}
+    for index, group_id in enumerate(group_ids):
+        members.setdefault(group_id, []).append(index)
+
+    ordered_group_ids = sorted(members, key=lambda group_id: min(members[group_id]))
+    group_ordinals: dict[int, str] = {}
     type_counts: dict[str, int] = {}
     person_counts: dict[str, int] = {}
+    for group_id in ordered_group_ids:
+        representative = mappings[members[group_id][0]]
+        group_ordinals[group_id] = _next_group_ordinal(representative, type_counts, person_counts)
+
     renumbered: list[MappingEntry] = []
-    for entry in mappings:
-        masked = _renumbered_mask_for_entry(entry, group_ordinals, type_counts, person_counts)
+    for index, entry in enumerate(mappings):
+        masked = _mask_with_group_ordinal(entry, group_ordinals[group_ids[index]])
         renumbered.append(replace(entry, masked=masked) if masked != entry.masked else entry)
     return renumbered
 
 
-def _renumbered_mask_for_entry(
+def _next_group_ordinal(
     entry: MappingEntry,
-    group_ordinals: dict[tuple[str, str], str],
     type_counts: dict[str, int],
     person_counts: dict[str, int],
 ) -> str:
     if entry.type == "person":
-        return _renumber_person_mask(entry, group_ordinals, person_counts)
+        stem = _person_mask_stem(entry)
+        person_counts[stem] = person_counts.get(stem, 0) + 1
+        return _ordinal_value(person_counts[stem])
+    counter_key = _renumber_counter_key(entry)
+    type_counts[counter_key] = type_counts.get(counter_key, 0) + 1
+    return _ordinal_value(type_counts[counter_key])
+
+
+def _renumber_counter_key(entry: MappingEntry) -> str:
     if entry.type in {"organization", "individual_business"}:
-        return _renumber_ordinal_prefix_mask(entry, "organization", group_ordinals, type_counts, _manual_organization_suffix)
+        return "organization"
     if entry.type in {"location", "grassroots_org"}:
-        return _renumber_ordinal_prefix_mask(entry, "location", group_ordinals, type_counts, _manual_location_suffix)
+        return "location"
     if entry.type == "project":
-        return _renumber_ordinal_prefix_mask(entry, "project", group_ordinals, type_counts, _project_suffix)
+        return "project"
+    return entry.type or "manual"
+
+
+def _person_mask_stem(entry: MappingEntry) -> str:
+    match = re.match(r"^(.+?某)(?:[甲乙丙丁戊己庚辛壬癸]|\d+)$", entry.masked or "")
+    if match:
+        return match.group(1)
+    if re.fullmatch(r"[\u4e00-\u9fa5]{2,4}", entry.original or ""):
+        return f"{entry.original[0]}某"
+    return "自然人"
+
+
+def _mask_with_group_ordinal(entry: MappingEntry, ordinal: str) -> str:
+    if entry.type == "person":
+        return f"{_person_mask_stem(entry)}{ordinal}"
+    if entry.type in {"organization", "individual_business"}:
+        return _mask_with_ordinal_prefix(entry, ordinal, _manual_organization_suffix)
+    if entry.type in {"location", "grassroots_org"}:
+        return _mask_with_ordinal_prefix(entry, ordinal, _manual_location_suffix)
+    if entry.type == "project":
+        return _mask_with_ordinal_prefix(entry, ordinal, _project_suffix)
     return entry.masked
 
 
-def _renumber_person_mask(
-    entry: MappingEntry,
-    group_ordinals: dict[tuple[str, str], str],
-    person_counts: dict[str, int],
-) -> str:
-    match = re.match(r"^(.+?某)([甲乙丙丁戊己庚辛壬癸]|\d+)$", entry.masked or "")
-    if match:
-        stem = match.group(1)
-        old_ordinal = match.group(2)
-    elif re.fullmatch(r"[\u4e00-\u9fa5]{2,4}", entry.original or ""):
-        stem = f"{entry.original[0]}某"
-        old_ordinal = entry.masked or entry.original
-    elif entry.masked:
-        return entry.masked
-    else:
-        stem = "自然人"
-        old_ordinal = entry.original
-    key = ("person", f"{stem}:{old_ordinal}")
-    if key not in group_ordinals:
-        person_counts[stem] = person_counts.get(stem, 0) + 1
-        group_ordinals[key] = _ordinal_value(person_counts[stem])
-    return f"{stem}{group_ordinals[key]}"
-
-
-def _renumber_ordinal_prefix_mask(
-    entry: MappingEntry,
-    counter_key: str,
-    group_ordinals: dict[tuple[str, str], str],
-    type_counts: dict[str, int],
-    suffix_from_original,
-) -> str:
+def _mask_with_ordinal_prefix(entry: MappingEntry, ordinal: str, suffix_from_original) -> str:
     match = re.match(r"^([甲乙丙丁戊己庚辛壬癸]|\d+)(.*)$", entry.masked or "")
-    old_group = match.group(1) if match else (entry.masked or entry.original)
-    old_suffix = match.group(2) if match else ""
-    key = (counter_key, old_group)
-    if key not in group_ordinals:
-        type_counts[counter_key] = type_counts.get(counter_key, 0) + 1
-        group_ordinals[key] = _ordinal_value(type_counts[counter_key])
-    suffix = old_suffix if match else suffix_from_original(entry.original)
-    return f"{group_ordinals[key]}{suffix}"
+    if match:
+        suffix = match.group(2)
+        if not suffix:
+            return ordinal
+        return f"{ordinal}{suffix}"
+    return f"{ordinal}{suffix_from_original(entry.original)}"
 
 
 def _project_suffix(original: str) -> str:
@@ -3522,6 +3713,14 @@ def _page(title: str, body: str) -> str:
         .selection-menu button{{border:0;border-radius:6px;padding:6px 9px;background:var(--bg);color:var(--ink);font-size:12px;cursor:pointer;white-space:nowrap}}
         .selection-menu button:hover{{background:var(--accent);color:#fff}}
         #text-input.dragover{{border-color:var(--accent);border-width:2px;background:rgba(26,122,109,.03)}}
+        .redact-submit-row{{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:4px}}
+        .redact-progress{{display:flex;align-items:center;gap:10px;flex:1;min-width:240px}}
+        .redact-progress-track{{flex:1;max-width:220px;height:6px;border-radius:999px;background:#e8e4dc;overflow:hidden}}
+        .redact-progress-fill{{height:100%;width:38%;border-radius:999px;background:linear-gradient(90deg,var(--accent),#3cb8a4);animation:redact-progress-slide 1.4s ease-in-out infinite}}
+        @keyframes redact-progress-slide{{0%{{transform:translateX(-120%)}}100%{{transform:translateX(320%)}}}}
+        .redact-progress-text{{font-size:13px;color:var(--ink);white-space:nowrap}}
+        .redact-elapsed{{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}}
+        .btn:disabled{{opacity:.72;cursor:wait}}
         @media(max-width:768px){{body{{padding:14px}}section{{padding:18px}}.grid{{grid-template-columns:1fr}}}}
       </style>
     </head>
@@ -3571,6 +3770,78 @@ def _page(title: str, body: str) -> str:
       document.addEventListener('input',function(e){{var form=e.target&&e.target.closest?e.target.closest('#mapping-edit-form'):null;if(!form)return;filterMappingRows(activeMappingFilter());}});
       document.addEventListener('change',function(e){{var form=e.target&&e.target.closest?e.target.closest('#mapping-edit-form'):null;if(!form)return;filterMappingRows(activeMappingFilter());}});
       (function(){{var ta=document.getElementById('text-input');if(!ta)return;ta.addEventListener('dragover',function(e){{e.preventDefault();ta.classList.add('dragover');}});ta.addEventListener('dragleave',function(){{ta.classList.remove('dragover');}});ta.addEventListener('drop',function(e){{e.preventDefault();ta.classList.remove('dragover');var f=e.dataTransfer.files[0];if(!f)return;if(['txt','md'].indexOf(f.name.split('.').pop().toLowerCase())<0){{toast('不支持 .'+f.name.split('.').pop(),'warn');return;}}var r=new FileReader();r.onload=function(){{ta.value=r.result;toast('已加载: '+f.name);}};r.readAsText(f,'UTF-8');}});}})();
+      (function(){{
+        var form=document.getElementById('redact-form');
+        if(!form)return;
+        var stages=[
+          {{sec:0,msg:'上传并读取文书…'}},
+          {{sec:6,msg:'LLM 语义识别中…'}},
+          {{sec:40,msg:'生成映射表并脱敏…'}},
+          {{sec:120,msg:'长文书仍在处理，请稍候…'}}
+        ];
+        function formatElapsed(sec){{
+          var mm=Math.floor(sec/60);
+          var ss=sec%60;
+          return mm+':'+(ss<10?'0':'')+ss;
+        }}
+        function stageMessage(sec){{
+          var msg=stages[0].msg;
+          for(var i=stages.length-1;i>=0;i--){{if(sec>=stages[i].sec){{msg=stages[i].msg;break;}}}}
+          return msg;
+        }}
+        form.addEventListener('submit',function(e){{
+          e.preventDefault();
+          var btn=document.getElementById('redact-submit-btn');
+          var prog=document.getElementById('redact-progress');
+          var text=document.getElementById('redact-progress-text');
+          var elapsed=document.getElementById('redact-elapsed');
+          if(!btn||btn.disabled)return;
+          btn.disabled=true;
+          btn.textContent='脱敏中…';
+          if(prog)prog.hidden=false;
+          var started=Date.now();
+          var tick=setInterval(function(){{
+            var sec=Math.floor((Date.now()-started)/1000);
+            if(elapsed)elapsed.textContent='已用时 '+formatElapsed(sec);
+            if(text)text.textContent=stageMessage(sec);
+          }},500);
+          function runRedact(){{
+            fetch('/redact',{{method:'POST',body:new FormData(form)}})
+            .then(function(resp){{return resp.text().then(function(body){{return {{ok:resp.ok,body:body}};}});}})
+            .then(function(res){{
+              clearInterval(tick);
+              if(!res.ok)throw new Error('服务器返回错误');
+              document.open();
+              document.write(res.body);
+              document.close();
+            }})
+            .catch(function(err){{
+              clearInterval(tick);
+              btn.disabled=false;
+              btn.textContent='一键脱敏';
+              if(prog)prog.hidden=true;
+              toast('脱敏失败：'+(err&&err.message?err.message:'网络中断'),'warn');
+            }});
+          }}
+          if(text)text.textContent='检查 MLX 本地模型…';
+          fetch('/api/ensure-mlx',{{method:'POST'}})
+            .then(function(resp){{return resp.json();}})
+            .then(function(st){{
+              if(st.state!=='ready'&&st.state!=='skipped'){{
+                throw new Error(st.message||'MLX 未就绪');
+              }}
+              if(text)text.textContent='上传并读取文书…';
+              runRedact();
+            }})
+            .catch(function(err){{
+              clearInterval(tick);
+              btn.disabled=false;
+              btn.textContent='一键脱敏';
+              if(prog)prog.hidden=true;
+              toast('MLX 未就绪：'+(err&&err.message?err.message:'请重新启动系统'),'warn');
+            }});
+        }});
+      }})();
 	      (function(){{
 	        function uploadSuffix(name){{var i=String(name||'').lastIndexOf('.');return i>=0?String(name).slice(i).toLowerCase():'.txt';}}
 	        function isSupportedUpload(name){{return ['.txt','.md','.doc','.docx','.pdf'].indexOf(uploadSuffix(name))>=0&&String(name||'').split('/').pop().indexOf('._')!==0;}}

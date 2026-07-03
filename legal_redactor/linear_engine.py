@@ -47,7 +47,11 @@ from .org_masking import (
     build_company_mask_plan,
     derived_organization_alias_cores,
     explicit_organization_aliases,
+    find_related_company_plan,
+    full_organization_mask_for_plan,
     has_explicit_bare_brand_alias,
+    is_short_company_surface,
+    organization_mask_for_surface,
     looks_like_complete_bare_company_body,
     mask_institution,
     simple_legal_suffix,
@@ -67,6 +71,7 @@ class LinearRuleEngine:
     profile: RedactionProfile
     sample_blacklist: set[str]
     get_location_prefix: Callable[[str], str]
+    person_blacklist: set[str] = field(default_factory=set)
     mappings: list[MappingEntry] = field(default_factory=list)
     known_locations: dict[str, str] = field(default_factory=dict)
     known_people: set[str] = field(default_factory=set)
@@ -74,9 +79,11 @@ class LinearRuleEngine:
     seen_originals: set[str] = field(default_factory=set)
     source_text: str = ""
     use_semantic_rules: bool = True
+    llm_primary_discovery: bool = False
     use_china_admin_rules: bool = True
     _alias_cores_cache: dict[str, frozenset[str]] = field(default_factory=dict, repr=False)
     _organization_plans: dict[str, CompanyMaskPlan] = field(default_factory=dict, repr=False)
+    _known_brand_masks: dict[str, str] = field(default_factory=dict, repr=False)
 
     def discover(
         self,
@@ -97,7 +104,10 @@ class LinearRuleEngine:
         candidates = self._apply_llm_verdicts(candidates, scan_text, llm_analysis or {})
         candidates = resolve_candidate_overlaps(candidates)
 
-        for candidate in sorted(candidates, key=lambda item: (item.start, -item.length, -item.confidence)):
+        for candidate in sorted(
+            candidates,
+            key=lambda item: (-len(item.text), item.start, -item.confidence),
+        ):
             if candidate.text in self.sample_blacklist:
                 continue
             if candidate.type in {"location", "grassroots_org"}:
@@ -119,6 +129,10 @@ class LinearRuleEngine:
         analysis: dict,
     ) -> list[Candidate]:
         candidates = list(admin_candidates)
+        if self.llm_primary_discovery:
+            candidates.extend(self._llm_candidates(text, analysis))
+            return self._deduplicate_candidates(candidates)
+
         has_local_org_ner = any(
             candidate.type == "organization" and candidate.source.startswith("hanlp_ner")
             for candidate in candidates
@@ -191,6 +205,8 @@ class LinearRuleEngine:
             value = _clean_organization_text(match.group(0))
             if "与" in value:
                 value = value.rsplit("与", 1)[-1]
+            if value and _is_false_org(value):
+                continue
             if value:
                 start = offset + match.start() + match.group(0).find(value)
                 candidates.append(
@@ -229,6 +245,8 @@ class LinearRuleEngine:
         text: str,
         analysis: dict,
     ) -> list[Candidate]:
+        from .llm import is_noise_entity_text
+
         rejected = {
             value for value in analysis.get("reject", [])
             if isinstance(value, str)
@@ -239,38 +257,37 @@ class LinearRuleEngine:
 
         reviewed: list[Candidate] = []
         for candidate in candidates:
-            if candidate.text in rejected:
-                continue
             calibrated = calibrations.get(candidate.text)
-            if not isinstance(calibrated, str):
-                reviewed.append(candidate)
+            if isinstance(calibrated, str):
+                calibrated = calibrated.strip()
+                if len(calibrated) >= 2:
+                    nearby_start = max(0, candidate.start - 80)
+                    nearby_end = min(len(text), candidate.end + 80)
+                    start = text.find(calibrated, nearby_start, nearby_end)
+                    if start >= 0:
+                        reviewed.append(
+                            Candidate(
+                                type=candidate.type,
+                                text=calibrated,
+                                start=start,
+                                end=start + len(calibrated),
+                                source="linear_llm_calibrated",
+                                confidence=0.95,
+                                risk_level=candidate.risk_level,
+                                auto_redact=True,
+                                role=candidate.role,
+                                metadata=candidate.metadata,
+                            )
+                        )
+                        continue
+            if candidate.text in rejected or is_noise_entity_text(candidate.text):
                 continue
-            calibrated = calibrated.strip()
-            if len(calibrated) < 2:
-                continue
-            nearby_start = max(0, candidate.start - 80)
-            nearby_end = min(len(text), candidate.end + 80)
-            start = text.find(calibrated, nearby_start, nearby_end)
-            if start < 0:
-                reviewed.append(candidate)
-                continue
-            reviewed.append(
-                Candidate(
-                    type=candidate.type,
-                    text=calibrated,
-                    start=start,
-                    end=start + len(calibrated),
-                    source="linear_llm_calibrated",
-                    confidence=0.95,
-                    risk_level=candidate.risk_level,
-                    auto_redact=True,
-                    role=candidate.role,
-                    metadata=candidate.metadata,
-                )
-            )
+            reviewed.append(candidate)
         return reviewed
 
     def _llm_candidates(self, text: str, analysis: dict) -> list[Candidate]:
+        from .llm import is_noise_entity_text
+
         candidates: list[Candidate] = []
         windows = analysis.get("_sentence_windows", [])
         window_by_id = {
@@ -316,8 +333,17 @@ class LinearRuleEngine:
         item: dict | None = None,
         window_by_id: dict[str, dict] | None = None,
     ) -> None:
+        from .llm import is_noise_entity_text
+
         if not isinstance(value, str) or len(value) < 2:
             return
+        if is_noise_entity_text(value):
+            return
+        if entity_type == "organization":
+            from .llm import _is_valid_company_variant
+
+            if not _is_valid_company_variant(value):
+                return
         start = -1
         had_window = False
         if item and window_by_id:
@@ -419,6 +445,7 @@ class LinearRuleEngine:
         value = candidate.text.strip()
         if (
             value in self.known_people
+            or value in self.person_blacklist
             or not re.fullmatch(r"[\u4e00-\u9fa5·]{2,6}", value)
             or _is_false_person(value)
             or any(word in value for word in ("当事", "应予", "应当", "予以"))
@@ -437,7 +464,9 @@ class LinearRuleEngine:
             value = raw_value
         if not value or value in self.known_organizations:
             return
-        if is_noisy_org_capture(value):
+        if not candidate.source.startswith("linear_llm") and (
+            _is_false_org(value) or is_noisy_org_capture(value)
+        ):
             return
 
         if any(suffix in value for suffix in INSTITUTION_SUFFIXES):
@@ -467,12 +496,48 @@ class LinearRuleEngine:
         ):
             return
 
+        related_plan = find_related_company_plan(
+            value,
+            self._organization_plans,
+            self._alias_cores_cache,
+            source_text=self.source_text,
+        )
+        if related_plan is not None:
+            if related_plan.brand:
+                self._known_brand_masks[related_plan.brand] = related_plan.brand_mask
+            location_updates: tuple[tuple[str, str], ...] = ()
+            if is_short_company_surface(value, brand=related_plan.brand):
+                masked = organization_mask_for_surface(value, related_plan)
+            else:
+                masked, location_updates = full_organization_mask_for_plan(
+                    value,
+                    related_plan,
+                    self.known_locations,
+                    self.get_location_prefix,
+                )
+            for province, location_mask in location_updates:
+                self.known_locations[province] = location_mask
+                self._add("location", province, location_mask, candidate)
+            self.known_organizations.add(value)
+            self._organization_plans[value] = CompanyMaskPlan(
+                value=value,
+                full_mask=masked,
+                brand=related_plan.brand,
+                brand_mask=related_plan.brand_mask,
+                legal_suffix=related_plan.legal_suffix,
+                location_updates=location_updates,
+                aliases=related_plan.aliases,
+            )
+            self._alias_cores_cache[value] = derived_organization_alias_cores(value)
+            self._add("organization", value, masked, candidate)
+            return
+
         plan = build_company_mask_plan(
             value=value,
             source_text=self.source_text,
             known_locations=self.known_locations,
             get_location_prefix=self.get_location_prefix,
-            next_brand_mask=lambda: self.counters.next("group_prefix"),
+            get_brand_mask=lambda _brand: self.counters.next("group_prefix"),
         )
         if plan is None:
             return
@@ -551,9 +616,19 @@ class LinearRuleEngine:
                     ),
                 )
 
+    def _brand_mask_for(self, brand: str) -> str:
+        cleaned = brand.strip()
+        if not cleaned:
+            return self.counters.next("group_prefix")
+        if cleaned not in self._known_brand_masks:
+            self._known_brand_masks[cleaned] = self.counters.next("group_prefix")
+        return self._known_brand_masks[cleaned]
+
     def accept_project(self, candidate: Candidate) -> None:
         if not self.profile.redact_projects:
             return
+        from .llm import is_noise_project_text
+
         value = candidate.text.strip(" ：:，,。；;\n\t")
         if (
             not value
@@ -561,6 +636,7 @@ class LinearRuleEngine:
             or value in self.sample_blacklist
             or value in {"项目", "工程", "小区", "楼盘"}
             or len(value) < 3
+            or is_noise_project_text(value)
         ):
             return
         suffix = "地"
@@ -597,5 +673,3 @@ class LinearRuleEngine:
                 restore_by_default=True,
             )
         )
-
-

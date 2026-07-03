@@ -511,6 +511,9 @@ _FALSE_PERSON_WORDS = frozenset({
     "高水", "花架", "解协",
     "同意", "不同意", "第一", "第二", "第三", "仲裁委", "仲裁时",
     "包括", "作为", "案涉", "权限",
+    # ── 4396 样本：口语/程序性短语误识别人名 ──
+    "甲方", "签约", "维护", "而非", "银行流水", "人员混同", "仍然认可", "同时",
+    "将水搅浑", "无关", "无权再向", "欲证实", "直至今日", "老贾",
 })
 
 
@@ -734,9 +737,35 @@ _FALSE_ORG_EXACT_CORES = frozenset({
 
 _COMMON_SURNAME_CHARS = frozenset("赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜谢范彭马苗方袁唐薛雷贺倪汤罗郝安常于傅康伍余顾孟黄萧尹姚邵汪毛董梁杜阮贾路江郭梅林钟徐邱骆高夏蔡田胡万卢莫曾白王")
 
+# 公司字号末尾常见的行业/业务词，与动作动词同形但不应单独触发误杀。
+_INDUSTRY_CORE_SUFFIXES = frozenset({
+    "运输", "建设", "工程", "制造", "销售", "租赁", "装饰", "物流", "物业",
+    "开发", "投资", "科技", "信息", "服务", "咨询", "代理", "管理", "贸易",
+    "商贸", "建筑", "劳务", "环保", "能源", "置业", "产业", "电力", "水利",
+})
+
+
+def _core_has_action_verb_noise(core: str, action_verbs: tuple[str, ...]) -> bool:
+    for verb in action_verbs:
+        if verb not in core:
+            continue
+        if (
+            verb in _INDUSTRY_CORE_SUFFIXES
+            and core.endswith(verb)
+            and len(core) > len(verb) + 1
+        ):
+            continue
+        return True
+    return False
+
 
 def _is_false_org(value: str) -> bool:
     """检查清理后的公司名是否为误识别（如"家具有限公司"、"有限责任公司"）。"""
+    if re.fullmatch(r"合同[一二三四五六七八九十百零\d]+", value):
+        return True
+    if "系关联公司" in value or value.startswith(("否认其", "否认与")):
+        return True
+
     # 纯法律后缀，无品牌
     _pure_suffixes = {"有限责任公司", "股份有限公司", "集团有限公司", "有限公司", "公司", "集团", "幼儿园"}
     if value in _pure_suffixes:
@@ -783,7 +812,7 @@ def _is_false_org(value: str) -> bool:
             if core.endswith(("北京区", "中国北京区", "集团区")):
                 return True
             # ── 过滤包含法律诉讼/日常动作动词构成的动词短语公司（如 "严重违反公司" -> "严重违反"） ──
-            if any(verb in core for verb in _action_verbs):
+            if _core_has_action_verb_noise(core, _action_verbs):
                 return True
             # 完全匹配常见非品牌词
             if core in _FALSE_ORG_BRANDS or core in _FALSE_ORG_EXACT_CORES:
@@ -792,14 +821,14 @@ def _is_false_org(value: str) -> bool:
             for fb in _FALSE_ORG_BRANDS:
                 if core.endswith(fb) and len(core) > len(fb):
                     prefix = core[: -len(fb)]
-                    if len(prefix) <= 2 or any(verb in prefix for verb in _action_verbs):
+                    if len(prefix) <= 2 or _core_has_action_verb_noise(prefix, _action_verbs):
                         return True
             break
     else:
         # 如果不带公司/集团后缀，直接检查 core 级别的非地理/动作词
         if any(noise in value for noise in ("我", "你", "他", "本", "该", "贵", "此", "两", "两家", "各", "各家", "某", "一", "两个", "几家", "见两个")):
             return True
-        if any(verb in value for verb in _action_verbs):
+        if _core_has_action_verb_noise(value, _action_verbs):
             return True
             
     return False

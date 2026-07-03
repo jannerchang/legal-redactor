@@ -28,7 +28,7 @@ from .china_admin_rules import detect_china_admin_rule_candidates
 from .hebei_admin import HebeiAdminDivisionDetector
 from .location_utils import get_location_core
 from .models import BatchRedactionResult, Candidate, Leak, MappingEntry, RedactedDocument, RedactionMap, RedactionResult
-from ._samples import load_trusted_sample_mappings
+from ._samples import load_all_samples, load_trusted_sample_mappings
 
 
 _COMPANY_SUFFIXES_FOR_ALIAS_BOUNDARY = (
@@ -401,9 +401,76 @@ def _candidate_allowed(entity_type: str, config: RedactionProfile) -> bool:
     return True
 
 
+def _suspicious_organization_candidate(candidate: Candidate) -> bool:
+    if candidate.type != "organization":
+        return False
+    text = candidate.text.strip()
+    if not text:
+        return False
+    from .detectors import _is_false_org
+
+    if _is_false_org(text):
+        return False
+    if len(text) >= 10:
+        return True
+    if any(
+        marker in text
+        for marker in (
+            "否认",
+            "关联公司",
+            "合同",
+            "银行流水",
+            "人员混同",
+            "搅浑",
+            "欲证实",
+            "无权再向",
+        )
+    ):
+        return True
+    return candidate.source == "party_section" and len(text) > 6
+
+
+def _linear_sentence_review_candidates(
+    scan_text: str,
+    analysis: dict,
+    hanlp_candidates: list[Candidate],
+    org_aliases: set[str],
+) -> list[Candidate]:
+    llm_texts = _analysis_entity_texts(analysis)
+    review_candidates: list[Candidate] = []
+    seen_review_keys: set[tuple[str, str]] = set()
+
+    for candidate in hanlp_candidates:
+        if candidate.text in llm_texts:
+            continue
+        if not _hanlp_candidate_needs_sentence_review(candidate, org_aliases):
+            continue
+        key = (candidate.type, candidate.text)
+        if key in seen_review_keys:
+            continue
+        seen_review_keys.add(key)
+        review_candidates.append(candidate)
+
+    party_candidates, _ = detect_party_candidates(scan_text)
+    for candidate in party_candidates:
+        if candidate.text in llm_texts:
+            continue
+        if not _suspicious_organization_candidate(candidate):
+            continue
+        key = (candidate.type, candidate.text)
+        if key in seen_review_keys:
+            continue
+        seen_review_keys.add(key)
+        review_candidates.append(candidate)
+
+    return review_candidates[:80]
+
+
 def _candidate_needs_llm_review(candidate: Candidate) -> bool:
     source = candidate.source
     if source in {"fallback_person", "heuristic_ner", "linear_full_org", "linear_bare_org_alias"}:
+        return True
+    if _suspicious_organization_candidate(candidate):
         return True
     if candidate.confidence < 0.85:
         return True
@@ -505,6 +572,32 @@ def _find_all_spans(text: str, needle: str) -> list[tuple[int, int]]:
     return spans
 
 
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def _trusted_organization_short_names(sample_mappings: list[MappingEntry]) -> set[str]:
+    """Short names that trusted samples already treat as organizations."""
+    names: set[str] = set()
+    for mapping in sample_mappings:
+        masked = mapping.masked or ""
+        if mapping.type not in {"organization", "individual_business"} and not masked.endswith(
+            ("公司", "集团", "律所", "事务所", "机构", "商行", "经营部", "合作社")
+        ):
+            continue
+        original = (mapping.original or "").strip()
+        if original:
+            names.add(original)
+    return names
+
+
 def _should_skip_short_org_alias_replacement(
     text: str,
     start: int,
@@ -588,6 +681,22 @@ def _filter_mappings_inside_trusted_samples(text: str, mappings: list[MappingEnt
             any(start >= c_start and end <= c_end and mapping.original != container for c_start, c_end, container in trusted_spans)
             for start, end in spans
         ):
+            continue
+        filtered.append(mapping)
+    return filtered
+
+
+def _filter_noise_entity_mappings(mappings: list[MappingEntry]) -> list[MappingEntry]:
+    from .llm import _is_valid_company_variant, is_noise_entity_text, is_noise_project_text
+
+    filtered: list[MappingEntry] = []
+    for mapping in mappings:
+        original = (mapping.original or "").strip()
+        if not original or is_noise_entity_text(original):
+            continue
+        if mapping.type in {"organization", "individual_business"} and not _is_valid_company_variant(original):
+            continue
+        if mapping.type == "project" and is_noise_project_text(original):
             continue
         filtered.append(mapping)
     return filtered
@@ -787,13 +896,32 @@ def _organization_alias_profile(
                 tokens.add(token)
 
     compact_body = _strip_organization_industry_suffix(body_without_place, INDUSTRY_TERMS)
-    for alias_key in {body_without_place, compact_body, *_organization_number_aliases(body_without_place)}:
+    from .org_masking import organization_brand_key as _organization_brand_key
+
+    brand_key = _organization_brand_key(cleaned)
+    alias_candidates = {body_without_place, *_organization_number_aliases(body_without_place)}
+    if compact_body == brand_key:
+        alias_candidates.add(compact_body)
+    if _usable_organization_alias_key(brand_key, place_prefixes) and 2 <= len(brand_key) <= 4:
+        alias_candidates.add(brand_key)
+    party_alias_candidates: set[str] = set()
+    if _mapping_has_party_anchor(mapping):
+        for core in raw_cores:
+            core = re.sub(r"\s+", "", str(core).strip(" ：:，,。；;、（）()"))
+            if _usable_organization_alias_key(core, place_prefixes) and 2 <= len(core) <= 4:
+                party_alias_candidates.add(core)
+                alias_candidates.add(core)
+
+    for alias_key in alias_candidates:
         alias_key = alias_key.strip(" ：:，,。；;、（）()")
         if (
             _usable_organization_alias_key(alias_key, place_prefixes)
-            and len(alias_key) <= 3
+            and len(alias_key) <= 4
             and (
-                legal_suffix in {"公司", "集团", ""}
+                alias_key == body_without_place
+                or alias_key == brand_key
+                or alias_key in party_alias_candidates
+                or legal_suffix in {"公司", "集团", ""}
                 or cleaned.endswith((f"{alias_key}公司", f"{alias_key}集团"))
             )
         ):
@@ -804,6 +932,107 @@ def _organization_alias_profile(
         "tokens": tokens,
         "exact_alias_keys": exact_alias_keys,
     }
+
+
+_ORG_MERGE_BRAND_MASK_RE = re.compile(
+    r"^(?:(?P<loc>[\u4e00-\u9fa5]{1,8}省))?(?P<brand>[甲乙丙丁戊己庚辛壬癸])(?P<rest>.+?)(?P<suffix>公司|集团)$"
+)
+
+
+def _short_company_mask_from_full_masked(masked: str) -> str | None:
+    match = _ORG_MERGE_BRAND_MASK_RE.fullmatch(masked.strip())
+    if match:
+        return f"{match.group('brand')}{match.group('suffix')}"
+    if masked.endswith(("公司", "集团")) and len(masked) <= 4:
+        return masked
+    return None
+
+
+def _full_company_mask_parts(masked: str) -> tuple[str, str, str] | None:
+    match = _ORG_MERGE_BRAND_MASK_RE.fullmatch(masked.strip())
+    if not match or not match.group("loc"):
+        return None
+    return match.group("brand"), match.group("rest"), match.group("suffix")
+
+
+def _organization_location_anchor(original: str, place_prefixes: set[str]) -> str:
+    from .lexicon import LEGAL_SUFFIXES
+    from .org_masking import _split_leading_place_prefix
+
+    cleaned = _clean_organization_text(original) or original.strip()
+    cleaned = re.sub(r"\s+", "", cleaned.strip(" ：:，,。；;、\n\t"))
+    legal_suffix = next((suffix for suffix in LEGAL_SUFFIXES if cleaned.endswith(suffix)), "")
+    body = cleaned[: -len(legal_suffix)] if legal_suffix else cleaned
+    place, _ = _split_leading_place_prefix(body)
+    if place and (place in place_prefixes or f"{place}省" in place_prefixes):
+        return place
+    for place in sorted(place_prefixes, key=len, reverse=True):
+        if cleaned.startswith(place) and len(cleaned) > len(place) + 1:
+            return place
+    return ""
+
+
+def _mapping_has_party_anchor(mapping: MappingEntry) -> bool:
+    source = str(mapping.source or "")
+    return "party_section" in source or bool(mapping.role)
+
+
+def _organization_profiles_same_subject(
+    left_profile: dict,
+    right_profile: dict,
+    *,
+    left_mapping: MappingEntry,
+    right_mapping: MappingEntry,
+    place_prefixes: set[str],
+) -> bool:
+    left_keys = left_profile.get("exact_alias_keys", set())
+    right_keys = right_profile.get("exact_alias_keys", set())
+    if not isinstance(left_keys, set) or not isinstance(right_keys, set):
+        return False
+    shared_keys = left_keys & right_keys
+    if not shared_keys:
+        return False
+
+    left_anchor = _organization_location_anchor(left_mapping.original, place_prefixes)
+    right_anchor = _organization_location_anchor(right_mapping.original, place_prefixes)
+    if left_anchor and right_anchor and left_anchor != right_anchor:
+        return False
+    if left_anchor != right_anchor and not (
+        _mapping_has_party_anchor(left_mapping) or _mapping_has_party_anchor(right_mapping)
+    ):
+        return False
+    return True
+
+
+def _merged_organization_mask(mapping: MappingEntry, anchor: MappingEntry) -> str:
+    from .org_masking import is_short_company_surface, organization_brand_key
+
+    brand = organization_brand_key(anchor.original)
+    is_short_surface = is_short_company_surface(mapping.original, brand=brand) or (
+        mapping.original.endswith(("公司", "集团"))
+        and not mapping.original.endswith(("有限责任公司", "股份有限公司", "集团有限公司", "有限公司"))
+        and len(mapping.original) <= 8
+    )
+    if is_short_surface:
+        short_mask = _short_company_mask_from_full_masked(anchor.masked)
+        if short_mask:
+            return short_mask
+        if anchor.masked.endswith(("公司", "集团")) and len(anchor.masked) <= 4:
+            return anchor.masked
+    own_short_mask = _short_company_mask_from_full_masked(mapping.masked)
+    anchor_short_mask = _short_company_mask_from_full_masked(anchor.masked)
+    own_full_parts = _full_company_mask_parts(mapping.masked)
+    anchor_full_parts = _full_company_mask_parts(anchor.masked)
+    if (
+        own_short_mask
+        and anchor_short_mask
+        and own_short_mask == anchor_short_mask
+        and own_full_parts is not None
+        and anchor_full_parts is not None
+        and own_full_parts == anchor_full_parts
+    ):
+        return mapping.masked
+    return anchor.masked
 
 
 def _organization_canonical_score(mapping: MappingEntry) -> tuple[int, int, str]:
@@ -855,13 +1084,6 @@ def _merge_organization_alias_mappings(mappings: list[MappingEntry]) -> list[Map
         index: _organization_alias_profile(mappings[index], place_prefixes)
         for index in org_indices
     }
-    exact_short_alias_keys = {
-        key
-        for profile in profiles.values()
-        for key in profile["exact_alias_keys"]
-        if isinstance(key, str)
-    }
-
     parent = {index: index for index in org_indices}
 
     def find(index: int) -> int:
@@ -878,11 +1100,11 @@ def _merge_organization_alias_mappings(mappings: list[MappingEntry]) -> list[Map
 
     token_index: dict[str, list[int]] = {}
     for index, profile in profiles.items():
-        tokens = profile["tokens"]
-        if not isinstance(tokens, set):
+        exact_keys = profile.get("exact_alias_keys", set())
+        if not isinstance(exact_keys, set):
             continue
-        for token in tokens:
-            if len(token) >= 4 or token in exact_short_alias_keys:
+        for token in exact_keys:
+            if isinstance(token, str) and token:
                 token_index.setdefault(token, []).append(index)
 
     for indices in token_index.values():
@@ -890,44 +1112,24 @@ def _merge_organization_alias_mappings(mappings: list[MappingEntry]) -> list[Map
             continue
         first = indices[0]
         for index in indices[1:]:
-            union(first, index)
+            if _organization_profiles_same_subject(
+                profiles[first],
+                profiles[index],
+                left_mapping=mappings[first],
+                right_mapping=mappings[index],
+                place_prefixes=place_prefixes,
+            ):
+                union(first, index)
 
     for position, left in enumerate(org_indices):
-        left_tokens = profiles[left]["tokens"]
-        if not isinstance(left_tokens, set):
-            continue
         for right in org_indices[position + 1 :]:
-            right_tokens = profiles[right]["tokens"]
-            if not isinstance(right_tokens, set):
-                continue
-            should_union = False
-            for left_token in left_tokens:
-                for right_token in right_tokens:
-                    if left_token == right_token and (
-                        len(left_token) >= 4 or left_token in exact_short_alias_keys
-                    ):
-                        should_union = True
-                    else:
-                        long_token, short_token = (
-                            (left_token, right_token)
-                            if len(left_token) >= len(right_token)
-                            else (right_token, left_token)
-                        )
-                        if len(short_token) >= 4 and long_token.endswith(short_token):
-                            should_union = True
-                        elif short_token in exact_short_alias_keys and (
-                            long_token.endswith(short_token)
-                            or (
-                                long_token.startswith(short_token)
-                                and long_token[len(short_token) :] in place_prefixes
-                            )
-                        ):
-                            should_union = True
-                    if should_union:
-                        break
-                if should_union:
-                    break
-            if should_union:
+            if _organization_profiles_same_subject(
+                profiles[left],
+                profiles[right],
+                left_mapping=mappings[left],
+                right_mapping=mappings[right],
+                place_prefixes=place_prefixes,
+            ):
                 union(left, right)
 
     groups: dict[int, list[int]] = {}
@@ -943,7 +1145,9 @@ def _merge_organization_alias_mappings(mappings: list[MappingEntry]) -> list[Map
             continue
         canonical = max((mappings[index] for index in indices), key=_organization_canonical_score)
         for index in indices:
-            canonical_mask_by_index[index] = canonical.masked
+            merged_mask = _merged_organization_mask(mappings[index], canonical)
+            if mappings[index].original != canonical.original or merged_mask != mappings[index].masked:
+                canonical_mask_by_index[index] = merged_mask
 
     if not canonical_mask_by_index:
         return mappings
@@ -1151,6 +1355,46 @@ class RedactionPipeline:
     def _profile(self) -> RedactionProfile:
         return self.config.redaction_profile
 
+    def analyze(self, text: str) -> dict[str, Any]:
+        """Return the entity-group shape used by the Web confirmation flow."""
+        result = self.redact(text)
+        groups_by_key: dict[tuple[str, str], list[MappingEntry]] = {}
+        locations: list[str] = []
+        seen_locations: set[str] = set()
+
+        for mapping in result.redaction_map.mappings:
+            if mapping.type in {"organization", "individual_business"}:
+                groups_by_key.setdefault(("organization", mapping.masked), []).append(mapping)
+            elif mapping.type == "person":
+                groups_by_key.setdefault(("person", mapping.original), []).append(mapping)
+            elif mapping.type in {"location", "grassroots_org"} and mapping.original not in seen_locations:
+                seen_locations.add(mapping.original)
+                locations.append(mapping.original)
+
+        entity_groups: list[dict[str, Any]] = []
+        for index, ((entity_type, _key), mappings) in enumerate(groups_by_key.items(), 1):
+            originals = _dedupe_strings([mapping.original for mapping in mappings if mapping.original])
+            if not originals:
+                continue
+            full_name = max(originals, key=len)
+            aliases = [value for value in originals if value != full_name]
+            role = next((mapping.role for mapping in mappings if mapping.role), None)
+            entity_groups.append(
+                {
+                    "id": index,
+                    "type": entity_type,
+                    "role": role,
+                    "full_name": full_name,
+                    "aliases": aliases,
+                }
+            )
+
+        return {
+            "entity_groups": entity_groups,
+            "locations": locations,
+            "warnings": result.warnings,
+        }
+
     def redact(self, text: str, source_file: str | None = None, mode: str | None = None, prov_mapping: dict[str, str] | None = None, base_redaction_map: RedactionMap | None = None) -> RedactionResult:
         if mode is not None:
             config = replace(self.config, redaction_profile=RedactionProfile.from_preset(mode))
@@ -1208,6 +1452,8 @@ class RedactionPipeline:
         else:
             sample_blacklist = set()
             sample_mappings = []
+
+        trusted_org_short_names = _trusted_organization_short_names(sample_mappings)
 
         base_mappings = []
         if base_redaction_map and base_redaction_map.mappings:
@@ -1299,13 +1545,33 @@ class RedactionPipeline:
         fallback_orgs: list[Candidate] = []
         if self.config.enable_party_parser:
             party_c, _ = detect_party_candidates(scan_text)
-            fallback_persons.extend(c for c in party_c if c.type == "person" and c.text not in sample_blacklist and not overlaps_high_conf(c.start, c.end))
+            fallback_persons.extend(
+                c
+                for c in party_c
+                if c.type == "person"
+                and c.text not in sample_blacklist
+                and c.text not in trusted_org_short_names
+                and not overlaps_high_conf(c.start, c.end)
+            )
             fallback_orgs.extend(c for c in party_c if c.type == "organization" and c.text not in sample_blacklist and not overlaps_high_conf(c.start, c.end))
         if self.config.enable_heuristic_ner:
             ner_c = detect_heuristic_ner_candidates(scan_text)
-            fallback_persons.extend(c for c in ner_c if c.type == "person" and c.text not in sample_blacklist and not overlaps_high_conf(c.start, c.end))
+            fallback_persons.extend(
+                c
+                for c in ner_c
+                if c.type == "person"
+                and c.text not in sample_blacklist
+                and c.text not in trusted_org_short_names
+                and not overlaps_high_conf(c.start, c.end)
+            )
             fallback_orgs.extend(c for c in ner_c if c.type == "organization" and c.text not in sample_blacklist and not overlaps_high_conf(c.start, c.end))
-            fallback_persons.extend(c for c in detect_fallback_person_candidates(scan_text) if c.text not in sample_blacklist and not overlaps_high_conf(c.start, c.end))
+            fallback_persons.extend(
+                c
+                for c in detect_fallback_person_candidates(scan_text)
+                if c.text not in sample_blacklist
+                and c.text not in trusted_org_short_names
+                and not overlaps_high_conf(c.start, c.end)
+            )
 
         # 3. 如果启用了本地 LLM，在调用前构造待验证的候选列表
         analysis = {"locations": [], "companies": [], "persons": [], "reject": [], "calibrate": {}}
@@ -1513,7 +1779,12 @@ class RedactionPipeline:
 
         # 启发式人名补充与 LLM 裁判过滤
         for c in fallback_persons:
-            if c.text not in person_names and c.text not in rejected_names and c.text not in sample_blacklist:
+            if (
+                c.text not in person_names
+                and c.text not in rejected_names
+                and c.text not in sample_blacklist
+                and c.text not in trusted_org_short_names
+            ):
                 person_names.add(c.text)
                 surname = c.text[0]
                 person_entries.append((c.text, surname, c.source, c.confidence))
@@ -1558,7 +1829,7 @@ class RedactionPipeline:
 
         if _candidate_allowed("person", profile):
             for name, surname, source, confidence in person_entries:
-                if name in sample_blacklist:
+                if name in sample_blacklist or name in trusted_org_short_names:
                     continue
                 masked = f"{surname}某{counters.next(f'person_{surname}')}"
                 mappings.append(MappingEntry(type="person", original=name, masked=masked, role=None, source=source, confidence=confidence, restore_by_default=True))
@@ -1589,6 +1860,7 @@ class RedactionPipeline:
         unique_mappings = _filter_locations_inside_organizations(text, unique_mappings, sample_blacklist)
         unique_mappings = _filter_org_alias_prefixed_locations(unique_mappings)
         unique_mappings = _filter_fragments_inside_longer_entities(text, unique_mappings)
+        unique_mappings = _filter_noise_entity_mappings(unique_mappings)
 
         redacted_text = self.apply_mappings(text, unique_mappings)
         redacted_text = remove_court_signatures(redacted_text)
@@ -1635,6 +1907,8 @@ class RedactionPipeline:
             sample_blacklist = set()
             sample_mappings = []
 
+        trusted_org_short_names = _trusted_organization_short_names(sample_mappings)
+
         base_mappings = list(base_redaction_map.mappings) if base_redaction_map else []
         location_prefixes: dict[str, str] = {}
         for mapping in base_mappings:
@@ -1665,6 +1939,7 @@ class RedactionPipeline:
             return prefix
 
         mappings: list[MappingEntry] = []
+        fixed_regex_mappings: list[MappingEntry] = []
         if self.config.enable_regex:
             for candidate in detect_standard_regex_candidates(text):
                 if candidate.text in sample_blacklist or not _candidate_allowed(candidate.type, profile):
@@ -1674,17 +1949,17 @@ class RedactionPipeline:
                     if candidate.type == "case_number"
                     else "***"
                 )
-                mappings.append(
-                    MappingEntry(
-                        type=candidate.type,
-                        original=candidate.text,
-                        masked=masked,
-                        role=None,
-                        source=candidate.source,
-                        confidence=candidate.confidence,
-                        restore_by_default=False,
-                    )
+                mapping = MappingEntry(
+                    type=candidate.type,
+                    original=candidate.text,
+                    masked=masked,
+                    role=None,
+                    source=candidate.source,
+                    confidence=candidate.confidence,
+                    restore_by_default=False,
                 )
+                mappings.append(mapping)
+                fixed_regex_mappings.append(mapping)
 
         admin_candidates: list[Candidate] = []
         admin_spans: list[tuple[int, int, str]] = []
@@ -1780,6 +2055,7 @@ class RedactionPipeline:
             "reject": [],
             "calibrate": {},
         }
+        llm_extraction_failed = False
 
         if sentence_extraction_mode:
             from .llm import LegalEntityAuditor
@@ -1790,7 +2066,53 @@ class RedactionPipeline:
                 enable_samples=self.config.enable_sample_library,
             )
             if analysis.get("error"):
-                warnings.append(str(analysis["error"]))
+                llm_extraction_failed = True
+                if not self.config.local_llm.fail_open:
+                    warnings.append(
+                        f"整句 LLM 识别失败，已仅保留固定结构化正则脱敏：{analysis['error']}"
+                    )
+                    unique_mappings: list[MappingEntry] = []
+                    seen_originals: set[str] = set()
+                    for mapping in base_mappings:
+                        if mapping.original in seen_originals:
+                            continue
+                        seen_originals.add(mapping.original)
+                        unique_mappings.append(mapping)
+                    for mapping in sorted(sample_mappings, key=lambda item: len(item.original), reverse=True):
+                        if mapping.original in seen_originals or mapping.original in sample_blacklist:
+                            continue
+                        seen_originals.add(mapping.original)
+                        unique_mappings.append(mapping)
+                    for mapping in sorted(fixed_regex_mappings, key=lambda item: len(item.original), reverse=True):
+                        if mapping.original in seen_originals or mapping.original in sample_blacklist:
+                            continue
+                        seen_originals.add(mapping.original)
+                        unique_mappings.append(mapping)
+
+                    unique_mappings = _filter_mappings_inside_trusted_samples(text, unique_mappings)
+                    unique_mappings = _filter_locations_inside_organizations(text, unique_mappings, sample_blacklist)
+                    unique_mappings = _filter_org_alias_prefixed_locations(unique_mappings)
+                    unique_mappings = _filter_noise_entity_mappings(unique_mappings)
+
+                    redacted_text = remove_court_signatures(self.apply_mappings(text, unique_mappings))
+                    leaks = self.scan_high_risk_leaks(redacted_text)
+                    return RedactionResult(
+                        original_text=text,
+                        redacted_text=redacted_text,
+                        redaction_map=RedactionMap.create(
+                            mappings=unique_mappings,
+                            mode=profile.name,
+                            source_file=source_file,
+                        ),
+                        candidates=[],
+                        review_candidates=[],
+                        leaks=leaks,
+                        mode=profile.name,
+                        warnings=warnings,
+                    )
+                warnings.append(
+                    f"整句 LLM 识别失败，已降级为规则模式：{analysis['error']}"
+                )
                 analysis = {
                     "locations": [],
                     "companies": [],
@@ -1800,73 +2122,26 @@ class RedactionPipeline:
                     "calibrate": {},
                 }
                 collect_heuristic_location_candidates()
+            elif analysis.get("_no_target_windows"):
+                collect_heuristic_location_candidates()
             else:
                 sentence_extraction_success = True
+                batch_failures = analysis.get("_batch_failures")
+                if isinstance(batch_failures, list) and batch_failures:
+                    warnings.append(
+                        f"部分批次 LLM 识别失败（{len(batch_failures)} 批），已使用其余批次结果编排。"
+                    )
         else:
             collect_heuristic_location_candidates()
-
-        if sentence_extraction_success and self.config.enable_local_llm and self.config.local_llm.enabled:
-            llm_texts = _analysis_entity_texts(analysis)
-            org_aliases = _organization_alias_cores_from_candidates(hanlp_candidates)
-            review_candidates = [
-                candidate
-                for candidate in hanlp_candidates
-                if candidate.text not in llm_texts
-                and _hanlp_candidate_needs_sentence_review(candidate, org_aliases)
-            ]
-            deduped_review_candidates: list[Candidate] = []
-            seen_review_keys: set[tuple[str, str]] = set()
-            for candidate in review_candidates:
-                key = (candidate.type, candidate.text)
-                if key in seen_review_keys:
-                    continue
-                seen_review_keys.add(key)
-                deduped_review_candidates.append(candidate)
-            review_candidates = deduped_review_candidates[:60]
-            if review_candidates:
-                from .llm import LegalEntityAuditor
-
-                auditor = LegalEntityAuditor(self.config.local_llm)
-                verify_list = [
-                    {
-                        "text": candidate.text,
-                        "type": candidate.type,
-                        "context": candidate.metadata.get(
-                            "context",
-                            scan_text[
-                                max(0, candidate.start - 60):
-                                min(len(scan_text), candidate.end + 60)
-                            ],
-                        ),
-                    }
-                    for candidate in review_candidates
-                ]
-                review_analysis = auditor.audit_and_verify(
-                    scan_text,
-                    verify_list,
-                    enable_samples=self.config.enable_sample_library,
-                )
-                if review_analysis.get("error"):
-                    warnings.append(str(review_analysis["error"]))
-                else:
-                    analysis["reject"] = [
-                        *analysis.get("reject", []),
-                        *review_analysis.get("reject", []),
-                    ]
-                    calibrate = analysis.get("calibrate", {})
-                    if not isinstance(calibrate, dict):
-                        calibrate = {}
-                    review_calibrate = review_analysis.get("calibrate", {})
-                    if isinstance(review_calibrate, dict):
-                        calibrate.update(review_calibrate)
-                    analysis["calibrate"] = calibrate
 
         engine = LinearRuleEngine(
             counters=counters,
             profile=profile,
             sample_blacklist=sample_blacklist,
+            person_blacklist=trusted_org_short_names,
             get_location_prefix=get_location_prefix,
             use_semantic_rules=not sentence_extraction_success,
+            llm_primary_discovery=sentence_extraction_success,
             use_china_admin_rules=self.config.enable_china_admin_rules,
         )
 
@@ -1887,7 +2162,12 @@ class RedactionPipeline:
                 deduped_review_candidates.append(candidate)
             review_candidates = deduped_review_candidates[:80]
 
-            if self.config.enable_local_llm and self.config.local_llm.enabled and review_candidates:
+            if (
+                self.config.enable_local_llm
+                and self.config.local_llm.enabled
+                and review_candidates
+                and not llm_extraction_failed
+            ):
                 from .llm import LegalEntityAuditor
 
                 auditor = LegalEntityAuditor(self.config.local_llm)
@@ -1939,6 +2219,7 @@ class RedactionPipeline:
         unique_mappings = _filter_mappings_inside_trusted_samples(text, unique_mappings)
         unique_mappings = _filter_locations_inside_organizations(text, unique_mappings, sample_blacklist)
         unique_mappings = _filter_org_alias_prefixed_locations(unique_mappings)
+        unique_mappings = _filter_noise_entity_mappings(unique_mappings)
 
         redacted_text = remove_court_signatures(self.apply_mappings(text, unique_mappings))
         leaks = self.scan_high_risk_leaks(redacted_text)
@@ -2001,6 +2282,7 @@ class RedactionPipeline:
         unique_mappings = _filter_locations_inside_organizations(joined_text, unique_mappings)
         unique_mappings = _filter_org_alias_prefixed_locations(unique_mappings)
         unique_mappings = _filter_fragments_inside_longer_entities(joined_text, unique_mappings)
+        unique_mappings = _filter_noise_entity_mappings(unique_mappings)
         unique_mappings = _merge_organization_alias_mappings(unique_mappings)
                 
         unified_redaction_map = RedactionMap.create(

@@ -144,6 +144,9 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertIn('id="source-directory-files"', page)
         self.assertIn('name="case_folder_files"', page)
         self.assertIn('id="upload-relative-paths-input"', page)
+        self.assertIn('id="redact-form"', page)
+        self.assertIn('id="redact-progress"', page)
+        self.assertIn("已用时", page)
         self.assertNotIn("super-secret-token", page)
 
     def test_status_panel_renders_state_labels(self) -> None:
@@ -636,6 +639,57 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertIn("INVALID_INPUT", response.text)
         self.assertIn("status", response.text)
 
+    def test_redact_failure_hint_does_not_blame_hanlp_when_disabled(self) -> None:
+        from fastapi.testclient import TestClient
+
+        class FakePipeline:
+            def __init__(self, config) -> None:
+                self.config = config
+
+            def redact(self, text, source_file=None, base_redaction_map=None):
+                raise RuntimeError("simulated failure")
+
+        with (
+            patch("legal_redactor.web_app.ensure_mlx_server_ready", return_value=SimpleNamespace(state="ready")),
+            patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
+        ):
+            response = TestClient(app).post("/redact", data={"text": "张三"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("当前未启用 HanLP", response.text)
+        self.assertNotIn("取消勾选 HanLP", response.text)
+
+    def test_analyze_page_uses_pipeline_analyze(self) -> None:
+        from fastapi.testclient import TestClient
+
+        class FakePipeline:
+            def __init__(self, config) -> None:
+                self.config = config
+
+            def analyze(self, text):
+                return {
+                    "entity_groups": [
+                        {
+                            "id": 1,
+                            "type": "person",
+                            "role": "原告",
+                            "full_name": "张三",
+                            "aliases": [],
+                        }
+                    ],
+                    "locations": [],
+                }
+
+        with (
+            patch("legal_redactor.web_app.ensure_mlx_server_ready", return_value=SimpleNamespace(state="ready")),
+            patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
+        ):
+            response = TestClient(app).post("/analyze", data={"text": "张三"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("分级确认", response.text)
+        self.assertIn("张三", response.text)
+
     def test_apply_edited_map_rejects_forged_workflow_state(self) -> None:
         from fastapi.testclient import TestClient
 
@@ -816,6 +870,32 @@ class WebAppUploadTests(unittest.TestCase):
         renumbered = _renumber_mapping_placeholders(entries)
 
         self.assertEqual([entry.masked for entry in renumbered], ["甲公司", "乙机构", "张某甲"])
+
+    def test_renumber_mapping_placeholders_keeps_distinct_companies_separate(self) -> None:
+        entries = [
+            MappingEntry(
+                type="organization",
+                original="安徽拓欧建设集团有限公司",
+                masked="丁省丁公司",
+                role=None,
+                source="rule",
+                confidence=1.0,
+                restore_by_default=True,
+            ),
+            MappingEntry(
+                type="organization",
+                original="河北成城房地产开发有限公司",
+                masked="丁公司",
+                role=None,
+                source="rule",
+                confidence=1.0,
+                restore_by_default=True,
+            ),
+        ]
+
+        renumbered = _renumber_mapping_placeholders(entries)
+
+        self.assertEqual([entry.masked for entry in renumbered], ["甲省丁公司", "乙公司"])
 
     def test_renumber_mapping_placeholders_keeps_aliases_in_same_group(self) -> None:
         entries = [

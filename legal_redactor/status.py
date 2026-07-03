@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -211,6 +212,39 @@ def probe_mlx_server(
         )
     details["reason"] = "model_ready"
     return StatusItem("mlx_server", "MLX 本地模型", "ready", "固定 9B MLX 模型已就绪。", "无需处理", details)
+
+
+def _mlx_start_script_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "scripts" / "start_mlx9b_server.sh"
+
+
+def ensure_mlx_server_ready(
+    *,
+    environ: Mapping[str, str] | None = None,
+    timeout: float = 0.6,
+    start_timeout_seconds: int = 130,
+) -> StatusItem:
+    """Probe MLX; if missing, attempt scripts/start_mlx9b_server.sh once."""
+    item = probe_mlx_server(environ=environ, timeout=timeout)
+    if item.state == "ready":
+        return item
+    env = os.environ if environ is None else environ
+    if env.get("LEGAL_REDACTOR_SKIP_MLX") == "1":
+        return item
+    script = _mlx_start_script_path()
+    if not script.is_file():
+        return item
+    try:
+        subprocess.run(
+            ["bash", str(script)],
+            check=True,
+            timeout=start_timeout_seconds,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return probe_mlx_server(environ=environ, timeout=max(timeout, 2.0))
 
 
 def probe_mlx_runtime(*, environ: Mapping[str, str] | None = None, expected_model: str = EXPECTED_MLX_MODEL) -> StatusItem:

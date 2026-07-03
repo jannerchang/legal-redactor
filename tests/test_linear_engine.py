@@ -11,7 +11,7 @@ from legal_redactor.org_masking import (
     has_explicit_bare_brand_alias,
 )
 from legal_redactor.location_utils import get_location_core, location_suffix, strip_leading_locations
-from legal_redactor.models import Candidate, MappingEntry
+from legal_redactor.models import Candidate, MappingEntry, sort_mapping_entries
 
 
 @dataclass
@@ -22,7 +22,7 @@ class _Profile:
     redact_projects: bool = True
 
 
-def _engine(*, sample_blacklist: set[str] | None = None) -> LinearRuleEngine:
+def _engine(*, sample_blacklist: set[str] | None = None, llm_primary_discovery: bool = False) -> LinearRuleEngine:
     counters = TypeCounters()
     prefixes: dict[str, str] = {}
 
@@ -37,6 +37,7 @@ def _engine(*, sample_blacklist: set[str] | None = None) -> LinearRuleEngine:
         profile=_Profile(),
         sample_blacklist=sample_blacklist or set(),
         get_location_prefix=get_location_prefix,
+        llm_primary_discovery=llm_primary_discovery,
     )
 
 
@@ -84,6 +85,19 @@ def test_explicit_organization_aliases_finds_bare_short_name() -> None:
     aliases = explicit_organization_aliases(text, "华北制药股份有限公司")
 
     assert "华药" in aliases
+
+
+def test_explicit_organization_aliases_does_not_cross_contaminate_party_short_names() -> None:
+    text = (
+        "河北云厚建筑装饰工程有限公司（以下简称云厚公司）与"
+        "河北兴代建筑安装工程有限公司（以下简称兴代公司）及"
+        "石家庄方卫信息系统技术有限公司（以下简称方卫公司）签订合同。"
+    )
+
+    assert explicit_organization_aliases(text, "云厚公司") == []
+    assert explicit_organization_aliases(text, "兴代公司") == []
+    assert explicit_organization_aliases(text, "河北云厚建筑装饰工程有限公司") == ["云厚公司"]
+    assert explicit_organization_aliases(text, "河北兴代建筑安装工程有限公司") == ["兴代公司"]
 
 
 def test_has_explicit_bare_brand_alias_detects_parenthetical_short_name() -> None:
@@ -295,6 +309,33 @@ def test_resolve_candidate_overlaps_prefers_clean_nested_org_alias() -> None:
     assert resolved[0].text == "拓欧公司"
 
 
+def test_llm_primary_discovery_skips_party_and_regex_candidates() -> None:
+    engine = _engine(llm_primary_discovery=True)
+    analysis = {
+        "companies": [{"window": "s1", "name": "兴代公司", "variants": ["兴代公司"]}],
+        "persons": [],
+        "locations": [],
+        "projects": [],
+        "reject": ["否认其与兴代公司系关联公司"],
+        "calibrate": {},
+        "_sentence_windows": [{"id": "s1", "previous": "", "target": "被告否认其与兴代公司系关联公司。", "next": ""}],
+    }
+    text = "被告否认其与兴代公司系关联公司，兴代公司辩称无关联。"
+    mappings = engine.discover(text, llm_analysis=analysis)
+    originals = {mapping.original for mapping in mappings}
+    assert "兴代公司" in originals
+    assert "否认其与兴代公司系关联公司" not in originals
+
+
+def test_discover_rejects_false_org_clause_with_embedded_company() -> None:
+    engine = _engine()
+    text = "被告否认其与兴代公司系关联公司，兴代公司辩称双方无关联。"
+    mappings = engine.discover(text)
+    originals = {mapping.original for mapping in mappings}
+    assert "否认其与兴代公司系关联公司" not in originals
+    assert "兴代公司" in originals
+
+
 def test_discover_respects_sample_blacklist_for_rules() -> None:
     engine = _engine(sample_blacklist={"办公区"})
     text = "办公区完成调整，河北星河建筑工程有限公司签订合同。"
@@ -304,14 +345,209 @@ def test_discover_respects_sample_blacklist_for_rules() -> None:
     assert "河北星河建筑工程有限公司" in originals
 
 
-def test_sentence_windows_split_commas_and_dunhao_for_extraction() -> None:
+def test_sentence_windows_keep_commas_inside_sentence() -> None:
     from legal_redactor.llm import build_sentence_windows
 
     windows = build_sentence_windows("原告张三、李四，被告王五。")
 
-    assert [item["target"] for item in windows] == ["原告张三、", "李四，", "被告王五。"]
-    assert windows[1]["previous"] == "原告张三、"
-    assert windows[1]["next"] == "被告王五。"
+    assert len(windows) == 1
+    assert windows[0]["target"] == "原告张三、李四，被告王五。"
+
+
+def test_sentence_windows_keep_one_sentence_per_target() -> None:
+    from legal_redactor.llm import build_sentence_windows
+
+    windows = build_sentence_windows("原告张三提交证据。被告李四发表意见！第三人王五未到庭？")
+
+    assert [item["target"] for item in windows] == [
+        "原告张三提交证据。",
+        "被告李四发表意见！",
+        "第三人王五未到庭？",
+    ]
+    assert windows[1]["previous"] == "原告张三提交证据。"
+    assert windows[1]["next"] == "第三人王五未到庭？"
+
+
+def test_sentence_extraction_partial_batch_failure_keeps_successful_batches() -> None:
+    from legal_redactor.config import LocalLLMConfig
+    from legal_redactor.llm import LegalEntityAuditor
+
+    auditor = LegalEntityAuditor(LocalLLMConfig(mode="max-effect"))
+    text = "".join(f"第{i}句原告张三提交证据。" for i in range(1, 22))
+    calls: list[str] = []
+
+    def fake_extract_windows_batch(batch, *, enable_samples, label):
+        calls.append(label)
+        if label.startswith("batch 2/"):
+            return None, [f"{label}: simulated failure"]
+        return {
+            "locations": [],
+            "companies": [],
+            "persons": [{"window": batch[0]["id"], "name": "张三"}],
+            "projects": [],
+            "reject": [],
+            "calibrate": {},
+        }, []
+
+    auditor._extract_windows_batch = fake_extract_windows_batch  # type: ignore[method-assign]
+
+    result = auditor.extract_sentence_entities(text, enable_samples=False)
+
+    assert "error" not in result
+    assert result["_batch_failures"] == ["batch 2/3: simulated failure"]
+    assert [item["name"] for item in result["persons"]] == ["张三"]
+    assert sorted(calls) == ["batch 1/3", "batch 2/3", "batch 3/3"]
+
+
+def test_sentence_batch_records_one_failure_after_retry() -> None:
+    from legal_redactor.config import LocalLLMConfig
+    from legal_redactor.llm import LegalEntityAuditor
+
+    auditor = LegalEntityAuditor(LocalLLMConfig(mode="max-effect"))
+
+    def fail_call(prompt, *, max_tokens):
+        raise RuntimeError("bad json")
+
+    auditor._call_local_model = fail_call  # type: ignore[method-assign]
+
+    payload, failures = auditor._extract_windows_batch(
+        [{"id": "s1", "previous": "", "target": "原告张三。", "next": ""}],
+        enable_samples=False,
+        label="batch 1/1",
+    )
+
+    assert payload is None
+    assert failures == ["batch 1/1: bad json"]
+
+
+def test_sentence_orchestration_keeps_company_names_from_llm_clause_output() -> None:
+    from legal_redactor.llm import orchestrate_sentence_extractions
+
+    sentence = (
+        "石家庄裕华精密铸造有限公司（原名称：鹿泉市裕华精密铸造有限公司），"
+        "后有简称为：裕华公司。"
+    )
+    analysis = {
+        "locations": [],
+        "companies": [
+            {
+                "window": "s1",
+                "name": (
+                    "石家庄裕华精密铸造有限公司（原名称：鹿泉市裕华精密铸造有限公司），"
+                    "后有简称为：裕华公司"
+                ),
+            }
+        ],
+        "persons": [],
+        "projects": [],
+        "reject": [],
+        "calibrate": {},
+    }
+
+    result = orchestrate_sentence_extractions(analysis, source_text=sentence)
+
+    variants = set(result["companies"][0]["variants"])
+    assert "石家庄裕华精密铸造有限公司" in variants
+    assert "鹿泉市裕华精密铸造有限公司" in variants
+    assert "裕华公司" in variants
+
+
+def test_sentence_orchestration_strips_litigation_role_company_prefix() -> None:
+    from legal_redactor.llm import orchestrate_sentence_extractions
+
+    result = orchestrate_sentence_extractions(
+        {
+            "locations": [],
+            "companies": [
+                {
+                    "window": "s1",
+                    "name": "被告河北星河建设有限公司",
+                    "variants": ["被告河北星河建设有限公司", "星河建设公司"],
+                }
+            ],
+            "persons": [],
+            "projects": [],
+            "reject": [],
+            "calibrate": {},
+        }
+    )
+
+    assert result["companies"] == [
+        {
+            "window": "s1",
+            "name": "河北星河建设有限公司",
+            "variants": ["河北星河建设有限公司", "星河建设公司"],
+        }
+    ]
+
+
+def test_sentence_orchestration_drops_action_clause_organization_noise() -> None:
+    from legal_redactor.llm import orchestrate_sentence_extractions
+
+    result = orchestrate_sentence_extractions(
+        {
+            "locations": [],
+            "companies": [
+                {"window": "s1", "name": "王琳向冯朋嵩发送河北银行", "variants": ["王琳向冯朋嵩发送河北银行"]},
+                {"window": "s2", "name": "否认冯朋嵩系兴代公司", "variants": ["否认冯朋嵩系兴代公司"]},
+                {"window": "s3", "name": "称冯朋嵩以兴代公司", "variants": ["称冯朋嵩以兴代公司"]},
+                {"window": "s4", "name": "云厚公司", "variants": ["云厚公司"]},
+            ],
+            "persons": [],
+            "projects": [],
+            "reject": [],
+            "calibrate": {},
+        }
+    )
+
+    company_names = {item["name"] for item in result["companies"]}
+    assert "云厚公司" in company_names
+    assert "河北银行" in company_names
+    assert "兴代公司" in company_names
+    assert "王琳向冯朋嵩发送河北银行" not in company_names
+    assert "否认冯朋嵩系兴代公司" not in company_names
+    assert "称冯朋嵩以兴代公司" not in company_names
+
+
+def test_sentence_orchestration_drops_generic_project_noise() -> None:
+    from legal_redactor.llm import orchestrate_sentence_extractions
+
+    result = orchestrate_sentence_extractions(
+        {
+            "locations": [],
+            "companies": [],
+            "persons": [],
+            "projects": [
+                {"window": "s1", "name": "办公大厅整体装修施工"},
+                {"window": "s2", "name": "会议室装修承包合同"},
+                {"window": "s3", "name": "二期空调采购清单"},
+                {"window": "s4", "name": "合同总款"},
+                {"window": "s5", "name": "整体工程"},
+                {"window": "s6", "name": "报价单"},
+                {"window": "s7", "name": "起航小镇"},
+            ],
+            "reject": [],
+            "calibrate": {},
+        }
+    )
+
+    assert result["projects"] == [{"window": "s7", "name": "起航小镇"}]
+
+
+def test_mapping_sort_groups_entity_types_for_review() -> None:
+    mappings = [
+        MappingEntry("project", "起航小镇", "甲小镇", None, "test", 1.0, True),
+        MappingEntry("organization", "云厚公司", "甲公司", None, "test", 1.0, True),
+        MappingEntry("location", "石家庄市", "甲市", None, "test", 1.0, True),
+        MappingEntry("person", "张三", "张某甲", None, "test", 1.0, True),
+    ]
+
+    assert [item.type for item in sort_mapping_entries(mappings)] == [
+        "organization",
+        "location",
+        "person",
+        "project",
+    ]
 
 
 def test_discover_detects_inline_party_person_lists() -> None:
@@ -380,3 +616,129 @@ def test_apply_mappings_skips_bare_alias_inside_unmapped_company_name() -> None:
     assert "华药生物公司" in redacted
     assert "甲公司生物公司" not in redacted
     assert "甲公司继续陈述" in redacted
+
+
+def test_accept_organization_reuses_brand_across_different_location_prefixes() -> None:
+    engine = _engine()
+    engine.source_text = (
+        "原告江苏载道电力工程有限公司，后更名为淮安载道电力工程有限公司。"
+        "载道公司亦参与诉讼。"
+    )
+    names = [
+        "江苏载道电力工程有限公司",
+        "淮安载道电力工程有限公司",
+        "载道公司",
+        "载道电力工程有限公司",
+    ]
+    for name in names:
+        engine.accept_organization(
+            Candidate(
+                type="organization",
+                text=name,
+                start=engine.source_text.index(name),
+                end=engine.source_text.index(name) + len(name),
+                source="linear_llm_exact",
+                confidence=0.95,
+                risk_level="medium",
+                auto_redact=True,
+            )
+        )
+
+    by_original = {mapping.original: mapping.masked for mapping in engine.mappings}
+    jiangsu = by_original["江苏载道电力工程有限公司"]
+    huaian = by_original["淮安载道电力工程有限公司"]
+    assert jiangsu.endswith("电力工程公司")
+    assert huaian.endswith("电力工程公司")
+    assert jiangsu != huaian
+    assert jiangsu[2] == huaian[2] == by_original["载道公司"][0]
+    assert by_original["载道公司"] == f"{jiangsu[2]}公司"
+
+
+def test_accept_organization_reuses_brand_mask_for_short_and_full_names() -> None:
+    engine = _engine()
+    engine.source_text = (
+        "河北云厚建筑装饰工程有限公司（以下简称云厚公司）与"
+        "河北兴代建筑安装工程有限公司（以下简称兴代公司）及"
+        "石家庄方卫信息系统技术有限公司（以下简称方卫公司）签订合同。"
+    )
+    names = [
+        "云厚公司",
+        "兴代公司",
+        "方卫公司",
+        "河北云厚建筑装饰工程有限公司",
+        "河北兴代建筑安装工程有限公司",
+        "石家庄方卫信息系统技术有限公司",
+    ]
+    for name in names:
+        engine.accept_organization(
+            Candidate(
+                type="organization",
+                text=name,
+                start=engine.source_text.index(name),
+                end=engine.source_text.index(name) + len(name),
+                source="linear_llm_exact",
+                confidence=0.95,
+                risk_level="medium",
+                auto_redact=True,
+            )
+        )
+
+    by_original = {mapping.original: mapping.masked for mapping in engine.mappings}
+    assert by_original["云厚公司"] == "甲公司"
+    assert by_original["兴代公司"] == "乙公司"
+    assert by_original["方卫公司"] == "丙公司"
+    assert by_original["河北云厚建筑装饰工程有限公司"].startswith("甲省甲")
+    assert by_original["河北兴代建筑安装工程有限公司"].startswith("甲省乙")
+    assert by_original["石家庄方卫信息系统技术有限公司"].startswith("乙省丙")
+    assert by_original["云厚公司"] == by_original["河北云厚建筑装饰工程有限公司"][2] + "公司"
+    assert by_original["兴代公司"] == by_original["河北兴代建筑安装工程有限公司"][2] + "公司"
+    assert by_original["方卫公司"] == by_original["石家庄方卫信息系统技术有限公司"][2] + "公司"
+
+
+def test_accept_organization_keeps_different_company_short_names_separate() -> None:
+    engine = _engine()
+    engine.source_text = (
+        "河北星河建设有限公司与北京星河科技有限公司签订合同。"
+        "星河建设公司提交说明，星河科技公司提交说明。"
+    )
+    for name in (
+        "河北星河建设有限公司",
+        "北京星河科技有限公司",
+        "星河建设公司",
+        "星河科技公司",
+    ):
+        engine.accept_organization(
+            Candidate(
+                type="organization",
+                text=name,
+                start=engine.source_text.index(name),
+                end=engine.source_text.index(name) + len(name),
+                source="linear_llm_exact",
+                confidence=0.95,
+                risk_level="medium",
+                auto_redact=True,
+            )
+        )
+
+    by_original = {mapping.original: mapping.masked for mapping in engine.mappings}
+    assert by_original["星河建设公司"] != by_original["星河科技公司"]
+    assert by_original["星河建设公司"] == by_original["河北星河建设有限公司"][2] + "公司"
+    assert by_original["星河科技公司"] == by_original["北京星河科技有限公司"][2] + "公司"
+
+
+def test_merge_organization_alias_mappings_keeps_different_company_short_names_separate() -> None:
+    from legal_redactor.pipeline import _merge_organization_alias_mappings
+
+    mappings = [
+        MappingEntry("organization", "河北星河建设有限公司", "甲省甲公司", None, "linear:linear_llm_exact", 0.95, True),
+        MappingEntry("organization", "星河建设公司", "甲公司", None, "linear:linear_llm_exact", 0.95, True),
+        MappingEntry("organization", "北京星河科技有限公司", "乙省乙科技公司", None, "linear:linear_llm_exact", 0.95, True),
+        MappingEntry("organization", "星河科技公司", "乙公司", None, "linear:linear_llm_exact", 0.95, True),
+    ]
+
+    merged = _merge_organization_alias_mappings(mappings)
+    by_original = {mapping.original: mapping.masked for mapping in merged}
+
+    assert by_original["星河建设公司"] == "甲公司"
+    assert by_original["星河科技公司"] == "乙公司"
+    assert by_original["星河建设公司"] != by_original["星河科技公司"]
