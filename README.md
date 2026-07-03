@@ -299,6 +299,57 @@ HanLP 是可选依赖，未安装时系统会跳过并继续使用现有规则�
   --regression-saved-at 2026-06-29T08:01:30+00:00
 ```
 
+### M8 运行时基准报告
+
+比较 `mlx_lm.server`、Rapid-MLX、纯规则兜底或其他本地候选时，先为每个候选生成
+同一 gold set / input set / profile 下的 M6 回归报告，再用
+`--runtime-benchmark-report` 生成本地 JSON 基准报告。M8 只给出可复核的候选比较；
+不会自动切换默认模型、`--llm` 默认值或启动脚本。
+
+`benchmark_context` 必须对所有候选一致；如果 gold set、输入文档集合或 benchmark
+profile 不匹配，报告会把推荐动作降为 `manual_review`：
+
+```json
+{
+  "gold_set_id": "spc-public-v1",
+  "gold_set_hash": "sha256-of-gold-manifest",
+  "input_set_id": "public-spc-samples-v1",
+  "input_set_kind": "public_spc_sample",
+  "input_set_hash": "sha256-of-relative-path-manifest",
+  "sample_provenance_id": "sample-meta-v1",
+  "benchmark_profile": "m8-default-v1"
+}
+```
+
+生成报告：
+
+```bash
+.venv/bin/python -m legal_redactor \
+  --runtime-benchmark-report output/runtime-benchmark.json \
+  --benchmark-context output/benchmark-context.json \
+  --benchmark-candidate baseline mlx mlx-lm output/baseline-regression.json \
+  --benchmark-candidate rapid-mlx mlx rapid-mlx output/rapid-regression.json
+```
+
+如果有本地探测数据，可为每个候选追加 observation JSON，记录 first-token、Web workflow、
+peak memory、error rate 或 `/v1/models` identity 这类元数据：
+
+```bash
+.venv/bin/python -m legal_redactor \
+  --runtime-benchmark-report output/runtime-benchmark.json \
+  --benchmark-context output/benchmark-context.json \
+  --benchmark-candidate baseline mlx mlx-lm output/baseline-regression.json \
+  --benchmark-candidate rapid-mlx mlx rapid-mlx output/rapid-regression.json \
+  --benchmark-observation baseline output/baseline-observation.json \
+  --benchmark-observation rapid-mlx output/rapid-observation.json
+```
+
+M8 报告仍然是隐私安全边界：只保存标签、聚合指标、delta、reason 和模型 identity
+元数据，不写入 `matched` / `missing` / `extra` 原始诊断、样本 entries、映射值、
+还原正文、绝对 Office 路径、token、prompt/body 或 debug trace。现有 `samples/`
+里的公开最高人民法院样本可以作为 M8 benchmark/test input，但报告中只能引用相对
+路径清单的 hash 或类别，不复制文书正文。
+
 命令行脱敏可加 `--debug-trace` 输出 `debug_trace.json`；Web 结果页也提供
 `debug_trace.json` 下载按钮。该文件记录映射来源、置信度、复核候选、泄漏告警、
 每个映射在各文件中的出现次数，适合排查漏识别或边界漂移。它和映射表一样包含原文
