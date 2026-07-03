@@ -157,6 +157,34 @@ def _build_parser() -> argparse.ArgumentParser:
         default="",
         help="案件保存时间 ISO 字符串，用于 document_input_to_saved_case_ms",
     )
+    parser.add_argument(
+        "--runtime-benchmark-report",
+        type=str,
+        default="",
+        help="写入 M8 隐私安全运行时基准 JSON 报告",
+    )
+    parser.add_argument(
+        "--benchmark-context",
+        type=str,
+        default="",
+        help="M8 benchmark_context JSON 路径",
+    )
+    parser.add_argument(
+        "--benchmark-candidate",
+        nargs=4,
+        action="append",
+        default=[],
+        metavar=("LABEL", "RUNTIME_KIND", "RUNTIME_CONFIG_ID", "M6_REPORT"),
+        help="添加一个 M8 候选运行：label runtime_kind runtime_config_id m6_report.json；可重复",
+    )
+    parser.add_argument(
+        "--benchmark-observation",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("LABEL", "OBSERVATION_JSON"),
+        help="可选：添加候选的本地计时/内存/错误/探测元数据 JSON",
+    )
     return parser
 
 
@@ -169,6 +197,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.eval_gold:
         _do_eval(args)
+        return
+
+    if args.runtime_benchmark_report:
+        _write_runtime_benchmark_report(args)
         return
 
     if args.regression_report:
@@ -367,6 +399,57 @@ def _write_regression_report(
     timing = report["timing"]
     if timing.get("document_input_to_saved_case_ms") is not None:
         print(f"[计时] document_input_to_saved_case_ms={timing['document_input_to_saved_case_ms']}")
+
+
+def _write_runtime_benchmark_report(args: argparse.Namespace) -> None:
+    from .regression import load_json_object
+    from .runtime_benchmark import (
+        BenchmarkCandidateInput,
+        benchmark_report_to_json,
+        build_runtime_benchmark_report,
+    )
+
+    output_path = Path(args.runtime_benchmark_report)
+    try:
+        if not args.benchmark_context:
+            raise ValueError("--benchmark-context is required")
+        if len(args.benchmark_candidate or []) < 2:
+            raise ValueError("at least two --benchmark-candidate entries are required")
+        context = load_json_object(args.benchmark_context, description="M8 benchmark_context")
+        observations: dict[str, dict] = {}
+        for label, observation_path in args.benchmark_observation or []:
+            observations[label] = load_json_object(observation_path, description=f"M8 observation {label}")
+        candidates = []
+        for label, runtime_kind, runtime_config_id, report_path in args.benchmark_candidate or []:
+            m6_report = load_json_object(report_path, description=f"M6 report {label}")
+            observation = observations.get(label, {})
+            candidate_context = observation.get("benchmark_context", context) if isinstance(observation, dict) else context
+            candidates.append(
+                BenchmarkCandidateInput(
+                    label=label,
+                    runtime_kind=runtime_kind,
+                    runtime_config_id=runtime_config_id,
+                    m6_report_path=report_path,
+                    m6_report=m6_report,
+                    benchmark_context=candidate_context,
+                    observation=observation,
+                )
+            )
+        report = build_runtime_benchmark_report(candidates)
+    except ValueError as exc:
+        print(f"[基准报告错误] {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(benchmark_report_to_json(report), encoding="utf-8")
+    labels = ", ".join(candidate["label"] for candidate in report["candidates"])
+    print(f"[运行时基准] {output_path}")
+    print(f"[候选] {labels}")
+    recommendation = report["recommendation"]
+    print(f"[建议] action={recommendation['action']} reason={recommendation['reason']}")
+    for delta in report["comparison"]["deltas"]:
+        timing = delta["timing"]
+        print(f"[差值] {delta['label']} total_redaction_eval_ms_delta={timing['total_redaction_eval_ms_delta']}")
 
 
 def _start_web(host: str, port: int) -> None:
