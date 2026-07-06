@@ -5,7 +5,16 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from .config import HIGH_RISK_TYPES
-from .lexicon import COMMON_SURNAMES, PROVINCE_NAMES
+from .lexicon import (
+    COMMON_SURNAMES,
+    COMMON_SURNAME_CHARS,
+    FALSE_ORG_BRANDS,
+    FALSE_ORG_EXACT_CORES,
+    FALSE_PERSON_WORDS,
+    INDUSTRY_CORE_SUFFIXES,
+    LEGAL_SUFFIXES,
+    PROVINCE_NAMES,
+)
 from .models import Candidate
 
 
@@ -477,45 +486,9 @@ _FALLBACK_PERSON_PATTERNS = [
     PERSON_AFTER_KINSHIP_RE,
 ]
 # 不应识别的常见词
-_FALSE_PERSON_WORDS = frozenset({
-    "原告", "被告", "本院", "法院", "裁定", "判决", "公司",
-    "合同", "项目", "工程", "事实", "法律",
-    "规定", "根据", "认为", "审理", "查明", "适用", "依法",
-    "上述", "如下", "另有", "对于", "关于", "有关", "由于",
-    "鉴于", "依照", "按照", "予以", "不予",
-    "共同", "各自", "应当", "可以", "不得", "已经", "尚未",
-    "进行", "作出", "提出", "提交", "出具", "提供",
-    "存在", "发生", "产生", "决定", "确认", "认定", "确定",
-    "当事人", "委托", "法定", "代理", "诉讼", "起诉", "上诉", "申诉",
-    "负责人", "代表人", "代理人", "辩护人", "权利人", "义务人",
-    "人数", "两年内", "一年内", "补充", "说明", "本案", "他人", "本人",
-    "三原告", "两原告", "三被告", "两被告", "原审", "被申请", "申请",
-    # ── 常见误识别排除词 ──
-    "双方", "各方", "对方", "本方", "通知", "公告", "送达",
-    "费用", "金额", "损失", "利息", "无效", "有效", "解除", "终止",
-    "履行", "支付", "请求", "主张", "配合", "协助", "支持", "理由",
-    "陈述", "辩称", "答辩", "陈述意见", "抗诉",
-    "执行", "裁决", "判令", "承担", "案情", "起诉状", "答辩状", "委托书", "代理词",
-    # ── 口语与泛称实体、动词、方位词排除 ──
-    "单位", "毕业", "订立", "成立", "设立", "责任", "见过", "帮忙", "结算", "开庭",
-    "开庭后", "劳动者", "代表", "表示", "工作", "任职", "离职", "入职", "集团", "中心", "都用",
-    "部门", "块", "圈", "后", "没见", "见过章", "明确", "法庭",
-    "包含", "施工", "法官", "齐齐", "利润", "时三方", "时到期", "时甲方", "时该条", "时还约",
-    "水采暖", "水配管", "水管道", "水管清", "时期其", "应检测", "应实体", "安装费",
-    "安置方", "所说", "正义", "仲裁", "应以",
-    # ── 新增：从715条黑名单分析出的高频误识别词 ──
-    "通过", "经由", "经营", "劳动", "劳力", "劳务", "安装", "万元", "平房", "房屋",
-    "应予", "应债", "应就", "应票", "应该", "应项", "应造价", "应商票", "应向",
-    "方式", "方法", "方上", "程序", "管理", "质证", "都属", "甄别", "明显",
-    "公共", "公平", "公序", "公交", "司法", "制度", "维持", "驳回", "扰乱",
-    "国家", "范围", "反映", "步推", "保护", "限制", "组织", "全面",
-    "高水", "花架", "解协",
-    "同意", "不同意", "第一", "第二", "第三", "仲裁委", "仲裁时",
-    "包括", "作为", "案涉", "权限",
-    # ── 4396 样本：口语/程序性短语误识别人名 ──
-    "甲方", "签约", "维护", "而非", "银行流水", "人员混同", "仍然认可", "同时",
-    "将水搅浑", "无关", "无权再向", "欲证实", "直至今日", "老贾",
-})
+# Relocated to lexicon.FALSE_PERSON_WORDS; alias kept for backward-compatible
+# imports (pipeline.py, tests/test_sample_integration.py).
+_FALSE_PERSON_WORDS = FALSE_PERSON_WORDS
 
 
 def _clean_person_name(value: str) -> str:
@@ -693,38 +666,15 @@ def detect_heuristic_ner_candidates(text: str) -> list[Candidate]:
 
 
 # 常见的非品牌名词汇——当这些词作为公司名的"品牌"部分时，说明是误识别
-_FALSE_ORG_BRANDS = frozenset({
-    # 产品/物品类
-    "家具", "家居", "设备", "材料", "建材", "食品", "服装", "药品", "商品",
-    "货物", "物品", "物资", "器材", "器械", "用品", "产品", "配件", "零件",
-    # 动作/状态类
-    "购买", "销售", "生产", "加工", "制造", "维修", "安装", "运输",
-    "管理", "经营", "服务", "咨询", "代理", "承包", "租赁", "出租",
-    "策划",
-    # 纯后缀/法律术语
-    "有限", "责任", "股份", "集团",
-    # ── 新增：从黑名单分析出的非品牌名词 ──
-    "开发", "建设", "检测", "检验", "造价", "质检",
-})
+# Relocated to lexicon.FALSE_ORG_BRANDS / FALSE_ORG_EXACT_CORES; aliases kept
+# because _is_false_org references them by these private names.
+_FALSE_ORG_BRANDS = FALSE_ORG_BRANDS
+_FALSE_ORG_EXACT_CORES = FALSE_ORG_EXACT_CORES
 
-_FALSE_ORG_EXACT_CORES = frozenset({
-    "工程", "建筑劳务", "建设", "房地产", "房地产开发", "技术", "科技", "燃气",
-    "药业", "生态环境", "独资", "留存", "完善", "扩大适用",
-    "检测技术", "检测技术服务", "工程质检技术",
-    # ── 新增：从黑名单分析出的纯行业词核心 ──
-    "建筑材料设备检验", "工程造价", "建工技术", "电子", "声旺",
-    "建筑安装", "建筑科技", "建设工程", "水电开发", "企业发展",
-    "流域水电", "网络技术", "信息技术", "策划",
-})
-
-_COMMON_SURNAME_CHARS = frozenset("赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜谢范彭马苗方袁唐薛雷贺倪汤罗郝安常于傅康伍余顾孟黄萧尹姚邵汪毛董梁杜阮贾路江郭梅林钟徐邱骆高夏蔡田胡万卢莫曾白王")
+_COMMON_SURNAME_CHARS = COMMON_SURNAME_CHARS
 
 # 公司字号末尾常见的行业/业务词，与动作动词同形但不应单独触发误杀。
-_INDUSTRY_CORE_SUFFIXES = frozenset({
-    "运输", "建设", "工程", "制造", "销售", "租赁", "装饰", "物流", "物业",
-    "开发", "投资", "科技", "信息", "服务", "咨询", "代理", "管理", "贸易",
-    "商贸", "建筑", "劳务", "环保", "能源", "置业", "产业", "电力", "水利",
-})
+_INDUSTRY_CORE_SUFFIXES = INDUSTRY_CORE_SUFFIXES
 
 
 def _core_has_action_verb_noise(core: str, action_verbs: tuple[str, ...]) -> bool:
@@ -742,9 +692,8 @@ def _core_has_action_verb_noise(core: str, action_verbs: tuple[str, ...]) -> boo
 
 
 # Module-level constants for _is_false_org (previously redefined on every call)
-_PURE_LEGAL_SUFFIXES = frozenset({
-    "有限责任公司", "股份有限公司", "集团有限公司", "有限公司", "公司", "集团", "幼儿园",
-})
+# Derived from lexicon.LEGAL_SUFFIXES (same 7 members) to avoid a duplicate literal.
+_PURE_LEGAL_SUFFIXES = frozenset(LEGAL_SUFFIXES)
 
 _ORG_ACTION_VERBS = (
     "违反", "拒绝", "接受", "返还", "邮寄", "接管", "工作", "往返",
@@ -769,63 +718,99 @@ _ORG_FALSE_CORE_PREFIXES = frozenset({
     "机构", "股东用", "非", "说", "知", "解", "知天煜",
 })
 
-def _is_false_org(value: str) -> bool:
-    """检查清理后的公司名是否为误识别（如"家具有限公司"、"有限责任公司"）。"""
+def _org_has_disclaimer_or_contract_ref(value: str) -> bool:
     if re.fullmatch(r"合同[一二三四五六七八九十百零\d]+", value):
         return True
     if "系关联公司" in value or value.startswith(("否认其", "否认与")):
+        return True
+    return False
+
+
+def _org_bracket_shape_invalid(value: str) -> bool:
+    if "（" in value or "）" in value or "(" in value or ")" in value:
+        if not re.fullmatch(r"[一-龥A-Za-z0-9·]+[（(][一-龥A-Za-z0-9·]{2,12}[）)][一-龥A-Za-z0-9·]*(?:有限责任公司|股份有限公司|集团有限公司|有限公司|公司|集团)", value):
+            return True
+    return False
+
+
+# 长句特征词：带有明显合同、证据、诉讼等非机构特征时为误识别。
+_ORG_LONG_SENTENCE_NOISE = (
+    "合同", "证据", "佐证", "在卷", "协议", "诉讼", "裁判", "本案", "案涉",
+    "原告", "被告", "第三人", "本院", "转账", "凭证", "案卷",
+)
+
+# 不带公司/集团后缀时，core 级别的代词/数量指代词，命中即误识别。
+_ORG_VALUE_NOISE_WITHOUT_SUFFIX = (
+    "我", "你", "他", "本", "该", "贵", "此", "两", "两家", "各", "各家",
+    "某", "一", "两个", "几家", "见两个",
+)
+
+
+def _org_core_is_false(core: str) -> bool:
+    """检查去掉法律后缀后的品牌核心是否为误识别。"""
+    # ── 过滤由常用代词、语气词或国家/通用指代代词构成的伪字号 ──
+    if core in _ORG_FALSE_CORE_PREFIXES:
+        return True
+    if len(core) < 2:
+        return True
+    if "我" in core or "两家" in core or core.endswith(("等", "等公司")):
+        return True
+    if core.endswith(("省", "市", "区", "县", "旗", "镇", "乡", "街道", "村", "社区")):
+        return True
+    if re.fullmatch(r"[一-龥]{2,3}", core) and core[0] in _COMMON_SURNAME_CHARS:
+        return True
+    if core.endswith(("北京区", "中国北京区", "集团区")):
+        return True
+    # ── 过滤包含法律诉讼/日常动作动词构成的动词短语公司（如 "严重违反公司" -> "严重违反"） ──
+    if _core_has_action_verb_noise(core, _ORG_ACTION_VERBS):
+        return True
+    # 完全匹配常见非品牌词
+    if core in _FALSE_ORG_BRANDS or core in _FALSE_ORG_EXACT_CORES:
+        return True
+    # 核心以常见非品牌词结尾（如"购买家具"以"家具"结尾）
+    for fb in _FALSE_ORG_BRANDS:
+        if core.endswith(fb) and len(core) > len(fb):
+            prefix = core[: -len(fb)]
+            if len(prefix) <= 2 or _core_has_action_verb_noise(prefix, _ORG_ACTION_VERBS):
+                return True
+    return False
+
+
+def _org_value_is_false_without_suffix(value: str) -> bool:
+    # 如果不带公司/集团后缀，直接检查 core 级别的非地理/动作词
+    if any(noise in value for noise in _ORG_VALUE_NOISE_WITHOUT_SUFFIX):
+        return True
+    if _core_has_action_verb_noise(value, _ORG_ACTION_VERBS):
+        return True
+    return False
+
+
+def _is_false_org(value: str) -> bool:
+    """检查清理后的公司名是否为误识别（如"家具有限公司"、"有限责任公司"）。"""
+    if _org_has_disclaimer_or_contract_ref(value):
         return True
 
     # 纯法律后缀，无品牌
     if value in _PURE_LEGAL_SUFFIXES:
         return True
-    if "（" in value or "）" in value or "(" in value or ")" in value:
-        if not re.fullmatch(r"[\u4e00-\u9fa5A-Za-z0-9·]+[（(][\u4e00-\u9fa5A-Za-z0-9·]{2,12}[）)][\u4e00-\u9fa5A-Za-z0-9·]*(?:有限责任公司|股份有限公司|集团有限公司|有限公司|公司|集团)", value):
-            return True
-    
+    if _org_bracket_shape_invalid(value):
+        return True
+
     # 过滤带有明显合同、证据、诉讼等非机构特征的长句。
-    if any(noise in value for noise in ("合同", "证据", "佐证", "在卷", "协议", "诉讼", "裁判", "本案", "案涉", "原告", "被告", "第三人", "本院", "转账", "凭证", "案卷")):
+    if any(noise in value for noise in _ORG_LONG_SENTENCE_NOISE):
         return True
 
     # 去掉法律后缀后，检查剩余部分
     for sfx in sorted(_PURE_LEGAL_SUFFIXES, key=len, reverse=True):
         if value.endswith(sfx) and len(value) > len(sfx):
-            core = value[:-len(sfx)]
-            # ── 过滤由常用代词、语气词或国家/通用指代代词构成的伪字号 ──
-            if core in _ORG_FALSE_CORE_PREFIXES:
+            if _org_core_is_false(value[:-len(sfx)]):
                 return True
-            if len(core) < 2:
-                return True
-            if "我" in core or "两家" in core or core.endswith(("等", "等公司")):
-                return True
-            if core.endswith(("省", "市", "区", "县", "旗", "镇", "乡", "街道", "村", "社区")):
-                return True
-            if re.fullmatch(r"[\u4e00-\u9fa5]{2,3}", core) and core[0] in _COMMON_SURNAME_CHARS:
-                return True
-            if core.endswith(("北京区", "中国北京区", "集团区")):
-                return True
-            # ── 过滤包含法律诉讼/日常动作动词构成的动词短语公司（如 "严重违反公司" -> "严重违反"） ──
-            if _core_has_action_verb_noise(core, _ORG_ACTION_VERBS):
-                return True
-            # 完全匹配常见非品牌词
-            if core in _FALSE_ORG_BRANDS or core in _FALSE_ORG_EXACT_CORES:
-                return True
-            # 核心以常见非品牌词结尾（如"购买家具"以"家具"结尾）
-            for fb in _FALSE_ORG_BRANDS:
-                if core.endswith(fb) and len(core) > len(fb):
-                    prefix = core[: -len(fb)]
-                    if len(prefix) <= 2 or _core_has_action_verb_noise(prefix, _ORG_ACTION_VERBS):
-                        return True
             break
     else:
-        # 如果不带公司/集团后缀，直接检查 core 级别的非地理/动作词
-        if any(noise in value for noise in ("我", "你", "他", "本", "该", "贵", "此", "两", "两家", "各", "各家", "某", "一", "两个", "几家", "见两个")):
+        if _org_value_is_false_without_suffix(value):
             return True
-        if _core_has_action_verb_noise(value, _ORG_ACTION_VERBS):
-            return True
-            
-    return False
 
+    return False
 
 
 def _regex_candidates(
