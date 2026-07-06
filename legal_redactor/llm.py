@@ -826,7 +826,6 @@ class LegalEntityAuditor:
             payload = self._call_local_model(prompt)
             return self._normalize_candidate_review_payload(payload, candidates)
         except Exception as exc:
-            import sys
             _logger.warning("语义审计与验证联合调用失败：%s", exc)
             # 联合调用失败时，返回空提取，并采用 fail-open（空拒绝列表）以保留所有规则候选
             return {"locations": [], "companies": [], "persons": [], "reject": [], "error": str(exc)}
