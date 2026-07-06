@@ -1270,11 +1270,11 @@ def _legacy_finalize(pipeline, ctx, text) -> RedactionResult:
             seen_orig.add(m.original)
             unique_mappings.append(m)
 
-    unique_mappings = _filter_mappings_inside_trusted_samples(text, unique_mappings)
-    unique_mappings = _filter_locations_inside_organizations(text, unique_mappings, ctx.sample_blacklist)
-    unique_mappings = _filter_org_alias_prefixed_locations(unique_mappings)
-    unique_mappings = _filter_fragments_inside_longer_entities(text, unique_mappings)
-    unique_mappings = _filter_noise_entity_mappings(unique_mappings)
+    unique_mappings = apply_postprocess(
+        text,
+        unique_mappings,
+        PostprocessConfig(include_fragments=True, protected_texts=ctx.sample_blacklist),
+    )
 
     redacted_text = pipeline.apply_mappings(text, unique_mappings)
     redacted_text = remove_court_signatures(redacted_text)
@@ -1493,10 +1493,11 @@ def _linear_run_sentence_extraction(pipeline, ctx, text):
                     seen_originals.add(mapping.original)
                     unique_mappings.append(mapping)
 
-                unique_mappings = _filter_mappings_inside_trusted_samples(text, unique_mappings)
-                unique_mappings = _filter_locations_inside_organizations(text, unique_mappings, ctx.sample_blacklist)
-                unique_mappings = _filter_org_alias_prefixed_locations(unique_mappings)
-                unique_mappings = _filter_noise_entity_mappings(unique_mappings)
+                unique_mappings = apply_postprocess(
+                    text,
+                    unique_mappings,
+                    PostprocessConfig(protected_texts=ctx.sample_blacklist),
+                )
 
                 redacted_text = remove_court_signatures(pipeline.apply_mappings(text, unique_mappings))
                 leaks = pipeline.scan_high_risk_leaks(redacted_text)
@@ -1625,10 +1626,11 @@ def _linear_finalize(pipeline, ctx, text) -> RedactionResult:
         seen_originals.add(mapping.original)
         unique_mappings.append(mapping)
 
-    unique_mappings = _filter_mappings_inside_trusted_samples(text, unique_mappings)
-    unique_mappings = _filter_locations_inside_organizations(text, unique_mappings, ctx.sample_blacklist)
-    unique_mappings = _filter_org_alias_prefixed_locations(unique_mappings)
-    unique_mappings = _filter_noise_entity_mappings(unique_mappings)
+    unique_mappings = apply_postprocess(
+        text,
+        unique_mappings,
+        PostprocessConfig(protected_texts=ctx.sample_blacklist),
+    )
 
     redacted_text = remove_court_signatures(pipeline.apply_mappings(text, unique_mappings))
     leaks = pipeline.scan_high_risk_leaks(redacted_text)
@@ -1794,12 +1796,11 @@ class RedactionPipeline:
                 unique_mappings.append(m)
 
         joined_text = "\n\n".join(original_text for _, original_text in documents)
-        unique_mappings = _filter_mappings_inside_trusted_samples(joined_text, unique_mappings)
-        unique_mappings = _filter_locations_inside_organizations(joined_text, unique_mappings)
-        unique_mappings = _filter_org_alias_prefixed_locations(unique_mappings)
-        unique_mappings = _filter_fragments_inside_longer_entities(joined_text, unique_mappings)
-        unique_mappings = _filter_noise_entity_mappings(unique_mappings)
-        unique_mappings = _merge_organization_alias_mappings(unique_mappings)
+        unique_mappings = apply_postprocess(
+            joined_text,
+            unique_mappings,
+            PostprocessConfig(include_fragments=True, include_alias_merge=True),
+        )
                 
         unified_redaction_map = RedactionMap.create(
             mappings=unique_mappings,
@@ -1874,10 +1875,12 @@ def apply_redaction_map(text: str, redaction_map: RedactionMap) -> str:
 # ── Backward-compat aliases ─────────────────────────────────────────
 # The mapping filter/merge pipeline has been relocated to .postprocess; these
 # underscore aliases keep existing `from .pipeline import _filter_*` call sites
-# (web_app, tests, and the four in-pipeline call sites until Phase 4 rewires
-# them) working without changes.
+# (web_app, tests) working without changes. The four in-pipeline call sites
+# now go through apply_postprocess + PostprocessConfig.
 from . import postprocess as _postprocess
 
+apply_postprocess = _postprocess.apply_postprocess
+PostprocessConfig = _postprocess.PostprocessConfig
 _filter_locations_inside_organizations = _postprocess._filter_locations_inside_organizations
 _filter_mappings_inside_trusted_samples = _postprocess._filter_mappings_inside_trusted_samples
 _filter_noise_entity_mappings = _postprocess._filter_noise_entity_mappings
