@@ -40,6 +40,7 @@ from .location_utils import (
     location_suffix,
     mask_admin_cascade_path,
 )
+from .llm import is_noise_entity_text, is_noise_project_text, _is_valid_company_variant
 from .models import Candidate, MappingEntry
 from .org_masking import (
     CompanyMaskPlan,
@@ -245,7 +246,6 @@ class LinearRuleEngine:
         text: str,
         analysis: dict,
     ) -> list[Candidate]:
-        from .llm import is_noise_entity_text
 
         rejected = {
             value for value in analysis.get("reject", [])
@@ -286,7 +286,6 @@ class LinearRuleEngine:
         return reviewed
 
     def _llm_candidates(self, text: str, analysis: dict) -> list[Candidate]:
-        from .llm import is_noise_entity_text
 
         candidates: list[Candidate] = []
         windows = analysis.get("_sentence_windows", [])
@@ -333,14 +332,12 @@ class LinearRuleEngine:
         item: dict | None = None,
         window_by_id: dict[str, dict] | None = None,
     ) -> None:
-        from .llm import is_noise_entity_text
 
         if not isinstance(value, str) or len(value) < 2:
             return
         if is_noise_entity_text(value):
             return
         if entity_type == "organization":
-            from .llm import _is_valid_company_variant
 
             if not _is_valid_company_variant(value):
                 return
@@ -627,7 +624,6 @@ class LinearRuleEngine:
     def accept_project(self, candidate: Candidate) -> None:
         if not self.profile.redact_projects:
             return
-        from .llm import is_noise_project_text
 
         value = candidate.text.strip(" ：:，,。；;\n\t")
         if (

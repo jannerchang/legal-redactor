@@ -23,6 +23,7 @@ from .detectors import (
     _clean_person_name,
     _is_false_person
 )
+from .lexicon import GENERIC_BRAND_BLACKLIST as _GENERIC_BRAND_BLACKLIST_SET
 from .admin_division import AdminDivisionDetector
 from .china_admin_rules import detect_china_admin_rule_candidates
 from .hebei_admin import HebeiAdminDivisionDetector
@@ -48,13 +49,7 @@ _ORG_ALIAS_LONGER_COMPANY_RE = re.compile(
 
 
 # ── 行业与法律通用高频品牌词黑名单（防止超脱敏误伤普通词汇） ──
-GENERIC_BRAND_BLACKLIST = {
-    "开发", "建设", "工程", "集团", "贸易", "商贸", "物业", "投资", "科技",
-    "信息", "网络", "电子商务", "电子", "新材料", "服务", "咨询", "代理",
-    "管理", "资产", "金融", "工业", "农业", "商业", "联合", "发展", "实业",
-    "劳务", "建筑", "装饰", "物流", "运输", "环保", "能源", "置业", "产业",
-    "燃气", "水务", "热力", "供热", "供水", "排水", "电力", "交通", "运输"
-}
+GENERIC_BRAND_BLACKLIST = _GENERIC_BRAND_BLACKLIST_SET
 
 # 全国法院省份及兵团简称
 PROVINCE_ABBRS = [

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from .config import HIGH_RISK_TYPES
+from .lexicon import COMMON_SURNAMES, PROVINCE_NAMES
 from .models import Candidate
 
 
@@ -566,12 +567,7 @@ def _is_false_person(value: str) -> bool:
     # 排除包含常见助词、连词、语气代词等误匹配
     if any(p in value for p in ("的", "了", "在", "是", "去", "给", "有", "我", "你", "他", "们", "这", "那", "个", "对", "后", "做", "用")):
         return True
-    if value.startswith((
-        "北京", "天津", "河北", "山西", "内蒙古", "辽宁", "吉林", "黑龙江",
-        "上海", "江苏", "浙江", "安徽", "福建", "江西", "山东", "河南",
-        "湖北", "湖南", "广东", "广西", "海南", "重庆", "四川", "贵州",
-        "云南", "西藏", "陕西", "甘肃", "青海", "宁夏", "新疆",
-    )):
+    if any(value.startswith(prov) for prov in PROVINCE_NAMES):
         return True
     return False
 
@@ -584,21 +580,7 @@ def detect_fallback_person_candidates(text: str) -> list[Candidate]:
     candidates: list[Candidate] = []
     
     # 增加百家姓校验，如果匹配的词是以百家姓开头，可信度更高
-    common_surnames = frozenset(
-        "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜"
-        "戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳史唐"
-        "费薛雷贺倪汤罗毕郝安常于时傅齐康伍余元顾孟平黄和萧尹姚邵汪祁毛"
-        "狄米明计成戴谈宋庞熊纪舒屈项祝董梁杜阮蓝季强贾路娄危江童颜郭梅盛林"
-        "钟徐邱骆高夏蔡田樊胡凌霍万柯管卢莫经房裘干解应宗丁宣邓郁单洪包诸左"
-        "石崔吉龚程邢裴陆荣翁惠甄曲家封储松段富巫焦巴弓秋仲伊宁仇暴甘厉戎祖"
-        "武符刘景詹龙叶幸司黎薄白从赖卓屠池乔阴能苍双闻党谭贡劳姬申冉郦"
-        "桂牛寿通边燕浦尚农温庄晏柴瞿阎慕连茹习艾向古易戈廖终居衡步都耿满弘"
-        "国文寇广禄阙东欧利师巩聂勾融冷辛简饶空曾沙养鞠须丰巢关查后荆红游权"
-        "盖益公万俟司马上官欧阳夏侯诸葛闻人东方赫连皇甫尉迟公羊澹台公冶宗政"
-        "濮阳淳于单于太叔申屠公孙仲孙轩辕令狐钟离宇文长孙慕容鲜于闾丘司徒司空"
-        "端木巫马公西漆雕乐正拓跋夹谷谷梁晋楚闫法涂钦呼延羊舌岳帅有琴梁丘左丘"
-        "南宫"
-    )
+    common_surnames = COMMON_SURNAMES
 
     for pattern in _FALLBACK_PERSON_PATTERNS:
         for match in pattern.finditer(text):
@@ -759,6 +741,34 @@ def _core_has_action_verb_noise(core: str, action_verbs: tuple[str, ...]) -> boo
     return False
 
 
+# Module-level constants for _is_false_org (previously redefined on every call)
+_PURE_LEGAL_SUFFIXES = frozenset({
+    "有限责任公司", "股份有限公司", "集团有限公司", "有限公司", "公司", "集团", "幼儿园",
+})
+
+_ORG_ACTION_VERBS = (
+    "违反", "拒绝", "接受", "返还", "邮寄", "接管", "工作", "往返",
+    "报销", "成立", "设立", "注销", "变更", "起诉", "上诉", "答辩", "申诉",
+    "执行", "查封", "扣押", "冻结", "辞退", "解雇", "开除", "离职", "入职",
+    "购买", "销售", "生产", "加工", "制造", "维修", "安装", "运输", "承包",
+    "租赁", "出租", "派遣", "支付", "履行", "不服", "认为", "陈述", "答辩",
+    "进行", "支持", "协助", "配合", "加盖", "盖章", "签章", "签字",
+    "损害", "不接受", "交跟", "去跟", "发放", "归属", "使用",
+    "核对", "核实", "审查", "交给", "转给", "遵循", "通知", "依据", "根据",
+    "汇入", "聘用",
+)
+
+_ORG_FALSE_CORE_PREFIXES = frozenset({
+    "我", "你", "他", "本", "该", "贵", "此", "来我", "我去", "我区", "你区", "来",
+    "中国", "中华", "全国", "地方", "本地", "其实", "确实", "事实", "真实", "证实",
+    "落实", "实", "但是", "可是", "若是", "总是", "但", "并", "且", "及", "或", "已",
+    "曾", "即", "就", "也", "都", "而", "上", "下", "前", "后", "两", "两家", "三",
+    "三家", "双", "各", "各家", "某", "某家", "一", "用", "指", "往", "去", "来", "分",
+    "联", "劳动者", "单位", "两个", "二公司", "三公司", "多个", "几家", "见两个",
+    "两个公司", "三家公司", "外两家", "达等", "任何", "刺破", "代", "备选机构",
+    "机构", "股东用", "非", "说", "知", "解", "知天煜",
+})
+
 def _is_false_org(value: str) -> bool:
     """检查清理后的公司名是否为误识别（如"家具有限公司"、"有限责任公司"）。"""
     if re.fullmatch(r"合同[一二三四五六七八九十百零\d]+", value):
@@ -767,8 +777,7 @@ def _is_false_org(value: str) -> bool:
         return True
 
     # 纯法律后缀，无品牌
-    _pure_suffixes = {"有限责任公司", "股份有限公司", "集团有限公司", "有限公司", "公司", "集团", "幼儿园"}
-    if value in _pure_suffixes:
+    if value in _PURE_LEGAL_SUFFIXES:
         return True
     if "（" in value or "）" in value or "(" in value or ")" in value:
         if not re.fullmatch(r"[\u4e00-\u9fa5A-Za-z0-9·]+[（(][\u4e00-\u9fa5A-Za-z0-9·]{2,12}[）)][\u4e00-\u9fa5A-Za-z0-9·]*(?:有限责任公司|股份有限公司|集团有限公司|有限公司|公司|集团)", value):
@@ -778,28 +787,12 @@ def _is_false_org(value: str) -> bool:
     if any(noise in value for noise in ("合同", "证据", "佐证", "在卷", "协议", "诉讼", "裁判", "本案", "案涉", "原告", "被告", "第三人", "本院", "转账", "凭证", "案卷")):
         return True
 
-    # 常见的动作、动词、以及法律文书高频操作词（作为公司品牌时说明是误抓的动词短语）
-    _action_verbs = (
-        "违反", "拒绝", "接受", "返还", "邮寄", "接管", "工作", "往返", "邮寄", 
-        "报销", "成立", "设立", "注销", "变更", "起诉", "上诉", "答辩", "申诉", 
-        "执行", "查封", "扣押", "冻结", "辞退", "解雇", "开除", "离职", "入职",
-        "购买", "销售", "生产", "加工", "制造", "维修", "安装", "运输", "承包", 
-        "租赁", "出租", "派遣", "支付", "履行", "不服", "认为", "陈述", "答辩",
-        "进行", "支持", "协助", "配合", "加盖", "盖章", "签章", "签字",
-        "损害", "不接受", "返还", "交跟", "去跟", "发放", "归属", "使用",
-        "核对", "核实", "审查", "交给", "转给", "遵循", "通知", "依据", "根据",
-        "汇入", "聘用",
-    )
-    
     # 去掉法律后缀后，检查剩余部分
-    for sfx in sorted(_pure_suffixes, key=len, reverse=True):
+    for sfx in sorted(_PURE_LEGAL_SUFFIXES, key=len, reverse=True):
         if value.endswith(sfx) and len(value) > len(sfx):
             core = value[:-len(sfx)]
             # ── 过滤由常用代词、语气词或国家/通用指代代词构成的伪字号 ──
-            if core in ("我", "你", "他", "本", "该", "贵", "此", "来我", "我去", "我区", "你区", "来", "中国", "中华", "全国", "地方", "本地", "其实", "确实", "事实", "真实", "证实", "落实", "实", "但是", "可是", "若是", "总是", "但", "并", "且", "及", "或", "已", "曾", "即", "就", "也", "都", "而",
-                        "上", "下", "前", "后", "两", "两家", "三", "三家", "双", "各", "各家", "某", "某家", "一", "用", "指", "往", "去", "来", "分", "联", "劳动者", "单位",
-                        "两个", "三家", "二公司", "三公司", "多个", "几家", "见两个", "两个公司", "三家公司", "外两家", "达等",
-                        "任何", "刺破", "代", "备选机构", "机构", "股东用", "非", "说", "知", "解", "知天煜"):
+            if core in _ORG_FALSE_CORE_PREFIXES:
                 return True
             if len(core) < 2:
                 return True
@@ -812,7 +805,7 @@ def _is_false_org(value: str) -> bool:
             if core.endswith(("北京区", "中国北京区", "集团区")):
                 return True
             # ── 过滤包含法律诉讼/日常动作动词构成的动词短语公司（如 "严重违反公司" -> "严重违反"） ──
-            if _core_has_action_verb_noise(core, _action_verbs):
+            if _core_has_action_verb_noise(core, _ORG_ACTION_VERBS):
                 return True
             # 完全匹配常见非品牌词
             if core in _FALSE_ORG_BRANDS or core in _FALSE_ORG_EXACT_CORES:
@@ -821,14 +814,14 @@ def _is_false_org(value: str) -> bool:
             for fb in _FALSE_ORG_BRANDS:
                 if core.endswith(fb) and len(core) > len(fb):
                     prefix = core[: -len(fb)]
-                    if len(prefix) <= 2 or _core_has_action_verb_noise(prefix, _action_verbs):
+                    if len(prefix) <= 2 or _core_has_action_verb_noise(prefix, _ORG_ACTION_VERBS):
                         return True
             break
     else:
         # 如果不带公司/集团后缀，直接检查 core 级别的非地理/动作词
         if any(noise in value for noise in ("我", "你", "他", "本", "该", "贵", "此", "两", "两家", "各", "各家", "某", "一", "两个", "几家", "见两个")):
             return True
-        if _core_has_action_verb_noise(value, _action_verbs):
+        if _core_has_action_verb_noise(value, _ORG_ACTION_VERBS):
             return True
             
     return False
