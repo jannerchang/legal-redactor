@@ -863,7 +863,6 @@ class LegalEntityAuditor:
                 "_no_target_windows": True,
             }
 
-        import sys
 
         _logger.info(
             "整句语义识别：总计 %d 句，筛选 %d 句，%d 批，%d 路并发。",
