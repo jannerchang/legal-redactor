@@ -50,6 +50,15 @@ from .llm import is_noise_entity_text
 from .pipeline import RedactionPipeline, _filter_noise_entity_mappings
 from .restore import preview_restore, restore_docx
 from .status import build_status_payload, ensure_mlx_server_ready
+from .web_templates import (
+    MAPPING_REVIEW_CATEGORY_LABELS,
+    RESTORE_RISK_REASON_LABELS,
+    _page,
+    render_batch_redaction_result_page,
+    render_home_page,
+    render_redaction_result_page,
+    render_status_panel,
+)
 
 try:
     from fastapi import FastAPI, File, Form, Request, UploadFile
@@ -71,21 +80,6 @@ class DiscordApiError(RuntimeError):
     code = "discord_api_error"
 
 
-MAPPING_REVIEW_CATEGORY_LABELS = {
-    "low_confidence": "低置信",
-    "manual_added": "手工新增",
-    "modified": "已修改",
-    "delete_candidate": "删除候选",
-    "restore_risk": "还原风险",
-    "sample_reused": "样本复用",
-}
-
-RESTORE_RISK_REASON_LABELS = {
-    "delete_candidate": "删除候选会影响后续黑名单和还原复核",
-    "empty_mask": "替换为空，无法可靠还原",
-    "risky_delete_guard": "短中文人名未写入全局黑名单",
-    "lookup_guard": "未进入可复用样本映射",
-}
 
 SAMPLE_SUMMARY_KEYS = (
     "lookup_entries",
@@ -486,81 +480,9 @@ def index() -> str:
     sample_info = ""
     status_panel = _render_status_panel(_status_payload())
 
-    return _page(
-        "本地法律文书脱敏系统",
-        status_panel + sample_info + f"""
-        <section>
-          <h2>脱敏</h2>
-          <form id="redact-form" action="/redact" method="post" enctype="multipart/form-data">
-            <label>粘贴文本</label>
-            <textarea name="text" id="text-input" rows="12" placeholder="粘贴文书原文，或拖拽 txt/md/doc/docx/pdf 文件到此处"></textarea>
-            <label>或上传 txt / md / doc / docx / pdf（可多选）</label>
-            <input type="file" id="source-files" name="files" accept=".txt,.md,.doc,.docx,.pdf" multiple>
-            <label>或选择案件文件夹（推荐）</label>
-            <input type="file" id="source-directory-files" name="case_folder_files" accept=".txt,.md,.doc,.docx,.pdf" webkitdirectory directory multiple>
-            <input type="hidden" id="upload-relative-paths-input" name="upload_relative_paths" value="">
-            <div class="row">
-              <p class="hint">统一标准脱敏：人名、地名、机构名称及敏感编号按同一套规则处理。</p>
-              <input type="hidden" name="enable_llm" value="1">
-            </div>
-            <label style="display:flex; align-items:center; gap:8px; margin-top:12px; margin-bottom:12px; cursor:pointer;">
-              <input type="checkbox" name="enable_samples" value="1" checked style="width:auto; margin:0;">
-              <span>使用样本库（利用历史黑名单与正样本）</span>
-            </label>
-            <label>分析模型</label>
-            <p class="hint">固定使用 MLX Qwen3.5 9B 本地模型。</p>
-            <input type="hidden" name="llm_mode" value="max-effect">
-            <label style="display:flex; align-items:center; gap:8px; margin-top:12px; margin-bottom:12px; cursor:pointer;">
-              <input type="checkbox" name="enable_hanlp" value="1" {_hanlp_checked_attr()} style="width:auto; margin:0;">
-              <span>HanLP 本地候选识别（已安装时默认启用）</span>
-            </label>
-            <label>HanLP 模型（故障排查时再调整）</label>
-            <input type="text" name="hanlp_model" value="MSRA_NER_ELECTRA_SMALL_ZH" style="max-width:320px">
-            <label>已有映射表（保持替换一致性，选填，支持粘贴JSON或上传文件）</label>
-            <textarea name="base_map_json" rows="3" placeholder="粘贴已有映射表 JSON（可选）"></textarea>
-            <input type="file" name="base_map_file" accept=".json,.enc">
-            <fieldset>
-              <legend>案件工作流（选填）</legend>
-              <label>案件文件夹名</label>
-              <input type="text" id="case-folder-input" name="case_folder" placeholder="例如：2025 8765">
-              <label>Discord 帖子链接</label>
-              <input type="url" id="discord-thread-url-input" name="discord_thread_url" placeholder="可留空，脱敏完成后可请求 Hermes 新建并回写 Discord 链接">
-              <label>案件库根目录</label>
-              <input type="text" id="case-root-input" name="case_root" value="{html.escape(str(default_case_root()))}" data-auto-value="{html.escape(str(default_case_root()), quote=True)}">
-              <label>原文件所在目录</label>
-              <input type="text" id="upload-source-dir-input" name="upload_source_dir" value="" placeholder="可选：自动识别失败时粘贴完整案件目录">
-              <p class="hint">浏览器不会提供上传文件的本机绝对路径，所以系统会用文件名在案件库中反查目录。自动识别失败时，可在“原文件所在目录”粘贴完整目录。若未填写 Discord 链接，脱敏结果页可请求 Hermes 新建案件帖并通过 MCP 写回链接；映射表不会上传到 Discord。</p>
-            </fieldset>
-            <div class="redact-submit-row">
-              <button type="submit" class="btn" id="redact-submit-btn">一键脱敏</button>
-              <div id="redact-progress" class="redact-progress" hidden>
-                <div class="redact-progress-track" aria-hidden="true"><div class="redact-progress-fill"></div></div>
-                <span id="redact-progress-text" class="redact-progress-text">准备中…</span>
-                <span id="redact-elapsed" class="redact-elapsed">已用时 0:00</span>
-              </div>
-            </div>
-          </form>
-        </section>
-        <section>
-          <h2>还原</h2>
-          <form action="/restore/preview" method="post" enctype="multipart/form-data">
-            <label>粘贴脱敏后的文本</label>
-            <textarea name="text" rows="6" placeholder="粘贴脱敏后的文书"></textarea>
-            <label>或上传脱敏文本 / Word</label>
-            <input type="file" name="file" accept=".txt,.md,.docx">
-            <label style="display:flex; align-items:center; gap:8px; margin-top:12px; margin-bottom:12px; cursor:pointer;">
-              <input type="checkbox" name="restore_docx_format" value="1" checked style="width:auto; margin:0;">
-              <span>如果上传的是 Word，输出保留格式的 .docx</span>
-            </label>
-            <label>粘贴或上传映射表（支持加密文件）</label>
-            <textarea name="map_json" rows="4" placeholder="粘贴 redaction_map.json"></textarea>
-            <input type="file" name="map_file" accept=".json,.enc">
-            <p class="hint">映射表中的全部条目将一次性还原。</p>
-            <button type="submit" class="btn btn-secondary">全部还原</button>
-          </form>
-        </section>
-        """,
-    )
+    hanlp_attr = _hanlp_checked_attr()
+    default_root_str = str(default_case_root())
+    return render_home_page(status_panel, sample_info, hanlp_attr, default_root_str)
 
 def _hanlp_checked_attr() -> str:
     # LLM 主路径下 HanLP 为可选增强；默认不勾选，避免与 MLX 同时占满内存导致进程被系统杀掉。
@@ -571,38 +493,8 @@ def _status_payload() -> dict:
     return build_status_payload(mlx_timeout=0.4)
 
 
-def _render_status_panel(payload: dict) -> str:
-    components = payload.get("components", [])
-    rows = []
-    for item in components:
-        state = str(item.get("state", "missing"))
-        rows.append(
-            '<div class="status-item">'
-            f'<span class="status-pill status-{html.escape(state)}">{html.escape(_status_label(state))}</span>'
-            f'<strong>{html.escape(str(item.get("label", "")))}</strong>'
-            f'<span>{html.escape(str(item.get("message", "")))}</span>'
-            f'<small>{html.escape(str(item.get("action", "")))}</small>'
-            '</div>'
-        )
-    return f"""
-        <section class="status-panel" aria-label="系统状态">
-          <div class="status-head">
-            <h2>系统状态</h2>
-            <a href="/api/status" data-no-intercept="true">JSON</a>
-          </div>
-          <div class="status-grid">{''.join(rows)}</div>
-        </section>
-        """
+_render_status_panel = render_status_panel
 
-
-def _status_label(state: str) -> str:
-    return {
-        "ready": "就绪",
-        "degraded": "降级",
-        "missing": "缺失",
-        "error": "错误",
-        "skipped": "跳过",
-    }.get(state, state)
 
 
 def _is_default_case_root_value(value: str) -> bool:
@@ -2099,101 +1991,39 @@ def _render_redaction_result(
             c.confidence, html.escape(c.reason or ""))
         for c in review_candidates
     )
-    return _page(
-        title,
-        f"""
-        <nav><a href="/">返回首页</a></nav>
-        <div class="downloads">
-          <a download="{html.escape(redacted_filename)}" href="{redacted_url}" class="btn">下载脱敏文本</a>
-          <a download="redaction_map.json" href="{map_url}" class="btn btn-secondary" onclick="prepareCurrentMapDownload(this)">下载 redaction_map</a>
-          <a download="debug_trace.json" href="{debug_url}" class="btn btn-secondary">下载 debug_trace</a>
-          <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制脱敏文本</button>
-        </div>
-
-        {workflow_panel}
-        
-        <section class="local-save-section" style="border-left: 4px solid var(--accent); background: linear-gradient(135deg, var(--surface) 0%, rgba(26, 122, 109, 0.02) 100%); padding: 18px 24px; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 18px; box-shadow: var(--shadow);">
-          <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 15px;">
-            <div style="flex: 1; min-width: 280px;">
-              <h3 style="margin: 0 0 6px 0; font-size: 14px; font-weight: 600; color: var(--ink); display: flex; align-items: center; gap: 6px;">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" class="feather feather-folder"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
-                本地直接保存 <span class="hint" style="font-weight: normal; font-size: 11px; margin-left: 4px;">(保存至本地任意文件夹)</span>
-              </h3>
-              <div style="display: flex; gap: 8px; align-items: center; margin-top: 8px;">
-                <span class="hint" style="white-space: nowrap; font-weight: 500;">保存路径:</span>
-                <input type="text" id="local-save-dir" value="{html.escape(default_dir)}" style="flex: 1; min-width: 200px; padding: 6px 10px; border-radius: 6px; font-family: monospace; font-size: 13px;" placeholder="例如: ~/Desktop">
-              </div>
-            </div>
-            <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px;">
-              <button type="button" class="btn btn-sm" onclick="saveToLocalPath([{{filename: {html.escape(redacted_filename_json)}, content: document.getElementById('redacted-output').value}}], this)">保存脱敏文本</button>
-              <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'redaction_map.json', content: readCurrentMappingJson()}}], this)">保存映射表</button>
-              <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'debug_trace.json', content: document.getElementById('debug-trace-output').value}}], this)">保存调试追踪</button>
-              <button type="button" class="btn btn-sm" style="background: #e18c12; border-color: #e18c12; color: #fff;" onclick="if(ensureAppliedMappingForText())saveToLocalPath([{{filename: {html.escape(redacted_filename_json)}, content: document.getElementById('redacted-output').value}}, {{filename: 'redaction_map.json', content: readCurrentMappingJson()}}], this)">一键保存全部</button>
-            </div>
-          </div>
-          <script>
-            (function(){{
-              var savedDir = localStorage.getItem('last_local_save_dir');
-              var hasPreferredDir = {json.dumps(bool(save_dir.strip()))};
-              if (savedDir && !hasPreferredDir) {{
-                var inp = document.getElementById('local-save-dir');
-                if (inp) inp.value = savedDir;
-              }}
-            }})();
-          </script>
-        </section>
-
-        {discord_create_section}
-        {discord_section}
-        
-        {f'<section class="warning"><h2>高危泄漏</h2><ul>{leaks_html}</ul></section>' if leaks_html else ''}
-        {f'<section class="notice"><h2>运行提示</h2><ul>{warnings_html}</ul></section>' if warnings_html else ''}
-        <section class="grid">
-          <div>
-            <h2>原文预览 <span class="hint">（高亮部分 = 已替换）</span></h2>
-            <div class="highlight-box original-highlight selection-add-source">{_highlight_replaced_text(original_text, redaction_map.mappings)}</div>
-          </div>
-          <div>
-            <h2>脱敏文</h2>
-            <textarea id="redacted-output" class="hidden-raw">{html.escape(redacted_text)}</textarea>
-            <div class="highlight-box redacted-highlight">{_highlight_replaced_text(redacted_text, redaction_map.mappings, reverse=True)}</div>
-          </div>
-        </section>
-        <section>
-          <h2>确认将替换的具体文字</h2>
-          <p class="hint">修改表格中的原文或替换词后点「应用表格修改」即可重新脱敏。</p>
-          {mapping_review_toolbar}
-          {sample_summary_panel}
-          <form id="mapping-edit-form" action="/redact/apply-edited-map" method="post">
-            <textarea name="original_text" class="hidden-raw">{html.escape(original_text)}</textarea>
-            <textarea name="original_bundle_json" class="hidden-raw"></textarea>
-            <textarea id="mapping-json-output" name="original_mapping_json" class="hidden-raw">{html.escape(map_json)}</textarea>
-            <textarea id="mapping-review-candidates" class="hidden-raw">{html.escape(review_candidate_texts_json)}</textarea>
-            <textarea id="debug-trace-output" class="hidden-raw">{html.escape(debug_json)}</textarea>
-            <input type="hidden" name="save_dir" value="{html.escape(save_dir)}">
-            <input type="hidden" name="discord_thread_url" value="{html.escape(discord_thread_url)}">
-            <input type="hidden" name="case_root" value="{html.escape(case_root)}">
-            <input type="hidden" name="case_folder" value="{html.escape(case_folder)}">
-            <input type="hidden" name="source_dir" value="{html.escape(source_dir or save_dir)}">
-            <input type="hidden" name="map_version" value="{html.escape(redaction_map.version)}">
-            <input type="hidden" name="map_created_at" value="{html.escape(redaction_map.created_at)}">
-            <input type="hidden" name="map_mode" value="{html.escape(redaction_map.mode)}">
-            <input type="hidden" name="map_source_file" value="{html.escape(redaction_map.source_file or '')}">
-            <table>
-              <thead><tr><th>类型</th><th>原文（精确匹配）</th><th>替换为</th><th>修改理由</th><th>来源</th><th>置信度</th><th>操作</th></tr></thead>
-              <tbody>{_render_mapping_edit_rows(redaction_map, review_candidates)}</tbody>
-            </table>
-            <button type="button" class="btn btn-secondary btn-sm" onclick="addBlankRow(this)" style="margin-bottom:12px">＋ 新增一行</button>
-            <label style="display:flex; align-items:center; gap:8px; margin:0 0 12px 0; cursor:pointer;">
-              <input type="checkbox" name="remap_placeholders" value="1" style="width:auto; margin:0;">
-              <span>应用时按当前映射重新排列占位符</span>
-            </label>
-            <button type="submit" class="btn">应用表格修改/删除</button>
-            <button type="submit" formaction="/redact/save-sample" formtarget="save-iframe" class="btn btn-secondary" style="margin-left:8px;">保存为样本</button>
-          </form>
-        </section>
-        {'<section><h2>需人工复核</h2><table><thead><tr><th>类型</th><th>文本</th><th>来源</th><th>置信度</th><th>原因</th></tr></thead><tbody>' + review_html + '</tbody></table></section>' if review_html else ''}
-        """,
+    original_highlight = _highlight_replaced_text(original_text, redaction_map.mappings)
+    redacted_highlight = _highlight_replaced_text(redacted_text, redaction_map.mappings, reverse=True)
+    mapping_edit_rows = _render_mapping_edit_rows(redaction_map, review_candidates)
+    return render_redaction_result_page(
+        title=title,
+        redacted_filename=redacted_filename,
+        redacted_url=redacted_url,
+        map_url=map_url,
+        debug_url=debug_url,
+        workflow_panel=workflow_panel,
+        default_dir=default_dir,
+        redacted_filename_json=redacted_filename_json,
+        save_dir=save_dir,
+        discord_create_section=discord_create_section,
+        discord_section=discord_section,
+        leaks_html=leaks_html,
+        warnings_html=warnings_html,
+        original_highlight=original_highlight,
+        redacted_text=redacted_text,
+        redacted_highlight=redacted_highlight,
+        mapping_review_toolbar=mapping_review_toolbar,
+        sample_summary_panel=sample_summary_panel,
+        original_text=original_text,
+        map_json=map_json,
+        review_candidate_texts_json=review_candidate_texts_json,
+        debug_json=debug_json,
+        discord_thread_url=discord_thread_url,
+        case_root=case_root,
+        case_folder=case_folder,
+        source_dir=source_dir,
+        redaction_map=redaction_map,
+        mapping_edit_rows=mapping_edit_rows,
+        review_html=review_html,
     )
 
 
@@ -2277,92 +2107,36 @@ def _render_batch_redaction_result(
         f'</article>'
         for d in documents
     )
-    return _page(
-        title,
-        f"""
-        <nav><a href="/">返回首页</a></nav>
-        <div class="downloads">
-          <a download="{combined_filename}" href="{redacted_url}" class="btn">下载合并脱敏文本</a>
-          <a download="redaction_map.json" href="{map_url}" class="btn btn-secondary" onclick="prepareCurrentMapDownload(this)">下载统一映射表</a>
-          <a download="debug_trace.json" href="{debug_url}" class="btn btn-secondary">下载 debug_trace</a>
-          <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制合并文本</button>
-        </div>
-        
-        <textarea id="redacted-output" class="hidden-raw">{html.escape(combined_redacted)}</textarea>
-
-        {workflow_panel}
-        
-        <section class="local-save-section" style="border-left: 4px solid var(--accent); background: linear-gradient(135deg, var(--surface) 0%, rgba(26, 122, 109, 0.02) 100%); padding: 18px 24px; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 18px; box-shadow: var(--shadow);">
-          <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 15px;">
-            <div style="flex: 1; min-width: 280px;">
-              <h3 style="margin: 0 0 6px 0; font-size: 14px; font-weight: 600; color: var(--ink); display: flex; align-items: center; gap: 6px;">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" class="feather feather-folder"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
-                本地直接保存 <span class="hint" style="font-weight: normal; font-size: 11px; margin-left: 4px;">(保存至本地任意文件夹)</span>
-              </h3>
-              <div style="display: flex; gap: 8px; align-items: center; margin-top: 8px;">
-                <span class="hint" style="white-space: nowrap; font-weight: 500;">保存路径:</span>
-                <input type="text" id="local-save-dir" value="{html.escape(default_dir)}" style="flex: 1; min-width: 200px; padding: 6px 10px; border-radius: 6px; font-family: monospace; font-size: 13px;" placeholder="例如: ~/Desktop">
-              </div>
-            </div>
-            <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px;">
-              <button type="button" class="btn btn-sm" onclick="saveToLocalPath([{{filename: {html.escape(combined_filename_json)}, content: document.getElementById('redacted-output').value}}], this)">保存合并文本</button>
-              <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'redaction_map.json', content: readCurrentMappingJson()}}], this)">保存统一映射表</button>
-              <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'debug_trace.json', content: document.getElementById('debug-trace-output').value}}], this)">保存调试追踪</button>
-              <button type="button" class="btn btn-sm" style="background: #e18c12; border-color: #e18c12; color: #fff;" onclick="if(ensureAppliedMappingForText())saveToLocalPath([{{filename: {html.escape(combined_filename_json)}, content: document.getElementById('redacted-output').value}}, {{filename: 'redaction_map.json', content: readCurrentMappingJson()}}].concat(_individualRedactedFiles), this)">一键保存全部</button>
-            </div>
-          </div>
-          <script>
-            var _individualRedactedFiles = {individual_files_json};
-            (function(){{
-              var savedDir = localStorage.getItem('last_local_save_dir');
-              var hasPreferredDir = {json.dumps(bool(save_dir.strip()))};
-              if (savedDir && !hasPreferredDir) {{
-                var inp = document.getElementById('local-save-dir');
-                if (inp) inp.value = savedDir;
-              }}
-            }})();
-          </script>
-        </section>
-
-        {discord_create_section}
-        {discord_section}
-        
-        {f'<section class="warning"><h2>高危泄漏</h2><ul>{leaks_html}</ul></section>' if leaks_html else ''}
-        {f'<section class="notice"><h2>运行提示</h2><ul>{warnings_html}</ul></section>' if warnings_html else ''}
-        <section><h2>分文件结果</h2>{doc_sections}</section>
-        <section>
-          <h2>确认将替换的具体文字</h2>
-          {mapping_review_toolbar}
-          {sample_summary_panel}
-          <form id="mapping-edit-form" action="/redact/apply-edited-map" method="post">
-            <textarea name="original_text" class="hidden-raw"></textarea>
-            <textarea name="original_bundle_json" class="hidden-raw">{html.escape(bundle_json)}</textarea>
-            <textarea id="mapping-json-output" name="original_mapping_json" class="hidden-raw">{html.escape(map_json)}</textarea>
-            <textarea id="mapping-review-candidates" class="hidden-raw">{html.escape(review_candidate_texts_json)}</textarea>
-            <textarea id="debug-trace-output" class="hidden-raw">{html.escape(debug_json)}</textarea>
-            <input type="hidden" name="save_dir" value="{html.escape(save_dir)}">
-            <input type="hidden" name="discord_thread_url" value="{html.escape(discord_thread_url)}">
-            <input type="hidden" name="case_root" value="{html.escape(case_root)}">
-            <input type="hidden" name="case_folder" value="{html.escape(case_folder)}">
-            <input type="hidden" name="source_dir" value="{html.escape(source_dir or save_dir)}">
-            <input type="hidden" name="map_version" value="{html.escape(redaction_map.version)}">
-            <input type="hidden" name="map_created_at" value="{html.escape(redaction_map.created_at)}">
-            <input type="hidden" name="map_mode" value="{html.escape(redaction_map.mode)}">
-            <input type="hidden" name="map_source_file" value="{html.escape(redaction_map.source_file or '')}">
-            <table>
-              <thead><tr><th>类型</th><th>原文</th><th>替换为</th><th>修改理由</th><th>来源</th><th>置信度</th><th>操作</th></tr></thead>
-              <tbody>{_render_mapping_edit_rows(redaction_map, review_candidates)}</tbody>
-            </table>
-            <button type="button" class="btn btn-secondary btn-sm" onclick="addBlankRow(this)" style="margin-bottom:12px">＋ 新增一行</button>
-            <label style="display:flex; align-items:center; gap:8px; margin:0 0 12px 0; cursor:pointer;">
-              <input type="checkbox" name="remap_placeholders" value="1" style="width:auto; margin:0;">
-              <span>应用时按当前映射重新排列占位符</span>
-            </label>
-            <button type="submit" class="btn">应用表格修改/删除到全部文书</button>
-            <button type="submit" formaction="/redact/save-sample" formtarget="save-iframe" class="btn btn-secondary" style="margin-left:8px;">保存为样本</button>
-          </form>
-        </section>
-        """,
+    mapping_edit_rows = _render_mapping_edit_rows(redaction_map, review_candidates)
+    return render_batch_redaction_result_page(
+        title=title,
+        combined_filename=combined_filename,
+        redacted_url=redacted_url,
+        map_url=map_url,
+        debug_url=debug_url,
+        combined_redacted=combined_redacted,
+        workflow_panel=workflow_panel,
+        default_dir=default_dir,
+        combined_filename_json=combined_filename_json,
+        save_dir=save_dir,
+        individual_files_json=individual_files_json,
+        discord_create_section=discord_create_section,
+        discord_section=discord_section,
+        leaks_html=leaks_html,
+        warnings_html=warnings_html,
+        doc_sections=doc_sections,
+        mapping_review_toolbar=mapping_review_toolbar,
+        sample_summary_panel=sample_summary_panel,
+        bundle_json=bundle_json,
+        map_json=map_json,
+        review_candidate_texts_json=review_candidate_texts_json,
+        debug_json=debug_json,
+        discord_thread_url=discord_thread_url,
+        case_root=case_root,
+        case_folder=case_folder,
+        source_dir=source_dir,
+        redaction_map=redaction_map,
+        mapping_edit_rows=mapping_edit_rows,
     )
 
 
@@ -3619,4 +3393,3 @@ def _simple_mask(text: str, counters: TypeCounters) -> str:
     return f"敏感信息{counters.next('other')}"
 
 
-from .web_templates import _page
