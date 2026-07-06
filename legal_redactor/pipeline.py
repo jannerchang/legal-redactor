@@ -26,7 +26,11 @@ from .hebei_admin import HebeiAdminDivisionDetector
 from .linear_engine import LinearRuleEngine
 from .location_utils import get_location_core
 from .models import BatchRedactionResult, Candidate, Leak, MappingEntry, RedactedDocument, RedactionMap, RedactionResult
-from ._samples import load_trusted_sample_mappings
+from ._samples import load_all_samples, load_trusted_sample_mappings
+# load_all_samples is not called in this module, but tests patch
+# legal_redactor.pipeline.load_all_samples as a mock anchor
+# (tests/test_hebei_admin.py, tests/test_china_admin.py); keep the name
+# importable on this module so mock.patch can resolve it.
 
 
 _COMPANY_SUFFIXES_FOR_ALIAS_BOUNDARY = (
