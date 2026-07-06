@@ -10,7 +10,10 @@ from __future__ import annotations
 import base64
 import os
 import secrets
-import sys
+
+from ._logging import get_logger
+
+_logger = get_logger("crypto")
 from pathlib import Path
 
 _KEY_ENV = "LEGAL_REDACTOR_KEY"
@@ -40,10 +43,7 @@ def get_or_create_key() -> bytes:
     _KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
     _KEY_FILE.write_text(encoded, encoding="utf-8")
     os.chmod(_KEY_FILE, 0o600)
-    print(
-        f"[legal-redactor] 已生成加密密钥并保存到 {_KEY_FILE}",
-        file=sys.stderr,
-    )
+    _logger.info("已生成加密密钥并保存到 %s", _KEY_FILE)
     return new_key
 
 
