@@ -26,6 +26,7 @@ from .detectors import (
 from .admin_division import AdminDivisionDetector
 from .china_admin_rules import detect_china_admin_rule_candidates
 from .hebei_admin import HebeiAdminDivisionDetector
+from .linear_engine import LinearRuleEngine
 from .location_utils import get_location_core
 from .models import BatchRedactionResult, Candidate, Leak, MappingEntry, RedactedDocument, RedactionMap, RedactionResult
 from ._samples import load_all_samples, load_trusted_sample_mappings
@@ -1886,8 +1887,6 @@ class RedactionPipeline:
         prov_mapping: dict[str, str] | None = None,
         base_redaction_map: RedactionMap | None = None,
     ) -> RedactionResult:
-        from .linear_engine import LinearRuleEngine
-
         profile = self._profile
         warnings: list[str] = []
         counters = TypeCounters()

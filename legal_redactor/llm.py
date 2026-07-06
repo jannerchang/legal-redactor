@@ -46,7 +46,8 @@ _MAX_EFFECT_TARGET_WINDOWS = 48
 _BALANCED_TARGET_WINDOWS = 24
 _SENTENCE_FEW_SHOT_EXAMPLES = 3
 _PARALLEL_BATCH_WORKERS = 1
-_BATCH_ATTEMPTS = 1
+_BATCH_ATTEMPTS = 3
+_BATCH_RETRY_BACKOFF_SECONDS = 1.0  # base backoff between retry attempts
 _SENTENCE_EXTRACTION_MAX_TOKENS = 1536
 _SENTENCE_EXTRACTION_MIN_TOKENS = 768
 _SENTENCE_EXTRACTION_BASE_TOKENS = 384
@@ -960,6 +961,12 @@ class LegalEntityAuditor:
             except Exception as exc:
                 payload = {"error": str(exc)}
                 if attempt + 1 < _BATCH_ATTEMPTS:
+                    backoff = _BATCH_RETRY_BACKOFF_SECONDS * (2 ** attempt)
+                    _logger.warning(
+                        "%s 调用失败（第 %d/%d 次），%.1fs 后重试：%s",
+                        label, attempt + 1, _BATCH_ATTEMPTS, backoff, exc,
+                    )
+                    time.sleep(backoff)
                     continue
                 break
             if not payload.get("error"):
