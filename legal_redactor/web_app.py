@@ -1668,15 +1668,15 @@ def _diagnose_sample_entry(entry: dict) -> str:
             matched_rules.append("LLM语义审计或规则兜底")
             
         rules_str = "、".join(matched_rules)
-        return f"<span style='color:var(--danger);font-weight:500'>误匹配为实体</span>（触发「{rules_str}」）。<b>已加入黑名单，下次分析相同文本将自动豁免，不再误判！</b>"
+        return f"<span style='color:var(--danger);font-weight:500'>误匹配为实体</span>（触发「{html.escape(rules_str)}」）。<b>已加入黑名单，下次分析相同文本将自动豁免，不再误判！</b>"
 
     elif action == "modify":
         old_masked = entry.get("old_masked", "")
         new_masked = entry.get("new_masked", "")
-        return f"<span style='color:#e65100;font-weight:500'>修正脱敏掩码</span>（从「{old_masked}」修正为「{new_masked}」）。<b>已载入精准映射，下次直接以此格式脱敏该词。</b>"
+        return f"<span style='color:#e65100;font-weight:500'>修正脱敏掩码</span>（从「{html.escape(old_masked)}」修正为「{html.escape(new_masked)}」）。<b>已载入精准映射，下次直接以此格式脱敏该词。</b>"
 
     elif action == "add":
-        return f"<span style='color:#1565c0;font-weight:500'>手动新增实体</span>。<b>已载入精准映射，下次该词将直接脱敏为「{masked}」。</b>"
+        return f"<span style='color:#1565c0;font-weight:500'>手动新增实体</span>。<b>已载入精准映射，下次该词将直接脱敏为「{html.escape(masked)}」。</b>"
 
     elif action == "keep":
         return f"<span style='color:#2e7d32;font-weight:500'>确认无误（保留）</span>。<b>已记录，下次将直接命中并直接脱敏。</b>"
