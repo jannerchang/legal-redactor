@@ -13,11 +13,8 @@ from .detectors import (
     detect_heuristic_ner_candidates,
     detect_fallback_person_candidates,
     remove_court_signatures,
-    default_restore,
-    _clean_org_simple,
     _is_false_org,
     _clean_organization_text,
-    _FALSE_PERSON_WORDS,
     _clean_unbalanced_brackets,
     _clean_location_text,
     _clean_person_name,
@@ -30,7 +27,7 @@ from .hebei_admin import HebeiAdminDivisionDetector
 from .linear_engine import LinearRuleEngine
 from .location_utils import get_location_core
 from .models import BatchRedactionResult, Candidate, Leak, MappingEntry, RedactedDocument, RedactionMap, RedactionResult
-from ._samples import load_all_samples, load_trusted_sample_mappings
+from ._samples import load_trusted_sample_mappings
 
 
 _COMPANY_SUFFIXES_FOR_ALIAS_BOUNDARY = (
