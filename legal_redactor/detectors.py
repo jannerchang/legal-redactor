@@ -11,8 +11,10 @@ from .lexicon import (
     FALSE_ORG_BRANDS,
     FALSE_ORG_EXACT_CORES,
     FALSE_PERSON_WORDS,
+    FALLBACK_PERSON_PATTERNS,
     INDUSTRY_CORE_SUFFIXES,
     LEGAL_SUFFIXES,
+    PERSON_AFTER_KINSHIP_RE,
     PROVINCE_NAMES,
 )
 from .models import Candidate
@@ -131,11 +133,8 @@ ADDRESS_BODY_RE = re.compile(
     r"[\u4e00-\u9fa5A-Za-z0-9号幢栋单元室楼层路街弄巷村社区区县镇乡\-]{6,70}"
 )
 PERSON_AFTER_ROLE_RE = re.compile(r"(?:证人|联系人|经办人|代理人|法定代表人|负责人|经营者)[：:]?\s*([\u4e00-\u9fa5]{2,4})")
-PERSON_AFTER_KINSHIP_RE = re.compile(
-    r"(?:及其|与其|和其|其|的)"
-    r"(?:儿子|儿|子|女儿|女|父亲|父|母亲|母|妻子|妻|丈夫|夫|配偶|兄弟|哥哥|弟弟|姐姐|妹妹)"
-    r"([\u4e00-\u9fa5]{2,4}?)(?=之间|间|，|,|。|；|;|、|和|与|及|$)"
-)
+# PERSON_AFTER_KINSHIP_RE relocated to lexicon (re-exported here via import);
+# see lexicon.PERSON_AFTER_KINSHIP_RE.
 
 TITLE_ENTITY_RE = re.compile(
     r"^(?P<a>[\u4e00-\u9fa5A-Za-z0-9（）()·]{2,40}?)"
@@ -469,22 +468,7 @@ def detect_title_candidates(text: str) -> list[Candidate]:
 # ── 兜底人名检测（不依赖当事人段格式） ──────────────────────────
 
 # 中文法律文书中常见的人名模式
-_FALLBACK_PERSON_PATTERNS = [
-    # "，XXX，男/女" 或 "，XXX，汉族"
-    re.compile(r"[，,]\s*([一-龥]{2,4})\s*[，,]\s*(?:男|女|汉族)"),
-    # 句号/换行后的人名动作
-    re.compile(r"(?:^|[。\n])\s*(?:原告|被告|第三人|上诉人|被上诉人|申请人|被申请人)?\s*([一-龥]{2,4})\s*(?:答辩称|辩称|诉称|申请称|复议称|向本院|补充)"),
-    # 名字+的+特定角色或动作主张
-    re.compile(r"(?:^|[，。；\n、])\s*([一-龥]{2,4})的(?:委托|法定|诉讼|代理|主张|请求|意见|陈述|辩称|诉称|要求|签字|签章|签名)"),
-    # 角色标签后的明确冒号人名
-    re.compile(r"(?:证人|联系人|经办人|代理人|法定代表人|负责人|经营者|执行人|收件人)[：:]\s*([一-龥]{2,4})(?=[，。；\n、]|$)"),
-    # 常用关系/介词引导人名（对单字介词限制前导字符，防止误匹配“涉及”、“合同”等，并移除了纯连接词“及”）
-    re.compile(r"(?:(?:听取|询问|传唤|通知|告知|召集|委托|交由|伙同|连同|会同)|(?<!涉|以|波|触|及|共|合|不|陪|相|针|面|敌|交|送|分|留|付|参|赠|施|总|温)(?:由|向|与|和|同|对|给|致))\s*([一-龥]{2,3})(?=[，。；\n、\s一-龥])"),
-    # 句中名字起句与动作
-    re.compile(r"(?:^|[，。；\n、\s])\s*([一-龥]{2,3})\s*(?:于|在|已|将|以|向|与|提交|提供|出具|收到|签收|签署|签字|支付|偿还|欠|借|称|说|表示|辩称|要求|主张|确认|拒绝|不服|同意|补办|说明|转账|汇款|下载|发送|立案|驳回)"),
-    # 亲属关系
-    PERSON_AFTER_KINSHIP_RE,
-]
+_FALLBACK_PERSON_PATTERNS = FALLBACK_PERSON_PATTERNS
 # 不应识别的常见词
 # Relocated to lexicon.FALSE_PERSON_WORDS; alias kept for backward-compatible
 # imports (pipeline.py, tests/test_sample_integration.py).
@@ -496,7 +480,7 @@ def _clean_person_name(value: str) -> str:
     value = value.strip(" ：:，,。；;\n\t（）()")
     value = _clean_unbalanced_brackets(value)
     # 剥离末尾可能被误匹配进去的助词、连词、介词或动作词
-    while len(value) >= 2 and value[-1] in "及辩诉称和与等某已在于男女将被原吗呢吧啊呀":
+    while len(value) >= 2 and value[-1] in "及辩诉称和与等已在于男女将被原吗呢吧啊呀":
         value = value[:-1]
     return value.strip()
 
