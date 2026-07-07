@@ -9,8 +9,13 @@ from dataclasses import dataclass
 from json import JSONDecodeError
 from typing import Any
 
+from ._logging import get_logger
 from .config import LocalLLMConfig
 
+
+
+
+_logger = get_logger("llm")
 
 def get_context_paragraphs(text: str, max_chars: int = 8000) -> str:
     """通过段落/行对齐提取上下文，防止中途断句、断词，自适应处理 OCR 换行。"""
@@ -41,7 +46,8 @@ _MAX_EFFECT_TARGET_WINDOWS = 48
 _BALANCED_TARGET_WINDOWS = 24
 _SENTENCE_FEW_SHOT_EXAMPLES = 3
 _PARALLEL_BATCH_WORKERS = 1
-_BATCH_ATTEMPTS = 1
+_BATCH_ATTEMPTS = 3
+_BATCH_RETRY_BACKOFF_SECONDS = 1.0  # base backoff between retry attempts
 _SENTENCE_EXTRACTION_MAX_TOKENS = 1536
 _SENTENCE_EXTRACTION_MIN_TOKENS = 768
 _SENTENCE_EXTRACTION_BASE_TOKENS = 384
@@ -820,8 +826,7 @@ class LegalEntityAuditor:
             payload = self._call_local_model(prompt)
             return self._normalize_candidate_review_payload(payload, candidates)
         except Exception as exc:
-            import sys
-            print(f"\n[legal-redactor] 语义审计与验证联合调用失败：{exc}", file=sys.stderr)
+            _logger.warning("语义审计与验证联合调用失败：%s", exc)
             # 联合调用失败时，返回空提取，并采用 fail-open（空拒绝列表）以保留所有规则候选
             return {"locations": [], "companies": [], "persons": [], "reject": [], "error": str(exc)}
 
@@ -858,13 +863,11 @@ class LegalEntityAuditor:
                 "_no_target_windows": True,
             }
 
-        import sys
 
-        print(
-            f"\n[legal-redactor] 整句语义识别：总计 {len(all_windows)} 句，"
-            f"筛选 {len(windows)} 句，{len(batches)} 批，"
-            f"{min(_PARALLEL_BATCH_WORKERS, len(batches))} 路并发。",
-            file=sys.stderr,
+        _logger.info(
+            "整句语义识别：总计 %d 句，筛选 %d 句，%d 批，%d 路并发。",
+            len(all_windows), len(windows), len(batches),
+            min(_PARALLEL_BATCH_WORKERS, len(batches)),
         )
         merged, batch_count, batch_failures = self._extract_sentence_batches(
             batches,
@@ -873,11 +876,11 @@ class LegalEntityAuditor:
 
         if batch_count == 0:
             detail = "; ".join(batch_failures) or "no batches succeeded"
-            print(f"\n[legal-redactor] 整句语义识别全部批次失败：{detail}", file=sys.stderr)
+            _logger.warning("整句语义识别全部批次失败：%s", detail)
             return {**empty, "error": detail}
         if batch_failures:
             detail = "; ".join(batch_failures)
-            print(f"\n[legal-redactor] 整句语义识别存在失败批次，已保留成功批次结果：{detail}", file=sys.stderr)
+            _logger.warning("整句语义识别存在失败批次，已保留成功批次结果：%s", detail)
             merged["_batch_failures"] = batch_failures
 
         merged["_sentence_windows"] = windows
@@ -942,8 +945,6 @@ class LegalEntityAuditor:
         enable_samples: bool,
         label: str,
     ) -> tuple[dict[str, Any] | None, list[str]]:
-        import sys
-
         failures: list[str] = []
         prompt = self._build_sentence_extraction_prompt(batch, enable_samples=enable_samples)
         max_tokens = _sentence_extraction_max_tokens(len(batch))
@@ -958,24 +959,28 @@ class LegalEntityAuditor:
             except Exception as exc:
                 payload = {"error": str(exc)}
                 if attempt + 1 < _BATCH_ATTEMPTS:
+                    backoff = _BATCH_RETRY_BACKOFF_SECONDS * (2 ** attempt)
+                    _logger.warning(
+                        "%s 调用失败（第 %d/%d 次），%.1fs 后重试：%s",
+                        label, attempt + 1, _BATCH_ATTEMPTS, backoff, exc,
+                    )
+                    time.sleep(backoff)
                     continue
                 break
             if not payload.get("error"):
                 elapsed = time.monotonic() - started_at
-                print(
-                    f"\n[legal-redactor] {label} 完成：{len(batch)} 句，"
-                    f"max_tokens={max_tokens}，用时 {elapsed:.1f}s。",
-                    file=sys.stderr,
+                _logger.info(
+                    "%s 完成：%d 句，max_tokens=%d，用时 %.1fs。",
+                    label, len(batch), max_tokens, elapsed,
                 )
                 return payload, failures
             if attempt + 1 < _BATCH_ATTEMPTS:
-                print(f"\n[legal-redactor] {label} JSON 解析失败，重试中…", file=sys.stderr)
+                _logger.warning("%s JSON 解析失败，重试中…", label)
         if not payload.get("error"):
             return payload, failures
         failures.append(f"{label}: {payload.get('error', 'unknown error')}")
-        print(
-            f"\n[legal-redactor] {label} JSON 解析失败，跳过该批次：{payload.get('error')}",
-            file=sys.stderr,
+        _logger.warning(
+            "%s JSON 解析失败，跳过该批次：%s", label, payload.get("error"),
         )
         return None, failures
 

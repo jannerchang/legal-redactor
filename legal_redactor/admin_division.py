@@ -33,6 +33,57 @@ class AdminTerm:
     source: str
 
 
+
+
+class _TrieNode:
+    """Minimal trie node for multi-pattern matching of admin division terms."""
+
+    __slots__ = ("children", "term_key")
+
+    def __init__(self) -> None:
+        self.children: dict[str, _TrieNode] = {}
+        self.term_key: str | None = None
+
+
+def _build_trie(terms: list[AdminTerm]) -> _TrieNode | None:
+    """Build a character trie from all term texts. Returns root or None if empty."""
+    root = _TrieNode()
+    has_entries = False
+    for term in terms:
+        node = root
+        for char in term.text:
+            child = node.children.get(char)
+            if child is None:
+                child = _TrieNode()
+                node.children[char] = child
+            node = child
+        node.term_key = term.text
+        has_entries = True
+    return root if has_entries else None
+
+
+def _trie_find_all(text: str, root: _TrieNode) -> list[tuple[int, int, str]]:
+    """Scan *text* once through the trie, returning (start, end, term_key) for all matches.
+
+    Complexity is O(len(text) * max_term_length), compared to the previous
+    O(num_terms * len(text)) approach which called str.find per term.
+    """
+    matches: list[tuple[int, int, str]] = []
+    text_len = len(text)
+    for i in range(text_len):
+        node = root
+        j = i
+        while j < text_len:
+            char = text[j]
+            child = node.children.get(char)
+            if child is None:
+                break
+            node = child
+            j += 1
+            if node.term_key is not None:
+                matches.append((i, j, node.term_key))
+    return matches
+
 class AdminDivisionDetector:
     def __init__(
         self,
@@ -49,61 +100,73 @@ class AdminDivisionDetector:
         self.max_level = max_level
         self.require_canonical_substring = require_canonical_substring
         self._terms: list[AdminTerm] | None = None
+        self._trie_root: _TrieNode | None | bool = False  # False = not built yet
 
     def detect(self, text: str) -> list[Candidate]:
         terms = self._load_terms()
         if not terms:
             return []
 
+        root = self._get_trie()
+        if root is None:
+            return []
+
+        term_map: dict[str, AdminTerm] = {term.text: term for term in terms}
+
+        # Scan text once through the trie — O(len(text) * max_term_length)
+        raw_matches = _trie_find_all(text, root)
+        if not raw_matches:
+            return []
+
+        # Sort by (term_text length desc, confidence desc) to preserve
+        # the same processing order as the previous term-sorted loop.
+        raw_matches.sort(
+            key=lambda m: (-len(m[2]), -term_map[m[2]].confidence),
+        )
+
         candidates: list[Candidate] = []
         occupied: list[tuple[int, int, str]] = []
-        for term in terms:
-            start = 0
-            while True:
-                index = text.find(term.text, start)
-                if index < 0:
-                    break
-                end = index + len(term.text)
-                start = end
-                if any(
-                    used_start == index
-                    and end <= used_end
-                    and end < used_end
-                    and _level_rank(term.level) >= _level_rank(used_level)
-                    for used_start, used_end, used_level in occupied
-                ):
+        for index, end, term_key in raw_matches:
+            term = term_map[term_key]
+            if any(
+                used_start == index
+                and end <= used_end
+                and end < used_end
+                and _level_rank(term.level) >= _level_rank(used_level)
+                for used_start, used_end, used_level in occupied
+            ):
+                continue
+            if any(
+                not (end <= used_start or index >= used_end)
+                and not _can_overlap_admin_terms(term, used_level)
+                for used_start, used_end, used_level in occupied
+            ):
+                continue
+            if _is_short_local_name(term) and not _has_address_context(text, index, end):
+                continue
+            if self.require_canonical_substring and term.level in {"city", "county", "county_city"}:
+                if term.canonical_name not in text:
                     continue
-                if any(
-                    not (end <= used_start or index >= used_end)
-                    and not _can_overlap_admin_terms(term, used_level)
-                    for used_start, used_end, used_level in occupied
-                ):
-                    continue
-                if _is_short_local_name(term) and not _has_address_context(text, index, end):
-                    continue
-                if self.require_canonical_substring and term.level in {"city", "county", "county_city"}:
-                    if term.canonical_name not in text:
-                        continue
-                occupied.append((index, end, term.level))
-                candidates.append(
-                    Candidate(
-                        type=term.entity_type,
-                        text=term.text,
-                        start=index,
-                        end=end,
-                        source=self.source,
-                        confidence=term.confidence,
-                        risk_level="medium",
-                        auto_redact=True,
-                        reason=f"{self.region_label}地名库：{term.canonical_name}",
-                        metadata={
-                            "division_code": term.division_code,
-                            "level": term.level,
-                            "canonical_name": term.canonical_name,
-                            "context": text[max(0, index - 40) : min(len(text), end + 40)],
-                        },
-                    )
+            occupied.append((index, end, term.level))
+            candidates.append(
+                Candidate(
+                    type=term.entity_type,
+                    text=term.text,
+                    start=index,
+                    end=end,
+                    source=self.source,
+                    confidence=term.confidence,
+                    risk_level="medium",
+                    auto_redact=True,
+                    reason=f"{self.region_label}地名库：{term.canonical_name}",
+                    metadata={
+                        "division_code": term.division_code,
+                        "level": term.level,
+                        "canonical_name": term.canonical_name,
+                        "context": text[max(0, index - 40) : min(len(text), end + 40)],
+                    },
                 )
+            )
         return candidates
 
     def _load_terms(self) -> list[AdminTerm]:
@@ -191,6 +254,14 @@ class AdminDivisionDetector:
             reverse=True,
         )
         return self._terms
+
+    def _get_trie(self) -> _TrieNode | None:
+        """Return the cached trie built from loaded terms (built once, reused)."""
+        if self._trie_root is False:
+            terms = self._load_terms()
+            self._trie_root = _build_trie(terms) if terms else None
+        assert self._trie_root is not False
+        return self._trie_root if self._trie_root is not None else None
 
     def _add_term(
         self,

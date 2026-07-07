@@ -1630,3 +1630,69 @@ class WebAppUploadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── Security: XSS prevention in _diagnose_sample_entry ──────────────────
+
+class TestDiagnoseSampleEntryXSS:
+    """Ensure user-controlled sample values are HTML-escaped in diagnosis output."""
+
+    def test_delete_entry_does_not_leak_user_input(self):
+        from legal_redactor.web_app import _diagnose_sample_entry
+
+        # The 'original' field is only used for regex matching, not displayed.
+        # Verify no raw HTML from user input leaks into the output.
+        entry = {
+            "action": "delete",
+            "original": "<script>alert(1)</script>",
+            "masked": "",
+        }
+        result = _diagnose_sample_entry(entry)
+        assert "<script>" not in result
+        assert "alert(1)" not in result
+
+    def test_modify_entry_escapes_masked_values(self):
+        from legal_redactor.web_app import _diagnose_sample_entry
+
+        entry = {
+            "action": "modify",
+            "original": "test",
+            "old_masked": "<img src=x onerror=alert(1)>",
+            "new_masked": "<svg onload=alert(1)>",
+        }
+        result = _diagnose_sample_entry(entry)
+        assert "<img" not in result
+        assert "<svg" not in result
+        assert "&lt;img" in result
+        assert "&lt;svg" in result
+
+    def test_add_entry_escapes_masked_value(self):
+        from legal_redactor.web_app import _diagnose_sample_entry
+
+        entry = {
+            "action": "add",
+            "original": "safe_name",
+            "masked": "<body onload=alert(1)>",
+        }
+        result = _diagnose_sample_entry(entry)
+        assert "<body" not in result
+        assert "&lt;body" in result
+
+    def test_keep_entry_has_no_user_values(self):
+        from legal_redactor.web_app import _diagnose_sample_entry
+
+        entry = {"action": "keep"}
+        result = _diagnose_sample_entry(entry)
+        assert "确认无误" in result
+
+    def test_manual_reason_is_escaped(self):
+        from legal_redactor.web_app import _diagnose_sample_entry
+
+        entry = {
+            "action": "delete",
+            "original": "test",
+            "reason": "<iframe src=evil></iframe>",
+        }
+        result = _diagnose_sample_entry(entry)
+        assert "<iframe" not in result
+        assert "&lt;iframe" in result

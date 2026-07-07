@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 ADMIN_SUFFIXES = (
     "居民委员会",
     "村民委员会",
@@ -20,6 +22,14 @@ ADMIN_SUFFIXES = (
     "镇",
     "乡",
     "村",
+)
+
+_ADMIN_CASCADE_RE = re.compile(
+    r"^(?:(?P<prov>[\u4e00-\u9fa5]+?(?:省|自治区|特别行政区)))?"
+    r"(?:(?P<city>[\u4e00-\u9fa5]+?(?:市|自治州|地区|盟)))?"
+    r"(?:(?P<county>[\u4e00-\u9fa5]+?(?:(?<!社)区|县|旗|市)))?"
+    r"(?:(?P<town>[\u4e00-\u9fa5]+?(?:街道|镇|乡)))?"
+    r"(?:(?P<village>[\u4e00-\u9fa5]+?(?:居民委员会|居委会|村民委员会|村委会|社区|村)))?$"
 )
 
 
@@ -70,14 +80,7 @@ def strip_leading_locations(value: str, known_locations: dict[str, str]) -> tupl
 
 def mask_admin_cascade_path(text: str, get_loc_prefix) -> str:
     """Cascade-mask a single administrative path from province down to village."""
-    pattern = __import__("re").compile(
-        r"^(?:(?P<prov>[\u4e00-\u9fa5]+?(?:省|自治区|特别行政区)))?"
-        r"(?:(?P<city>[\u4e00-\u9fa5]+?(?:市|自治州|地区|盟)))?"
-        r"(?:(?P<county>[\u4e00-\u9fa5]+?(?:(?<!社)区|县|旗|市)))?"
-        r"(?:(?P<town>[\u4e00-\u9fa5]+?(?:街道|镇|乡)))?"
-        r"(?:(?P<village>[\u4e00-\u9fa5]+?(?:居民委员会|居委会|村民委员会|村委会|社区|村)))?$"
-    )
-    match = pattern.match(text)
+    match = _ADMIN_CASCADE_RE.match(text)
     if not match:
         return text
     parts: list[str] = []

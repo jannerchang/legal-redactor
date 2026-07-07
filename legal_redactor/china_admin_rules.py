@@ -78,6 +78,16 @@ ADMIN_PATH_SEARCH_RE = re.compile(
     r"[\u4e00-\u9fa5]{2,12}(?:(?<!社)区|县|旗)"
 )
 
+# Pre-compiled patterns for detect_china_admin_rule_candidates
+_PROVINCE_FULL_PATTERNS = tuple(
+    (short, full, re.compile(re.escape(full)))
+    for short, full in PROVINCE_ENTRIES
+)
+_PROVINCE_SHORT_PATTERNS = tuple(
+    (short, full, re.compile(rf"(?<![\u4e00-\u9fa5]){re.escape(short)}(?![\u4e00-\u9fa5])"))
+    for short, full in PROVINCE_ENTRIES
+)
+
 FALSE_LOCATION_TERMS = frozenset(
     {
         "本院",
@@ -210,26 +220,24 @@ def detect_china_admin_rule_candidates(text: str) -> list[Candidate]:
             reason="全国三级行政区划路径规则",
         )
 
-    for short, full in PROVINCE_ENTRIES:
-        for name in (full,):
-            pattern = re.compile(re.escape(name))
-            for match in pattern.finditer(text):
-                index = match.start()
-                end = match.end()
-                if _looks_like_org_context(text, index, end):
-                    continue
-                _append_rule_candidates(
-                    candidates,
-                    seen_spans,
-                    text=text,
-                    fragment=name,
-                    start=index,
-                    end=end,
-                    parts={"prov": name},
-                    confidence=0.9,
-                    reason=f"全国省级行政区划：{full}",
-                )
-        short_pattern = re.compile(rf"(?<![\u4e00-\u9fa5]){re.escape(short)}(?![\u4e00-\u9fa5])")
+    for short, full, full_pattern in _PROVINCE_FULL_PATTERNS:
+        for match in full_pattern.finditer(text):
+            index = match.start()
+            end = match.end()
+            if _looks_like_org_context(text, index, end):
+                continue
+            _append_rule_candidates(
+                candidates,
+                seen_spans,
+                text=text,
+                fragment=full,
+                start=index,
+                end=end,
+                parts={"prov": full},
+                confidence=0.9,
+                reason=f"全国省级行政区划：{full}",
+            )
+    for short, full, short_pattern in _PROVINCE_SHORT_PATTERNS:
         for match in short_pattern.finditer(text):
             index = match.start()
             end = match.end()

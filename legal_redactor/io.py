@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+
+from ._logging import get_logger
+
+_logger = get_logger("io")
 from pathlib import Path
 
 from .models import RedactionMap
@@ -122,11 +126,7 @@ def save_redaction_map_auto(path: str | Path, redaction_map: RedactionMap) -> No
         get_or_create_key()
         save_redaction_map_encrypted(path, redaction_map)
     except Exception:
-        import sys
-
-        print(
-            "[legal-redactor] 警告：redaction_map 将明文保存。"
-            "设置环境变量 LEGAL_REDACTOR_KEY 以启用加密。",
-            file=sys.stderr,
+        _logger.warning(
+            "redaction_map 将明文保存。设置环境变量 LEGAL_REDACTOR_KEY 以启用加密。"
         )
         save_redaction_map(path, redaction_map)

@@ -1,4 +1,5 @@
 .venv/
+.DS_Store
 __pycache__/
 *.py[cod]
 *.log
@@ -28,6 +29,8 @@ tests/*
 !tests/test_runtime_benchmark.py
 !tests/test_linear_engine.py
 !tests/test_china_admin.py
+!tests/test_postprocess.py
+!tests/test_detector_registry.py
 test_new_rules.py
 scratch_test_samples.py
 .ff-state/
