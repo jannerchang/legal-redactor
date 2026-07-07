@@ -132,7 +132,7 @@ def _handle_jsonrpc(message: dict[str, Any]) -> dict[str, Any] | None:
             result = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "legal-redactor", "version": "0.1.0"},
+                "serverInfo": {"name": "legal-redactor", "version": "0.1.1"},
             }
         elif method == "notifications/initialized":
             return None
