@@ -610,4 +610,3 @@ def apply_postprocess(
     if config.include_alias_merge:
         mappings = _merge_organization_alias_mappings(mappings)
     return mappings
-

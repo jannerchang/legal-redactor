@@ -669,13 +669,13 @@ def _page(title: str, body: str) -> str:
           dirInput.focus();
           return;
         }}
-        
+
         if (buttonEl) {{
           buttonEl.disabled = true;
           var origText = buttonEl.textContent || buttonEl.innerText;
           buttonEl.textContent = '正在保存...';
         }}
-        
+
         try {{
           var resp = await fetch('/api/save-to-local', {{
             method: 'POST',
@@ -722,7 +722,7 @@ def _page(title: str, body: str) -> str:
             var href = target.getAttribute('href');
             var contentText = "";
             var mimeType = "text/plain";
-            
+
             if (href.indexOf('data:') === 0) {{
               var commaIdx = href.indexOf(',');
               if (commaIdx >= 0) {{
@@ -743,13 +743,13 @@ def _page(title: str, body: str) -> str:
                 return;
               }}
             }}
-            
+
             // 规范化 MIME 类型，防止带有 ;charset= 等参数触发浏览器原生异常
             var cleanMimeType = mimeType.split(';')[0].trim();
             if (cleanMimeType !== 'application/json' && cleanMimeType !== 'text/plain') {{
               cleanMimeType = filename.endsWith('.json') ? 'application/json' : 'text/plain';
             }}
-            
+
             try {{
               const options = {{
                 suggestedName: filename,
@@ -947,7 +947,7 @@ def render_redaction_result_page(
         </div>
 
         {workflow_panel}
-        
+
         <section class="local-save-section" style="border-left: 4px solid var(--accent); background: linear-gradient(135deg, var(--surface) 0%, rgba(26, 122, 109, 0.02) 100%); padding: 18px 24px; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 18px; box-shadow: var(--shadow);">
           <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 15px;">
             <div style="flex: 1; min-width: 280px;">
@@ -981,7 +981,7 @@ def render_redaction_result_page(
 
         {discord_create_section}
         {discord_section}
-        
+
         {f'<section class="warning"><h2>高危泄漏</h2><ul>{leaks_html}</ul></section>' if leaks_html else ''}
         {f'<section class="notice"><h2>运行提示</h2><ul>{warnings_html}</ul></section>' if warnings_html else ''}
         <section class="grid">
@@ -1073,11 +1073,11 @@ def render_batch_redaction_result_page(
           <a download="debug_trace.json" href="{debug_url}" class="btn btn-secondary">下载 debug_trace</a>
           <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制合并文本</button>
         </div>
-        
+
         <textarea id="redacted-output" class="hidden-raw">{html.escape(combined_redacted)}</textarea>
 
         {workflow_panel}
-        
+
         <section class="local-save-section" style="border-left: 4px solid var(--accent); background: linear-gradient(135deg, var(--surface) 0%, rgba(26, 122, 109, 0.02) 100%); padding: 18px 24px; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 18px; box-shadow: var(--shadow);">
           <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 15px;">
             <div style="flex: 1; min-width: 280px;">
@@ -1112,7 +1112,7 @@ def render_batch_redaction_result_page(
 
         {discord_create_section}
         {discord_section}
-        
+
         {f'<section class="warning"><h2>高危泄漏</h2><ul>{leaks_html}</ul></section>' if leaks_html else ''}
         {f'<section class="notice"><h2>运行提示</h2><ul>{warnings_html}</ul></section>' if warnings_html else ''}
         <section><h2>分文件结果</h2>{doc_sections}</section>
@@ -1150,5 +1150,3 @@ def render_batch_redaction_result_page(
         </section>
         """,
     )
-
-

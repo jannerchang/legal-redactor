@@ -215,17 +215,17 @@ async def save_to_local(request: Request) -> JSONResponse:
         body = await request.json()
         directory = body.get("directory", "").strip()
         files = body.get("files", [])
-        
+
         if not directory:
             return JSONResponse({"status": "error", "message": "保存目录不能为空"}, status_code=400)
-            
+
         expanded_dir = os.path.abspath(os.path.expanduser(directory))
-        
+
         try:
             os.makedirs(expanded_dir, exist_ok=True)
         except Exception as e:
             return JSONResponse({"status": "error", "message": f"创建/访问目录失败: {str(e)}"}, status_code=400)
-            
+
         saved_paths = []
         for file_item in files:
             filename = file_item.get("filename", "").strip()
@@ -236,10 +236,10 @@ async def save_to_local(request: Request) -> JSONResponse:
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(content)
             saved_paths.append(file_path)
-            
+
         if not saved_paths:
             return JSONResponse({"status": "error", "message": "没有需要保存的文件内容"}, status_code=400)
-            
+
         return JSONResponse({
             "status": "success",
             "message": f"已成功保存 {len(saved_paths)} 个文件至本地目录：\n{expanded_dir}",
@@ -519,7 +519,7 @@ async def analyze_page(
         documents = await _read_input_documents(text, file, files)
     except ValueError as exc:
         return _page("上传失败", str(exc))
-        
+
     profile = "standard"
     llm_mode = "max-effect"
     mlx_block = _mlx_not_ready_page(ensure_mlx_server_ready())
@@ -531,7 +531,7 @@ async def analyze_page(
     # 执行语义审计（后台线程，避免阻塞 /health 等轻量请求）
     raw_text = "\n\n".join(doc.text for doc in documents)
     analysis = await asyncio.to_thread(pipeline.analyze, raw_text)
-    
+
     return _render_audit_dashboard(
         analysis=analysis,
         original_documents=documents,
@@ -1531,7 +1531,7 @@ def _diagnose_sample_entry(entry: dict) -> str:
     manual_reason = str(entry.get("reason") or "").strip()
     if manual_reason:
         return html.escape(manual_reason)
-    
+
     if action == "delete":
         matched_rules = []
         # 1. 手机/电话
@@ -1555,10 +1555,10 @@ def _diagnose_sample_entry(entry: dict) -> str:
         # 7. 机构/公司
         if any(orig.endswith(sfx) for sfx in ["有限责任公司", "股份有限公司", "集团有限公司", "有限公司", "公司", "集团", "律师事务所", "会计师事务所", "经营部", "商行", "工作室", "厂", "店"]):
             matched_rules.append("机构后缀特征")
-            
+
         if not matched_rules:
             matched_rules.append("LLM语义审计或规则兜底")
-            
+
         rules_str = "、".join(matched_rules)
         return f"<span style='color:var(--danger);font-weight:500'>误匹配为实体</span>（触发「{html.escape(rules_str)}」）。<b>已加入黑名单，下次分析相同文本将自动豁免，不再误判！</b>"
 
@@ -1844,7 +1844,7 @@ async def restore_preview_page(
     return _page("还原预览", f"""
         <nav><a href="/">返回首页</a></nav>
         <div class="downloads"><a download="restored.txt" href="{restored_url}" class="btn">下载还原文本</a></div>
-        
+
         <section class="local-save-section" style="border-left: 4px solid var(--accent); background: linear-gradient(135deg, var(--surface) 0%, rgba(26, 122, 109, 0.02) 100%); padding: 18px 24px; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 18px; box-shadow: var(--shadow);">
           <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 15px;">
             <div style="flex: 1; min-width: 280px;">
@@ -1871,7 +1871,7 @@ async def restore_preview_page(
             }})();
           </script>
         </section>
-        
+
         <section class="grid">
           <div><h2>脱敏文本</h2><textarea rows="20" readonly>{html.escape(redacted_text)}</textarea></div>
           <div><h2>还原后</h2><textarea id="restored-output" rows="20" readonly>{html.escape(preview.restored_text)}</textarea></div>
@@ -2041,14 +2041,14 @@ def _render_batch_redaction_result(
     source_dir: str = "",
 ) -> str:
     default_dir = save_dir.strip() or os.path.expanduser("~/Desktop")
-    
+
     # 构建各个独立文件的脱敏文本列表供 JS 使用
     individual_files = []
     for index, document in enumerate(documents, start=1):
         out_name = f"document-{index}.redacted.txt"
         individual_files.append({"filename": out_name, "content": document.redacted_text})
     individual_files_json = json.dumps(individual_files, ensure_ascii=False)
-    
+
     map_json = redaction_map_to_json(redaction_map)
     bundle_json = _documents_bundle_json(documents)
     combined_redacted = "\n\n".join(d.redacted_text for d in documents)
@@ -2801,7 +2801,7 @@ async def _read_input_documents(
     documents = []
     if text.strip():
         documents.append(InputDocument(source_file="粘贴文本.txt", text=text))
-    
+
     target_files = []
     if file and file.filename: target_files.append(file)
     if files: target_files.extend([f for f in files if f.filename])
@@ -2810,7 +2810,7 @@ async def _read_input_documents(
         for item in (case_folder_files or [])
         if item.filename and _is_supported_folder_upload_filename(item.filename)
     ]
-    
+
     for item in target_files:
         try:
             content = await _read_upload_text(item)
@@ -2828,7 +2828,7 @@ async def _read_input_documents(
         except Exception as exc:
             raise ValueError(f"读取文件 {item.filename} 失败: {exc}") from exc
         documents.append(InputDocument(source_file=item.filename, text=content))
-        
+
     if not documents: raise ValueError("未提供任何待脱敏的文本或文件")
     return documents
 
@@ -3391,5 +3391,3 @@ def _simple_mask(text: str, counters: TypeCounters) -> str:
         return f"项目{counters.next('project')}"
     # 其他
     return f"敏感信息{counters.next('other')}"
-
-
