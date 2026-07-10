@@ -840,12 +840,12 @@ def test_pipeline_collects_rule_detectors_once_before_optional_llm_review() -> N
         ) as china_admin_spy,
     ):
         result = RedactionPipeline(config=PipelineConfig.offline_without_llm()).redact(
-            "原告张三提交证据。"
+            "原告华北制药股份有限公司提交证据。"
         )
 
     assert title_spy.call_count == 1
     assert china_admin_spy.call_count == 1
-    assert any(mapping.original == "张三" for mapping in result.redaction_map.mappings)
+    assert any(mapping.original == "华北制药股份有限公司" for mapping in result.redaction_map.mappings)
 
 
 def test_fail_closed_sentence_extraction_skips_collector_and_engine() -> None:
@@ -856,7 +856,6 @@ def test_fail_closed_sentence_extraction_skips_collector_and_engine() -> None:
         PipelineConfig.balanced_llm(),
         enable_hebei_admin_db=False,
         enable_china_admin_db=False,
-        enable_sample_library=False,
     )
 
     with (

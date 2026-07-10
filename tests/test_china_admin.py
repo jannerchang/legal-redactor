@@ -5,7 +5,6 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest import mock
 
 from legal_redactor.admin_division import AdminDivisionDetector
 from legal_redactor.china_admin_rules import (
@@ -70,9 +69,7 @@ class ChinaAdminRulesTests(unittest.TestCase):
                 enable_china_admin_rules=True,
             )
             pipeline = RedactionPipeline(config=config)
-            with mock.patch("legal_redactor.pipeline.load_all_samples", return_value=({}, set())):
-                with mock.patch("legal_redactor.pipeline.load_trusted_sample_mappings", return_value=[]):
-                    result = pipeline.redact("广东省深圳市南山区某项目发生争议。")
+            result = pipeline.redact("广东省深圳市南山区某项目发生争议。")
 
         self.assertNotIn("广东省", result.redacted_text)
         self.assertNotIn("深圳市", result.redacted_text)
@@ -90,9 +87,7 @@ class ChinaAdminRulesTests(unittest.TestCase):
         )
         pipeline = RedactionPipeline(config=config)
         text = "原告张三住广东省深圳市南山区科技园，后搬至北京市海淀区。"
-        with mock.patch("legal_redactor.pipeline.load_all_samples", return_value=({}, set())):
-            with mock.patch("legal_redactor.pipeline.load_trusted_sample_mappings", return_value=[]):
-                result = pipeline.redact(text)
+        result = pipeline.redact(text)
 
         self.assertNotIn("广东省", result.redacted_text)
         self.assertNotIn("深圳市", result.redacted_text)

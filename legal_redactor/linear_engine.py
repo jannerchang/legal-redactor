@@ -51,8 +51,8 @@ from .org_masking import (
 class LinearRuleEngine:
     counters: TypeCounters
     profile: RedactionProfile
-    sample_blacklist: set[str]
     get_location_prefix: Callable[[str], str]
+    sample_blacklist: set[str] = field(default_factory=set)
     person_blacklist: set[str] = field(default_factory=set)
     mappings: list[MappingEntry] = field(default_factory=list)
     known_locations: dict[str, str] = field(default_factory=dict)

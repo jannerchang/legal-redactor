@@ -807,13 +807,13 @@ def orchestrate_sentence_extractions(
 class LegalEntityAuditor:
     config: LocalLLMConfig
 
-    def audit_and_verify(self, text: str, candidates: list[dict], enable_samples: bool = True) -> dict[str, Any]:
+    def audit_and_verify(self, text: str, candidates: list[dict], enable_samples: bool = False) -> dict[str, Any]:
         """合并审计提取与疑似候选词验证，单次调用 LLM。
 
         Args:
             text: 原文
             candidates: 待验证的正则/启发式候选列表，每项含 {"text", "type", "context"}
-            enable_samples: 是否注入历史样本作为 few-shot
+            enable_samples: 保留兼容参数；运行时脱敏不会注入样本 few-shot
         """
         if not self.config.enabled:
             return {"locations": [], "companies": [], "persons": [], "reject": []}
@@ -830,7 +830,7 @@ class LegalEntityAuditor:
             # 联合调用失败时，返回空提取，并采用 fail-open（空拒绝列表）以保留所有规则候选
             return {"locations": [], "companies": [], "persons": [], "reject": [], "error": str(exc)}
 
-    def extract_sentence_entities(self, text: str, enable_samples: bool = True) -> dict[str, Any]:
+    def extract_sentence_entities(self, text: str, enable_samples: bool = False) -> dict[str, Any]:
         """Extract entities from sentence windows; context is previous/next sentence only."""
         empty = {
             "locations": [],
@@ -1248,15 +1248,10 @@ class LegalEntityAuditor:
         payload["calibrate"] = calibrate
         return payload
 
-    def _build_sentence_extraction_prompt(self, windows: list[dict[str, str]], enable_samples: bool = True) -> str:
-        from ._samples import get_few_shot_examples
-
-        few_shot_str = (
-            get_few_shot_examples(max_examples=_SENTENCE_FEW_SHOT_EXAMPLES)
-            if enable_samples
-            else ""
-        )
-        few_shot_part = f"\n{few_shot_str}\n\n" if few_shot_str else ""
+    def _build_sentence_extraction_prompt(self, windows: list[dict[str, str]], enable_samples: bool = False) -> str:
+        # Runtime prompts never load sample-library few-shot evidence.
+        _ = enable_samples
+        few_shot_part = ""
         previous_context = windows[0].get("previous", "") if windows else ""
         next_context = windows[-1].get("next", "") if windows else ""
         window_lines: list[str] = []
@@ -1294,10 +1289,10 @@ class LegalEntityAuditor:
             f"=== 句子窗口 ===\n{windows_str}\n"
         )
 
-    def _build_merged_prompt(self, text: str, candidates: list[dict], enable_samples: bool = True) -> str:
-        from ._samples import get_few_shot_examples
-        few_shot_str = get_few_shot_examples() if enable_samples else ""
-        few_shot_part = f"\n{few_shot_str}\n\n" if few_shot_str else ""
+    def _build_merged_prompt(self, text: str, candidates: list[dict], enable_samples: bool = False) -> str:
+        # Runtime prompts never load sample-library few-shot evidence.
+        _ = enable_samples
+        few_shot_part = ""
 
         candidate_lines = []
         for i, c in enumerate(candidates, 1):

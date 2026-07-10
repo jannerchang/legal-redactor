@@ -25,11 +25,6 @@ from .linear_engine import LinearRuleEngine
 from .location_utils import get_location_core
 from .models import BatchRedactionResult, Candidate, Leak, MappingEntry, RedactedDocument, RedactionMap, RedactionResult
 from .postprocess import PostprocessConfig, apply_postprocess
-from ._samples import load_all_samples, load_trusted_sample_mappings  # noqa: F401
-# load_all_samples is not called in this module, but tests patch
-# legal_redactor.pipeline.load_all_samples as a mock anchor
-# (tests/test_hebei_admin.py, tests/test_china_admin.py); keep the name
-# importable on this module so mock.patch can resolve it.
 
 
 _COMPANY_SUFFIXES_FOR_ALIAS_BOUNDARY = (
@@ -164,14 +159,11 @@ def _append_admin_detection(
     candidate: Candidate,
     *,
     profile: RedactionProfile,
-    sample_blacklist: set[str],
     mappings: list[MappingEntry],
     admin_spans: list[tuple[int, int, str]],
     get_location_prefix,
     get_admin_prefix,
 ) -> None:
-    if candidate.text in sample_blacklist:
-        return
     if candidate.type == "grassroots_org":
         allowed = profile.redact_locations or profile.redact_organizations
     else:
@@ -327,19 +319,6 @@ def _dedupe_strings(values: list[str]) -> list[str]:
     return ordered
 
 
-def _trusted_organization_short_names(sample_mappings: list[MappingEntry]) -> set[str]:
-    """Short names that trusted samples already treat as organizations."""
-    names: set[str] = set()
-    for mapping in sample_mappings:
-        masked = mapping.masked or ""
-        if mapping.type not in {"organization", "individual_business"} and not masked.endswith(
-            ("公司", "集团", "律所", "事务所", "机构", "商行", "经营部", "合作社")
-        ):
-            continue
-        original = (mapping.original or "").strip()
-        if original:
-            names.add(original)
-    return names
 
 
 def _should_skip_short_org_alias_replacement(
@@ -383,9 +362,6 @@ class _RedactionContext:
     mappings: list[MappingEntry] = field(default_factory=list)
     prov_mapping: dict[str, str] = field(default_factory=dict)
     scan_text: str = ""
-    sample_blacklist: set[str] = field(default_factory=set)
-    sample_mappings: list[MappingEntry] = field(default_factory=list)
-    trusted_org_short_names: set[str] = field(default_factory=set)
     base_mappings: list[MappingEntry] = field(default_factory=list)
     location_prefixes: dict[str, str] = field(default_factory=dict)
     admin_prefixes: dict[str, str] = field(default_factory=dict)
@@ -430,18 +406,8 @@ def _linear_init_ctx(pipeline, text, source_file, prov_mapping, base_redaction_m
     boundary_match = re.search(r"本院(?:经审理|经审查|审理)?认为", text)
     ctx.scan_text = text[: boundary_match.start()] if boundary_match else text
 
-    if pipeline.config.enable_sample_library:
-        ctx.sample_blacklist = set()
-        ctx.sample_mappings = [
-            mapping
-            for mapping in load_trusted_sample_mappings()
-            if mapping.original in text and _candidate_allowed(mapping.type, profile)
-        ]
-    else:
-        ctx.sample_blacklist = set()
-        ctx.sample_mappings = []
-
-    ctx.trusted_org_short_names = _trusted_organization_short_names(ctx.sample_mappings)
+    # Samples are optimization evidence only. Runtime redaction is derived
+    # exclusively from current detectors, LLM analysis, and explicit base maps.
     ctx.base_mappings = list(base_redaction_map.mappings) if base_redaction_map else []
     return ctx
 
@@ -459,7 +425,7 @@ def _linear_seed_base_prefixes(ctx) -> None:
 def _linear_collect_regex_with_fixed(pipeline, ctx, text) -> None:
     if pipeline.config.enable_regex:
         for candidate in detect_standard_regex_candidates(text):
-            if candidate.text in ctx.sample_blacklist or not _candidate_allowed(candidate.type, ctx.profile):
+            if not _candidate_allowed(candidate.type, ctx.profile):
                 continue
             masked = (
                 map_case_number(candidate.text, ctx.prov_mapping)
@@ -491,7 +457,6 @@ def _linear_collect_admin_spans(pipeline, ctx) -> None:
             _append_admin_detection(
                 candidate,
                 profile=ctx.profile,
-                sample_blacklist=ctx.sample_blacklist,
                 mappings=ctx.mappings,
                 admin_spans=ctx.admin_spans,
                 get_location_prefix=ctx.get_location_prefix,
@@ -523,7 +488,7 @@ def _linear_collect_hanlp_candidates(pipeline, ctx) -> None:
             ctx.warnings.append(hanlp_error)
         for candidate in detected_hanlp:
             candidate = _as_project_candidate_if_needed(candidate)
-            if candidate.text in ctx.sample_blacklist or not _candidate_allowed(candidate.type, ctx.profile):
+            if not _candidate_allowed(candidate.type, ctx.profile):
                 continue
             if candidate.type == "location" and candidate.text.startswith(("（", "(")):
                 continue
@@ -547,7 +512,7 @@ def _linear_run_sentence_extraction(pipeline, ctx, text):
         if not (pipeline.config.enable_heuristic_ner and ctx.profile.redact_locations):
             return
         for candidate in detect_heuristic_ner_candidates(ctx.scan_text):
-            if candidate.type not in {"location", "grassroots_org"} or candidate.text in ctx.sample_blacklist:
+            if candidate.type not in {"location", "grassroots_org"}:
                 continue
             if any(
                 not (candidate.end <= start or candidate.start >= end)
@@ -593,7 +558,7 @@ def _linear_run_sentence_extraction(pipeline, ctx, text):
         auditor = LegalEntityAuditor(pipeline.config.local_llm)
         ctx.analysis = auditor.extract_sentence_entities(
             ctx.scan_text,
-            enable_samples=pipeline.config.enable_sample_library,
+            enable_samples=False,
         )
         if ctx.analysis.get("error"):
             ctx.llm_extraction_failed = True
@@ -608,13 +573,8 @@ def _linear_run_sentence_extraction(pipeline, ctx, text):
                         continue
                     seen_originals.add(mapping.original)
                     unique_mappings.append(mapping)
-                for mapping in sorted(ctx.sample_mappings, key=lambda item: len(item.original), reverse=True):
-                    if mapping.original in seen_originals or mapping.original in ctx.sample_blacklist:
-                        continue
-                    seen_originals.add(mapping.original)
-                    unique_mappings.append(mapping)
                 for mapping in sorted(ctx.fixed_regex_mappings, key=lambda item: len(item.original), reverse=True):
-                    if mapping.original in seen_originals or mapping.original in ctx.sample_blacklist:
+                    if mapping.original in seen_originals:
                         continue
                     seen_originals.add(mapping.original)
                     unique_mappings.append(mapping)
@@ -622,7 +582,7 @@ def _linear_run_sentence_extraction(pipeline, ctx, text):
                 unique_mappings = apply_postprocess(
                     text,
                     unique_mappings,
-                    PostprocessConfig(protected_texts=ctx.sample_blacklist),
+                    PostprocessConfig(),
                 )
 
                 redacted_text = remove_court_signatures(pipeline.apply_mappings(text, unique_mappings))
@@ -672,8 +632,6 @@ def _linear_run_engine(pipeline, ctx) -> None:
     engine = LinearRuleEngine(
         counters=ctx.counters,
         profile=ctx.profile,
-        sample_blacklist=ctx.sample_blacklist,
-        person_blacklist=ctx.trusted_org_short_names,
         get_location_prefix=ctx.get_location_prefix,
     )
     seed_candidates = [*ctx.admin_candidates, *ctx.hanlp_candidates]
@@ -741,7 +699,7 @@ def _linear_run_engine(pipeline, ctx) -> None:
             ctx.analysis = auditor.audit_and_verify(
                 ctx.scan_text,
                 verify_list,
-                enable_samples=pipeline.config.enable_sample_library,
+                enable_samples=False,
             )
             if ctx.analysis.get("error"):
                 ctx.warnings.append(str(ctx.analysis["error"]))
@@ -761,16 +719,8 @@ def _linear_finalize(pipeline, ctx, text) -> RedactionResult:
             continue
         seen_originals.add(mapping.original)
         unique_mappings.append(mapping)
-    for mapping in sorted(ctx.sample_mappings, key=lambda item: len(item.original), reverse=True):
-        if mapping.original in seen_originals or mapping.original in ctx.sample_blacklist:
-            continue
-        seen_originals.add(mapping.original)
-        unique_mappings.append(mapping)
     for mapping in sorted(ctx.mappings, key=lambda item: len(item.original), reverse=True):
-        if (
-            mapping.original in seen_originals
-            or mapping.original in ctx.sample_blacklist
-        ):
+        if mapping.original in seen_originals:
             continue
         seen_originals.add(mapping.original)
         unique_mappings.append(mapping)
@@ -778,7 +728,7 @@ def _linear_finalize(pipeline, ctx, text) -> RedactionResult:
     unique_mappings = apply_postprocess(
         text,
         unique_mappings,
-        PostprocessConfig(protected_texts=ctx.sample_blacklist),
+        PostprocessConfig(),
     )
 
     redacted_text = remove_court_signatures(pipeline.apply_mappings(text, unique_mappings))

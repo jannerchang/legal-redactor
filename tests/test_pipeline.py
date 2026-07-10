@@ -135,8 +135,7 @@ def test_pipeline_analyze_returns_web_confirmation_shape(mock_load_samples):
     assert isinstance(analysis["locations"], list)
 
 
-@patch("legal_redactor.pipeline.load_trusted_sample_mappings", return_value=[])
-def test_max_effect_llm_failure_falls_back_to_rule_mode(mock_sample_mappings):
+def test_max_effect_llm_failure_falls_back_to_rule_mode():
     pipeline = RedactionPipeline(config=PipelineConfig.max_effect())
     text = "原告张三提交证据，联系电话：13812345678。"
     analysis = {
@@ -380,8 +379,7 @@ def test_heuristic_optimization_rules():
     assert "镇" not in terms
 
 
-@patch("legal_redactor.pipeline.load_trusted_sample_mappings", return_value=[])
-def test_pipeline_llm_calibration(mock_load_sample_mappings):
+def test_pipeline_llm_calibration():
     from dataclasses import replace
     from legal_redactor.config import PipelineConfig
     from legal_redactor.pipeline import RedactionPipeline
@@ -522,8 +520,7 @@ def test_pipeline_ignores_calibration_not_found_near_candidate():
     assert "友成公司" in originals
 
 
-@patch("legal_redactor.pipeline.load_trusted_sample_mappings", return_value=[])
-def test_linear_pipeline_expands_locations_and_company_aliases(mock_sample_mappings):
+def test_linear_pipeline_expands_locations_and_company_aliases():
     pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
     text = (
         "中国建设银行河北省分行与河北豪木山运输有限公司签订合同。"
@@ -561,8 +558,7 @@ def test_linear_pipeline_adds_bare_org_brand_for_explicit_alias_context():
     assert "豪木山负责运输" not in result.redacted_text
 
 
-@patch("legal_redactor.pipeline.load_trusted_sample_mappings", return_value=[])
-def test_linear_pipeline_merges_explicit_former_name_and_company_short_name(mock_sample_mappings):
+def test_linear_pipeline_merges_explicit_former_name_and_company_short_name():
     pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
     text = (
         "石家庄裕华精密铸造有限公司（原名称：鹿泉市裕华精密铸造有限公司）签订合同，"
@@ -577,8 +573,7 @@ def test_linear_pipeline_merges_explicit_former_name_and_company_short_name(mock
     assert result.redacted_text.count("甲公司") == 4
 
 
-@patch("legal_redactor.pipeline.load_trusted_sample_mappings", return_value=[])
-def test_linear_pipeline_detects_short_company_and_group_names(mock_sample_mappings):
+def test_linear_pipeline_detects_short_company_and_group_names():
     pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
     text = "世耀包装公司提交合同，石药集团出具说明。"
 
@@ -593,8 +588,7 @@ def test_linear_pipeline_detects_short_company_and_group_names(mock_sample_mappi
     assert "集团" in result.redacted_text
 
 
-@patch("legal_redactor.pipeline.load_trusted_sample_mappings", return_value=[])
-def test_linear_pipeline_preserves_org_brand_boundary_characters(mock_sample_mappings):
+def test_linear_pipeline_preserves_org_brand_boundary_characters():
     pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
     text = (
         "可口可乐公司、三快科技有限公司、中粮可口可乐饮料（天津）有限公司、"
@@ -614,8 +608,7 @@ def test_linear_pipeline_preserves_org_brand_boundary_characters(mock_sample_map
     assert "幸福树幼儿园" not in result.redacted_text
 
 
-@patch("legal_redactor.pipeline.load_trusted_sample_mappings", return_value=[])
-def test_linear_pipeline_trims_person_address_prefix_before_location_check(mock_sample_mappings):
+def test_linear_pipeline_trims_person_address_prefix_before_location_check():
     pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
     text = "张三住起航小镇，起航小镇项目发生争议。"
 
@@ -757,8 +750,7 @@ def test_linear_pipeline_applies_llm_reject_and_calibration():
     assert [item.text for item in reviewed] == ["星河公司"]
 
 
-@patch("legal_redactor.pipeline.load_trusted_sample_mappings", return_value=[])
-def test_linear_pipeline_max_effect_uses_sentence_extraction(mock_sample_mappings):
+def test_linear_pipeline_max_effect_uses_sentence_extraction():
     from legal_redactor.llm import build_sentence_windows
 
     config = PipelineConfig.max_effect()
@@ -791,8 +783,7 @@ def test_linear_pipeline_max_effect_uses_sentence_extraction(mock_sample_mapping
         assert original not in result.redacted_text
 
 
-@patch("legal_redactor.pipeline.load_trusted_sample_mappings", return_value=[])
-def test_sentence_llm_exact_entities_ignore_optimization_blacklist(mock_sample_mappings):
+def test_sentence_llm_exact_entities_ignore_optimization_blacklist():
     from legal_redactor.llm import build_sentence_windows
 
     config = PipelineConfig.max_effect()
@@ -827,8 +818,7 @@ def test_sentence_llm_exact_entities_ignore_optimization_blacklist(mock_sample_m
     assert "张三" not in result.redacted_text
 
 
-@patch("legal_redactor.pipeline.load_trusted_sample_mappings", return_value=[])
-def test_linear_pipeline_balanced_uses_sentence_extraction(mock_sample_mappings):
+def test_linear_pipeline_balanced_uses_sentence_extraction():
     from legal_redactor.llm import build_sentence_windows
 
     config = PipelineConfig.balanced_llm()
@@ -857,8 +847,7 @@ def test_linear_pipeline_balanced_uses_sentence_extraction(mock_sample_mappings)
     assert "陈戊靖" not in result.redacted_text
 
 
-@patch("legal_redactor.pipeline.load_trusted_sample_mappings", return_value=[])
-def test_linear_pipeline_max_effect_fallback_keeps_fixed_regex(mock_sample_mappings):
+def test_linear_pipeline_max_effect_fallback_keeps_fixed_regex():
     config = PipelineConfig.max_effect()
     pipeline = RedactionPipeline(config=config)
     text = (
@@ -909,14 +898,12 @@ def test_linear_pipeline_rejects_legal_phrases_as_people_or_locations():
     assert result.redacted_text == text
 
 
-@patch("legal_redactor.pipeline.load_trusted_sample_mappings", return_value=[])
-def test_linear_pipeline_uses_hanlp_ner_candidates(mock_sample_mappings):
+def test_linear_pipeline_uses_hanlp_ner_candidates():
     from legal_redactor.models import Candidate
 
     config = replace(
         PipelineConfig.offline_without_llm(),
         enable_hanlp_ner=True,
-        enable_sample_library=False,
     )
     pipeline = RedactionPipeline(config=config)
     text = "庭审中马戈陈述了付款经过。"
@@ -945,9 +932,8 @@ def test_linear_pipeline_uses_hanlp_ner_candidates(mock_sample_mappings):
     )
 
 
-@patch("legal_redactor.pipeline.load_trusted_sample_mappings", return_value=[])
-def test_linear_pipeline_filters_latest_sample_boundary_noise(mock_sample_mappings):
-    config = replace(PipelineConfig.offline_without_llm(), enable_sample_library=False)
+def test_linear_pipeline_filters_latest_sample_boundary_noise():
+    config = replace(PipelineConfig.offline_without_llm())
     pipeline = RedactionPipeline(config=config)
     text = (
         "原告原名江苏载道电力工程有限公司。"

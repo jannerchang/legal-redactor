@@ -43,20 +43,43 @@ def test_status_details_recursively_scrub_paths_and_secret_values() -> None:
             "model_ids": [
                 EXPECTED_MLX_MODEL,
                 "/Users/jannerchang/private-model",
+                "C:\\Users\\jannerchang\\private-model\\model.bin",
+                "C:/Users/jannerchang/private-model/model.bin",
+                "\\\\server\\share\\private-model\\model.bin",
+                "//server/share/private-model/model.bin",
+                "https://example.com/docs/path",
+                "合同编号 A\\B-001",
+                "见附件路径：判决书\\附件1.pdf",
                 {"path": "/Volumes/cases/model.bin", "note": "Bearer secret-token-value"},
             ],
-            "nested": {"config_path": "/Users/jannerchang/config/api.local.json"},
+            "nested": {
+                "config_path": "/Users/jannerchang/config/api.local.json",
+                "windows_path": "D:\\Office\\cases\\map.enc",
+                "unc_path": "\\\\fileserver\\legal\\case-a",
+            },
+            "message": "案件库目录存在且可写。",
         },
     ).to_dict()
 
     text = json.dumps(item, ensure_ascii=False)
-    assert EXPECTED_MLX_MODEL in text
+    details = item["details"]
+    model_ids = details["model_ids"]
+    assert EXPECTED_MLX_MODEL in model_ids
+    assert "https://example.com/docs/path" in model_ids
+    assert "合同编号 A\\B-001" in model_ids
+    assert "见附件路径：判决书\\附件1.pdf" in model_ids
+    assert details["message"] == "案件库目录存在且可写。"
     assert "/Users/" not in text
     assert "/Volumes/" not in text
     assert "secret-token-value" not in text
-    assert "private-model" in text
-    assert "model.bin" in text
-    assert "api.local.json" in text
+    assert "jannerchang" not in text
+    assert "private-model" not in text
+    assert "model.bin" not in text
+    assert "api.local.json" not in text
+    assert "fileserver" not in text
+    assert "map.enc" not in text
+    assert "Office" not in text
+    assert "configured" in text
 
 
 def test_json_config_diagnostics_preserve_legacy_safe_default(tmp_path, monkeypatch) -> None:
@@ -84,6 +107,19 @@ def test_json_config_diagnostics_preserve_legacy_safe_default(tmp_path, monkeypa
     assert load_json_config("LEGAL_REDACTOR_API_CONFIG", "api.local.json") == {}
 
 
+def test_mlx_probe_skip_precedes_port_validation() -> None:
+    item = probe_mlx_server(
+        environ={
+            "LEGAL_REDACTOR_SKIP_MLX": "1",
+            "LEGAL_REDACTOR_MLX_PORT": "not-a-port",
+        }
+    )
+
+    assert item.state == "skipped"
+    assert item.details["reason"] == "skip_env"
+
+
+
 def test_mlx_probe_requires_expected_model(monkeypatch) -> None:
     monkeypatch.setattr(
         "legal_redactor.status._http_get_models",
@@ -107,7 +143,8 @@ def test_mlx_probe_requires_expected_model(monkeypatch) -> None:
     assert ready.state == "ready"
     text = json.dumps(ready.to_dict(), ensure_ascii=False)
     assert "/Users/" not in text
-    assert "private-model" in text
+    assert "private-model" not in text
+
 
 
 def test_mlx_probe_classifies_http_invalid_json_timeout_and_unreachable(monkeypatch) -> None:

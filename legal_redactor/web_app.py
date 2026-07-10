@@ -11,7 +11,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import base64
-import importlib.util
 import tempfile
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -20,7 +19,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from zipfile import BadZipFile
 
-from .config import PipelineConfig
+from .config import PipelineConfig, RedactionProfile
 from .cases import (
     CaseError,
     InvalidDiscordThreadError,
@@ -36,13 +35,14 @@ from .cases import (
     persist_case_redaction,
     raise_for_forged_workflow_fields,
     record_hermes_thread_request,
-    suggest_case_location_from_filenames as case_suggest_case_location_from_filenames,
+    suggest_case_location_from_filenames,
+    case_location_search_roots,
     case_thread_binding_status,
     validate_case_folder_name,
     workflow_state_message,
 )
 from .counters import CN_ORDINALS, TypeCounters
-from .io import is_encrypted_map, load_redaction_map_encrypted, redaction_map_from_json, redaction_map_to_json
+from .io import redaction_map_from_json, redaction_map_to_json
 from .local_config import config_value, load_json_config
 from .models import MappingEntry, RedactedDocument, RedactionMap, sort_mapping_entries
 from .org_masking import derived_organization_alias_cores
@@ -135,15 +135,13 @@ def api_ensure_mlx() -> dict:
     return payload
 
 
-def _mlx_not_ready_page(item) -> str | None:
-    if item.state in {"ready", "skipped"}:
-        return None
-    return _page(
-        "MLX 本地模型未就绪",
-        f"<p>{html.escape(item.message)}</p>"
-        f"<p><b>建议：</b>{html.escape(item.action)}</p>"
-        "<p>也可双击桌面「启动文书脱敏系统」重新启动全套服务。</p>",
-    )
+
+
+def _pipeline_config_for_mlx_status(item, *, profile: str = "standard") -> tuple[PipelineConfig, list[str]]:
+    if item.state == "ready":
+        return PipelineConfig.from_llm_mode("max-effect", profile_name=profile), []
+    warning = f"MLX 未就绪，已降级为纯规则模式：{item.message}"
+    return PipelineConfig.offline_without_llm(profile), [warning]
 
 
 def _redaction_failure_body(exc: Exception, *, enable_hanlp: bool) -> str:
@@ -210,45 +208,6 @@ def _waiting_hermes_response() -> JSONResponse:
     )
 
 
-@app.post("/api/save-to-local")
-async def save_to_local(request: Request) -> JSONResponse:
-    try:
-        body = await request.json()
-        directory = body.get("directory", "").strip()
-        files = body.get("files", [])
-
-        if not directory:
-            return JSONResponse({"status": "error", "message": "保存目录不能为空"}, status_code=400)
-
-        expanded_dir = os.path.abspath(os.path.expanduser(directory))
-
-        try:
-            os.makedirs(expanded_dir, exist_ok=True)
-        except Exception as e:
-            return JSONResponse({"status": "error", "message": f"创建/访问目录失败: {str(e)}"}, status_code=400)
-
-        saved_paths = []
-        for file_item in files:
-            filename = file_item.get("filename", "").strip()
-            content = file_item.get("content", "")
-            if not filename:
-                continue
-            file_path = os.path.join(expanded_dir, filename)
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(content)
-            saved_paths.append(file_path)
-
-        if not saved_paths:
-            return JSONResponse({"status": "error", "message": "没有需要保存的文件内容"}, status_code=400)
-
-        return JSONResponse({
-            "status": "success",
-            "message": f"已成功保存 {len(saved_paths)} 个文件至本地目录：\n{expanded_dir}",
-            "directory": expanded_dir,
-            "saved_paths": saved_paths
-        })
-    except Exception as exc:
-        return JSONResponse({"status": "error", "message": f"保存失败: {str(exc)}"}, status_code=500)
 
 
 @app.post("/api/suggest-case-location")
@@ -271,7 +230,7 @@ async def suggest_case_location(request: Request) -> JSONResponse:
         )
         if relative_suggestion.get("status") != "not_found":
             return JSONResponse(relative_suggestion)
-    suggestion = _suggest_case_location_from_filenames(
+    suggestion = suggest_case_location_from_filenames(
         filenames,
         roots or None,
         source_dir=str(body.get("source_dir") or body.get("upload_source_dir") or "").strip(),
@@ -522,22 +481,21 @@ async def analyze_page(
         return _page("上传失败", str(exc))
 
     profile = "standard"
-    llm_mode = "max-effect"
-    mlx_block = _mlx_not_ready_page(ensure_mlx_server_ready())
-    if mlx_block is not None:
-        return mlx_block
-    config = PipelineConfig.from_llm_mode(llm_mode, profile_name=profile)
+    mlx_item = ensure_mlx_server_ready()
+    config, warnings = _pipeline_config_for_mlx_status(mlx_item, profile=profile)
     pipeline = RedactionPipeline(config=config)
 
     # 执行语义审计（后台线程，避免阻塞 /health 等轻量请求）
     raw_text = "\n\n".join(doc.text for doc in documents)
     analysis = await asyncio.to_thread(pipeline.analyze, raw_text)
 
+    analysis.setdefault("warnings", [])
+    analysis["warnings"] = [*warnings, *analysis.get("warnings", [])]
     return _render_audit_dashboard(
         analysis=analysis,
         original_documents=documents,
         profile=profile,
-        llm_mode=llm_mode
+        llm_mode="max-effect" if mlx_item.state == "ready" else "off"
     )
 
 def _render_audit_dashboard(
@@ -584,8 +542,8 @@ def _render_audit_dashboard(
 
     locations = analysis.get("locations", [])
     locations_html = "".join(
-        f'<li><label><input type="checkbox" checked name="loc_{idx}" value="{html.escape(str(l))}"> {html.escape(str(l))}</label></li>'
-        for idx, l in enumerate(locations)
+        f'<li><label><input type="checkbox" checked name="loc_{idx}" value="{html.escape(str(location))}"> {html.escape(str(location))}</label></li>'
+        for idx, location in enumerate(locations)
     )
 
     bundle_json = json.dumps([{"source_file": d.source_file, "text": d.text} for d in original_documents], ensure_ascii=False)
@@ -834,10 +792,13 @@ async def redact_confirmed_page(request: Request) -> str:
             warnings=[],
         )
 
-    # 对已脱敏文本做新一轮 LLM 分析
-    config = PipelineConfig.from_llm_mode(llm_mode, profile_name=profile)
+    # 对已脱敏文本做新一轮分析；MLX 未就绪时与 /redact 一样降级为纯规则
+    mlx_item = ensure_mlx_server_ready()
+    config, fallback_warnings = _pipeline_config_for_mlx_status(mlx_item, profile=profile)
     pipeline2 = RedactionPipeline(config=config)
     new_analysis = await asyncio.to_thread(pipeline2.analyze, redacted_text)
+    new_analysis.setdefault("warnings", [])
+    new_analysis["warnings"] = [*fallback_warnings, *new_analysis.get("warnings", [])]
 
     # 过滤掉已确认和已排除的实体
     new_groups = []
@@ -851,8 +812,9 @@ async def redact_confirmed_page(request: Request) -> str:
         new_groups.append(g)
 
     new_locations = [
-        l for l in new_analysis.get("locations", [])
-        if l not in all_confirmed and l not in all_deselected_texts
+        location
+        for location in new_analysis.get("locations", [])
+        if location not in all_confirmed and location not in all_deselected_texts
     ]
 
     new_analysis["entity_groups"] = new_groups
@@ -890,7 +852,7 @@ async def redact_page(
     enable_llm: str | None = Form(default=None),
     enable_hanlp: str | None = Form(default=None),
     hanlp_model: str = Form(default=""),
-    enable_samples: str | None = Form(default=None),
+    # enable_samples kept out of the form: samples never affect runtime redaction.
     base_map_json: str = Form(default=""),
     case_folder: str = Form(default=""),
     discord_thread_url: str = Form(default=""),
@@ -919,17 +881,13 @@ async def redact_page(
         except Exception as exc:
             return _page("已有映射表解析失败", f"解析错误: {exc}")
 
-    llm_mode = "max-effect"
-    mlx_block = _mlx_not_ready_page(ensure_mlx_server_ready())
-    if mlx_block is not None:
-        return mlx_block
-    config = PipelineConfig.from_llm_mode(
-        llm_mode,
-        profile_name="standard",
+    mlx_item = ensure_mlx_server_ready()
+    config, fallback_warnings = _pipeline_config_for_mlx_status(
+        mlx_item,
+        profile="standard",
     )
     config = replace(
         config,
-        enable_sample_library=bool(enable_samples),
         enable_hanlp_ner=bool(enable_hanlp),
         hanlp_model=hanlp_model.strip() or "MSRA_NER_ELECTRA_SMALL_ZH",
     )
@@ -961,7 +919,7 @@ async def redact_page(
             _redaction_failure_body(exc, enable_hanlp=bool(enable_hanlp)),
         )
     result = replace(result, redaction_map=_sanitize_redaction_map(result.redaction_map))
-    warnings = list(result.warnings)
+    warnings = [*fallback_warnings, *result.warnings]
     if len(documents) > 1:
         try:
             _persist_optional_case_redaction(
@@ -1405,11 +1363,7 @@ async def save_sample_page(request: Request) -> str:
     map_type = form.getlist("map_type")
     map_original = form.getlist("map_original")
     map_masked = form.getlist("map_masked")
-    map_role = form.getlist("map_role")
-    map_source = form.getlist("map_source")
-    map_confidence = form.getlist("map_confidence")
     map_reason = form.getlist("map_reason")
-    map_restore_by_default = form.getlist("map_restore_by_default")
     row_delete = form.getlist("row_delete")
     map_source_file = form.get("map_source_file", "")
     original_mapping_json = form.get("original_mapping_json", "")
@@ -1429,7 +1383,8 @@ async def save_sample_page(request: Request) -> str:
     edited_types: dict[str, str] = {}
     edited_reasons: dict[str, str] = {}
     for i in range(max(len(map_original), len(map_masked))):
-        if str(i) in deleted: continue
+        if str(i) in deleted:
+            continue
         orig = (map_original[i] if i < len(map_original) else "").strip()
         masked = (map_masked[i] if i < len(map_masked) else "").strip()
         t = (map_type[i] if i < len(map_type) else "other").strip()
@@ -1467,7 +1422,8 @@ async def save_sample_page(request: Request) -> str:
         except (ValueError, IndexError):
             continue
     for orig, masked in edited_index.items():
-        if orig in processed: continue
+        if orig in processed:
+            continue
         processed.add(orig)
         t = edited_types.get(orig, "other")
         reason = edited_reasons.get(orig, "")
@@ -1561,20 +1517,34 @@ def _diagnose_sample_entry(entry: dict) -> str:
             matched_rules.append("LLM语义审计或规则兜底")
 
         rules_str = "、".join(matched_rules)
-        return f"<span style='color:var(--danger);font-weight:500'>误匹配为实体</span>（触发「{html.escape(rules_str)}」）。<b>已加入黑名单，下次分析相同文本将自动豁免，不再误判！</b>"
+        return (
+            f"<span style='color:var(--danger);font-weight:500'>误匹配为实体</span>"
+            f"（触发「{html.escape(rules_str)}」）。"
+            f"<b>已记入优化黑名单，供规则/评估优化使用；运行时脱敏不会读取样本库。</b>"
+        )
 
     elif action == "modify":
         old_masked = entry.get("old_masked", "")
         new_masked = entry.get("new_masked", "")
-        return f"<span style='color:#e65100;font-weight:500'>修正脱敏掩码</span>（从「{html.escape(old_masked)}」修正为「{html.escape(new_masked)}」）。<b>已载入精准映射，下次直接以此格式脱敏该词。</b>"
+        return (
+            f"<span style='color:#e65100;font-weight:500'>修正脱敏掩码</span>"
+            f"（从「{html.escape(old_masked)}」修正为「{html.escape(new_masked)}」）。"
+            f"<b>已记入优化样本，不参与运行时脱敏。</b>"
+        )
 
     elif action == "add":
-        return f"<span style='color:#1565c0;font-weight:500'>手动新增实体</span>。<b>已载入精准映射，下次该词将直接脱敏为「{html.escape(masked)}」。</b>"
+        return (
+            f"<span style='color:#1565c0;font-weight:500'>手动新增实体</span>。"
+            f"<b>已记入优化样本（目标掩码「{html.escape(masked)}」），不参与运行时脱敏。</b>"
+        )
 
     elif action == "keep":
-        return f"<span style='color:#2e7d32;font-weight:500'>确认无误（保留）</span>。<b>已记录，下次将直接命中并直接脱敏。</b>"
+        return (
+            "<span style='color:#2e7d32;font-weight:500'>确认无误（保留）</span>。"
+            "<b>已记入优化样本，不参与运行时脱敏。</b>"
+        )
 
-    return "已作为脱敏样本库记录并投入使用。"
+    return "已作为优化样本记录（不参与运行时脱敏）。"
 
 
 @app.get("/samples/edit", response_class=HTMLResponse)
@@ -1634,7 +1604,11 @@ def edit_samples_page() -> str:
         </style>
         <section>
           <h2>样本库（{len(entries)} 条）</h2>
-          <p class="hint">编辑后自动保存。删除操作立即生效。</p>
+          <p class="hint">样本库仅用于后续规则/评估优化，不参与运行时脱敏或 LLM few-shot。编辑后自动保存。删除操作立即生效。</p>
+          <p style="margin:8px 0 16px 0;">
+            <a href="/samples/clear" class="btn btn-secondary" onclick="return confirm('确认清空全部样本？清空后可继续写入新样本。');">清空样本库</a>
+            <a href="/samples/compact" class="btn btn-secondary" style="margin-left:8px;">整理去重</a>
+          </p>
           <table>
             <thead><tr><th>类型</th><th>原文</th><th>替换为</th><th>旧值</th><th>修改理由</th><th>诊断与优化分析</th><th>操作</th></tr></thead>
             <tbody>{rows}</tbody>
@@ -1719,6 +1693,29 @@ def compact_samples_page() -> str:
     from ._samples import compact_samples
     compact_samples()
     return _page("整理完成", '<p class="success">样本库已去重并优化。</p><nav><a href="/">返回首页</a></nav>')
+
+
+@app.get("/samples/clear", response_class=HTMLResponse)
+def clear_samples_page() -> str:
+    from ._samples import clear_sample_library
+
+    result = clear_sample_library()
+    return _page(
+        "样本库已清空",
+        (
+            f'<p class="success">已删除 {result["removed_entries"]} 条样本（{result["removed_files"]} 个文件），'
+            f'并重建空自动样本 {html.escape(str(result["sample_file"]))}。</p>'
+            '<nav><a href="/samples/edit">返回样本库</a> · <a href="/">返回首页</a></nav>'
+        ),
+    )
+
+
+@app.post("/api/samples/clear")
+def api_clear_samples() -> JSONResponse:
+    from ._samples import clear_sample_library
+
+    result = clear_sample_library()
+    return JSONResponse({"status": "ok", **result})
 
 
 def _render_case_workflow_panel(
@@ -1836,7 +1833,6 @@ async def restore_preview_page(
     except Exception as exc:
         return _page("还原错误", f'<nav><a href="/">返回</a></nav><section class="warning"><p>{html.escape(str(exc))}</p></section>')
 
-    default_dir = os.path.expanduser("~/Desktop")
     restored_url = _data_download("restored.txt", "text/plain", preview.restored_text)
     restored_rows = "".join(
         f"<tr><td>{html.escape(i.type)}</td><td>{html.escape(i.masked)}</td><td>{html.escape(i.original)}</td></tr>"
@@ -1846,32 +1842,7 @@ async def restore_preview_page(
         <nav><a href="/">返回首页</a></nav>
         <div class="downloads"><a download="restored.txt" href="{restored_url}" class="btn">下载还原文本</a></div>
 
-        <section class="local-save-section" style="border-left: 4px solid var(--accent); background: linear-gradient(135deg, var(--surface) 0%, rgba(26, 122, 109, 0.02) 100%); padding: 18px 24px; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 18px; box-shadow: var(--shadow);">
-          <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 15px;">
-            <div style="flex: 1; min-width: 280px;">
-              <h3 style="margin: 0 0 6px 0; font-size: 14px; font-weight: 600; color: var(--ink); display: flex; align-items: center; gap: 6px;">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" class="feather feather-folder"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
-                本地直接保存 <span class="hint" style="font-weight: normal; font-size: 11px; margin-left: 4px;">(保存至本地任意文件夹)</span>
-              </h3>
-              <div style="display: flex; gap: 8px; align-items: center; margin-top: 8px;">
-                <span class="hint" style="white-space: nowrap; font-weight: 500;">保存路径:</span>
-                <input type="text" id="local-save-dir" value="{html.escape(default_dir)}" style="flex: 1; min-width: 200px; padding: 6px 10px; border-radius: 6px; font-family: monospace; font-size: 13px;" placeholder="例如: ~/Desktop">
-              </div>
-            </div>
-            <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px;">
-              <button type="button" class="btn btn-sm" onclick="saveToLocalPath([{{filename: 'restored.txt', content: document.getElementById('restored-output').value}}], this)">保存还原文本</button>
-            </div>
-          </div>
-          <script>
-            (function(){{
-              var savedDir = localStorage.getItem('last_local_save_dir');
-              if (savedDir) {{
-                var inp = document.getElementById('local-save-dir');
-                if (inp) inp.value = savedDir;
-              }}
-            }})();
-          </script>
-        </section>
+
 
         <section class="grid">
           <div><h2>脱敏文本</h2><textarea rows="20" readonly>{html.escape(redacted_text)}</textarea></div>
@@ -2243,11 +2214,11 @@ def _persist_optional_case_redaction(
 def _resolve_case_location(upload_source_dir: str, source_files: list[str], upload_relative_paths: str = "") -> dict[str, object]:
     source_dir = upload_source_dir.strip()
     if source_dir:
-        return _suggest_case_location_from_filenames(source_files, source_dir=source_dir)
+        return suggest_case_location_from_filenames(source_files, source_dir=source_dir)
     relative_suggestion = _suggest_case_location_from_relative_paths(upload_relative_paths)
     if relative_suggestion.get("status") == "ok":
         return relative_suggestion
-    suggestion = _suggest_case_location_from_filenames(source_files)
+    suggestion = suggest_case_location_from_filenames(source_files)
     if suggestion.get("status") == "ok":
         return suggestion
     return {"status": "not_found"}
@@ -2264,7 +2235,7 @@ def _suggest_case_location_from_relative_paths(
     if not case_folder:
         return {"status": "not_found", "workflow_state": "not_saved", "evidence": []}
 
-    roots = search_roots or _case_location_search_roots()
+    roots = search_roots or case_location_search_roots()
     existing_dirs: list[Path] = []
     for root in roots:
         candidate = (Path(root).expanduser() / case_folder)
@@ -2549,7 +2520,16 @@ def _safe_discord_attachment_message(filename: str, message: str = "") -> str:
 
 
 def _safe_public_error_message(message: str) -> str:
-    return re.sub(r"(?:/Users/|/Volumes/|/private/|~)[^\\s\"'，。；;]+", "<local-path>", message)
+    text = str(message)
+    path_pattern = re.compile(
+        r"(?:"
+        r"[A-Za-z]:[\\/](?:[^\s\"'，。；;\\/]+[\\/])*[^\s\"'，。；;\\/]+"
+        r"|\\\\[^\s\"'，。；;\\/]+[\\/][^\s\"'，。；;\\/]+(?:[\\/][^\s\"'，。；;\\/]+)*"
+        r"|/(?:[^\s\"'，。；;/]+/)*[^\s\"'，。；;/]+"
+        r"|~/(?:[^\s\"'，。；;/]+/)*[^\s\"'，。；;/]+"
+        r")"
+    )
+    return path_pattern.sub("<local-path>", text)
 
 
 def _multipart_form_data(fields: list[tuple[str, str, str | None, bytes]]) -> tuple[bytes, str]:
@@ -2568,61 +2548,8 @@ def _multipart_form_data(fields: list[tuple[str, str, str | None, bytes]]) -> tu
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
-def _suggest_case_location_from_filenames(
-    filenames: list[str],
-    search_roots: list[Path] | None = None,
-    *,
-    source_dir: str = "",
-    discord_thread_url: str = "",
-) -> dict[str, object]:
-    return case_suggest_case_location_from_filenames(
-        filenames,
-        search_roots,
-        source_dir=source_dir,
-        discord_thread_url=discord_thread_url,
-    )
 
 
-def _best_case_location(
-    matches: list[tuple[Path, Path]],
-    wanted: set[str],
-) -> tuple[Path | None, list[Path]]:
-    if not matches:
-        return None, []
-
-    scores: dict[Path, set[str]] = {}
-    for file_path, case_dir_path in matches:
-        scores.setdefault(case_dir_path.resolve(), set()).add(file_path.name)
-    ranked = sorted(scores.items(), key=lambda item: (-len(item[1]), str(item[0])))
-    if not ranked:
-        return None, []
-
-    best_count = len(ranked[0][1])
-    best_dirs = [path for path, names in ranked if len(names) == best_count]
-    if len(best_dirs) == 1:
-        return best_dirs[0], []
-    return None, best_dirs
-
-
-def _case_dir_for_matched_file(root: Path, path: Path) -> Path:
-    root = root.resolve()
-    path = path.resolve()
-    try:
-        relative = path.relative_to(root)
-    except ValueError:
-        return path.parent.resolve()
-    if _looks_like_case_root(root) and len(relative.parts) > 1:
-        return (root / relative.parts[0]).resolve()
-    return path.parent.resolve()
-
-
-def _looks_like_case_root(root: Path) -> bool:
-    try:
-        if root.resolve() == default_case_root().resolve():
-            return True
-    except OSError:
-        pass
-    return root.name in {"案件资料", "legal-redactor-cases"}
 
 
 def _case_manifest_fields(case_dir_path: Path) -> dict[str, str]:
@@ -2633,53 +2560,8 @@ def _case_manifest_fields(case_dir_path: Path) -> dict[str, str]:
     }
 
 
-def _case_location_search_roots() -> list[Path]:
-    candidates: list[Path] = [
-        default_case_root(),
-        Path("~/Documents").expanduser(),
-        Path("~/Downloads").expanduser(),
-        Path("~/Desktop").expanduser(),
-    ]
-    volumes = Path("/Volumes")
-    if volumes.exists():
-        for volume in volumes.iterdir():
-            if volume.name.startswith("."):
-                continue
-            candidates.append(volume)
-            case_materials = volume / "案件资料"
-            if case_materials.exists():
-                candidates.insert(0, case_materials)
-
-    seen: set[Path] = set()
-    roots: list[Path] = []
-    for candidate in candidates:
-        try:
-            resolved = candidate.expanduser().resolve()
-        except OSError:
-            continue
-        if resolved.exists() and resolved not in seen:
-            seen.add(resolved)
-            roots.append(resolved)
-    return roots
 
 
-def _find_matching_files(root: Path, wanted: set[str], *, max_depth: int = 5, max_entries: int = 30000) -> list[Path]:
-    matches: list[Path] = []
-    root = root.resolve()
-    visited = 0
-    for current, dirs, files in os.walk(root):
-        visited += len(dirs) + len(files)
-        if visited > max_entries:
-            break
-        current_path = Path(current)
-        depth = len(current_path.relative_to(root).parts)
-        dirs[:] = [item for item in dirs if not item.startswith(".") and item not in {"__pycache__", ".git", ".venv"}]
-        if depth >= max_depth:
-            dirs[:] = []
-        for filename in files:
-            if filename in wanted:
-                matches.append(current_path / filename)
-    return matches
 
 
 def _render_mapping_review_toolbar(redaction_map: RedactionMap, review_candidates: list | None = None) -> str:
@@ -2804,8 +2686,10 @@ async def _read_input_documents(
         documents.append(InputDocument(source_file="粘贴文本.txt", text=text))
 
     target_files = []
-    if file and file.filename: target_files.append(file)
-    if files: target_files.extend([f for f in files if f.filename])
+    if file and file.filename:
+        target_files.append(file)
+    if files:
+        target_files.extend([f for f in files if f.filename])
     folder_target_files = [
         item
         for item in (case_folder_files or [])
@@ -2830,7 +2714,8 @@ async def _read_input_documents(
             raise ValueError(f"读取文件 {item.filename} 失败: {exc}") from exc
         documents.append(InputDocument(source_file=item.filename, text=content))
 
-    if not documents: raise ValueError("未提供任何待脱敏的文本或文件")
+    if not documents:
+        raise ValueError("未提供任何待脱敏的文本或文件")
     return documents
 
 def _decode_text_bytes(data: bytes, filename: str) -> str:
@@ -2960,10 +2845,12 @@ def _redaction_map_from_rows(
     row_count = max(len(map_original), len(map_masked), len(map_type))
     mappings: list[MappingEntry] = []
     for index in range(row_count):
-        if str(index) in deleted: continue
+        if str(index) in deleted:
+            continue
         original = _form_list_value(map_original, index).strip()
         masked = _form_list_value(map_masked, index).strip()
-        if not original or not masked: continue
+        if not original or not masked:
+            continue
         role = _form_list_value(map_role, index).strip() or None
         try:
             confidence = float(_form_list_value(map_confidence, index) or "1.0")
@@ -3258,7 +3145,8 @@ def _manual_location_suffix(original: str) -> str:
 
 
 def _form_list_value(values: list[str], index: int) -> str:
-    if index >= len(values): return ""
+    if index >= len(values):
+        return ""
     return values[index]
 
 
@@ -3275,11 +3163,19 @@ def _documents_bundle_json(documents: list[RedactedDocument]) -> str:
 
 
 def _documents_from_bundle_json(value: str) -> list[InputDocument]:
-    if not value.strip(): return []
-    try: payload = json.loads(value)
-    except json.JSONDecodeError: return []
-    if not isinstance(payload, list): return []
-    return [InputDocument(source_file=str(i.get("source_file","")), text=str(i.get("text",""))) for i in payload if isinstance(i, dict)]
+    if not value.strip():
+        return []
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [
+        InputDocument(source_file=str(item.get("source_file", "")), text=str(item.get("text", "")))
+        for item in payload
+        if isinstance(item, dict)
+    ]
 
 
 def _apply_map_to_documents(pipeline: RedactionPipeline, documents: list[InputDocument], redaction_map: RedactionMap) -> list[RedactedDocument]:
@@ -3351,7 +3247,7 @@ def _guess_location_mask(text: str) -> str:
     # 无后缀的地名简称：根据常见模式推测
     if re.fullmatch(r"[一-龥]{2,4}", text):
         return "某市"  # 最常见的地名简称是城市名
-    return f"地点"
+    return "地点"
 
 
 def _simple_mask(text: str, counters: TypeCounters) -> str:

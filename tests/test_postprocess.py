@@ -7,15 +7,16 @@ previously inlined as different call sequences.
 """
 
 from legal_redactor.models import MappingEntry
-from legal_redactor.pipeline import (
+from legal_redactor.postprocess import (
+    PostprocessConfig,
     _filter_fragments_inside_longer_entities,
     _filter_locations_inside_organizations,
     _filter_mappings_inside_trusted_samples,
     _filter_noise_entity_mappings,
     _filter_org_alias_prefixed_locations,
     _merge_organization_alias_mappings,
+    apply_postprocess,
 )
-from legal_redactor.postprocess import PostprocessConfig, apply_postprocess
 
 
 def _mappings() -> list[MappingEntry]:

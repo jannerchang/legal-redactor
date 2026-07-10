@@ -5,11 +5,14 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from .config import HIGH_RISK_TYPES
+from .filters import clean_organization_text as _clean_organization_text
+from .filters import clean_person_name as _clean_person_name
+from .filters import is_false_org as _is_false_org
+from .filters import is_false_person as _is_false_person
+from .filters import looks_like_false_location as _looks_like_false_location
 from .lexicon import (
     COMMON_SURNAMES,
-    FALSE_PERSON_WORDS,
     FALLBACK_PERSON_PATTERNS,
-    PERSON_AFTER_KINSHIP_RE,
 )
 from .models import Candidate
 
@@ -50,7 +53,7 @@ ROLE_NAMES = (
 ROLE_RE = re.compile(rf"^\s*(?P<role>{'|'.join(ROLE_NAMES)})\s*(?:[：:]|\s+)?\s*(?P<body>.+?)\s*$")
 ROLE_PREFIX_RE = re.compile(rf"^\s*(?P<role>{'|'.join(ROLE_NAMES)})(?:[一二三四五六七八九十\d]+)?(?:[（\(].*?[）\)])?\s*(?:[：:]|\s+)?\s*(?P<body>.+?)\s*$")
 
-PHONE_RE = re.compile(r"(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d{9}(?!\d)")
+PHONE_RE = re.compile(r"(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d(?:[-\s]?\d){8}(?!\d)")
 ID_RE = re.compile(
     r"(?<![0-9Xx])\d{6}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])"
     r"(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?![0-9Xx])"
@@ -80,31 +83,34 @@ COURT_RE = re.compile(r"[\u4e00-\u9fa5]{2,45}(?:" + "|".join(COURT_SUFFIXES) + r
 
 # 增加排除前缀，避免把“以下简称”等词抓进机构名
 ORG_RE = re.compile(
-    # 1) 含行政区划前缀的公司/机构
+    # 1) 含行政区划前缀的公司/机构（可带分行/支行/分公司等网点后缀）
     r"[\u4e00-\u9fa5]{2,5}(?:省|市|区|县|自治[区州县]|旗)[\u4e00-\u9fa5A-Za-z0-9()（）·]{1,40}"
     r"(?:有限责任公司|股份有限公司|集团有限公司|有限公司|公司|集团)"
+    r"(?:[\u4e00-\u9fa5A-Za-z0-9·]{1,20}(?:分行|支行|分公司|营业部))?"
     r"|"
-    # 2) 以下简称/简称后，或在句首/标点后的公司简称  
+    # 2) 通用公司名（优先于“……银行”短后缀，避免截断“XX银行股份有限公司YY分行”）
+    r"[\u4e00-\u9fa5A-Za-z0-9()（）·]{2,45}(?:有限责任公司|股份有限公司|集团有限公司|有限公司)"
+    r"(?:[\u4e00-\u9fa5A-Za-z0-9·]{1,20}(?:分行|支行|分公司|营业部))?"
+    r"|"
+    # 3) 以下简称/简称后，或在句首/标点后的公司简称
     r"(?:(?<=以下简称)|(?<=简称)|(?<=下称)|(?<=[，。；、\n：]))[\u4e00-\u9fa5A-Za-z0-9·]{2,20}(?:公司|集团)"
     r"|"
-    # 3) 专业事务所
+    # 4) 专业事务所
     r"[\u4e00-\u9fa5A-Za-z0-9·]{2,25}(?:律师事务所|会计师事务所)"
     r"|"
-    # 4) 教育机构（幼儿园前缀通常较短，单独处理）
+    # 5) 教育机构（幼儿园前缀通常较短，单独处理）
     r"[\u4e00-\u9fa5]{2,30}(?:幼儿园)"
     r"|"
-    # 5) 机构/单位（需较长前缀防止误匹配）
+    # 6) 机构/单位（银行不吞掉“银行股份有限公司…”）
     r"[\u4e00-\u9fa5]{4,30}"
-    r"(?:委员会|管理局|公安局|税务局|中心|医院|学校|银行)"
+    r"(?:委员会|管理局|公安局|税务局|中心|医院|学校|(?:银行(?!股份|有限)))"
+    r"(?:[\u4e00-\u9fa5A-Za-z0-9·]{1,20}(?:分行|支行|营业部))?"
     r"|"
-    # 6) 个体工商户/经营部/商行/工作室
-    r"[\u4e00-\u9fa5]{3,25}(?:个体工商户|经营部|商行|工作室)"
+    # 7) 个体工商户/经营部/商行/工作室
+    r"[\u4e00-\u9fa5]{3,25}(?:个体工商户|经营部|商行|饭店)"
     r"|"
-    # 7) 带地名前缀的厂/店
+    # 8) 带地名前缀的厂/店
     r"[\u4e00-\u9fa5]{2,10}(?:省|市|区|县)[\u4e00-\u9fa5]{2,25}(?:厂|店)"
-    r"|"
-    # 8) 通用公司名（不要求行政区划前缀）
-    r"[\u4e00-\u9fa5A-Za-z0-9()（）·]{2,45}(?:有限责任公司|股份有限公司|集团有限公司|有限公司)"
 )
 PROJECT_RE = re.compile(
     r"(?<!案件)[\u4e00-\u9fa5A-Za-z0-9·]{4,45}?" # 避免匹配“本案件”
@@ -126,7 +132,9 @@ ADDRESS_BODY_RE = re.compile(
     r"[\u4e00-\u9fa5]{2,12}(?:省|自治区|市)"
     r"[\u4e00-\u9fa5A-Za-z0-9号幢栋单元室楼层路街弄巷村社区区县镇乡\-]{6,70}"
 )
-PERSON_AFTER_ROLE_RE = re.compile(r"(?:证人|联系人|经办人|代理人|法定代表人|负责人|经营者)[：:]?\s*([\u4e00-\u9fa5]{2,4})")
+PERSON_AFTER_ROLE_RE = re.compile(
+    r"(?:证人|联系人|经办人|代理人|法定代表人|负责人|经营者)[：:]?\s*([\u4e00-\u9fa5·]{2,4})"
+)
 # PERSON_AFTER_KINSHIP_RE relocated to lexicon (re-exported here via import);
 # see lexicon.PERSON_AFTER_KINSHIP_RE.
 
@@ -222,19 +230,15 @@ def _extract_party_entity(body: str) -> str:
         return ""
     body = re.sub(r"^(?:自然人|公民|公司|单位|个体工商户)\s*", "", body)
     field = re.split(r"[，,。；;、\n]", body, maxsplit=1)[0].strip()
-    
+
     if not field:
         return ""
-        
+
     # 移除末尾可能的动作词（如“答辩称”、“诉称”、“称”等）
     field = re.sub(r"(?:答辩称|辩称|诉称|申请称|复议称|补充陈述|补充说明|陈述|说明|补充|称)$", "", field).strip()
     if not field:
         return ""
-        
-    # 排除明显的案件叙述行
-    if any(kw in field for kw in ("纠纷一案", "纠纷案", "一案", "本院", "审理", "查明", "判决")):
-        return ""
-        
+
     # 1. 优先尝试作为完整机构匹配（保留机构名中的括号如（集团））
     org_match = ORG_RE.search(field)
     if org_match and org_match.start() == 0:
@@ -242,14 +246,37 @@ def _extract_party_entity(body: str) -> str:
         if cleaned and cleaned not in {"公司", "该公司", "本公司", "分公司"}:
             return cleaned
 
-    # 2. 如果不是机构，移除可能存在的尾部括号（如人名的曾用名、简称等）
+    # 2. 角色后“姓名 + 动作/属性”：证人刘芳到庭作证 / 上诉人陈戊靖不服原审判决
+    #    只取句首 2–4 字姓名，避免把“到庭作证”“提出异议”等并入实体。
+    person_action = re.match(
+        r"^(?P<name>[\u4e00-\u9fa5·]{2,4})(?:"
+        r"到庭|出庭|参加|提出|申请|不服|负责|办理|陈述|说明|表示|确认|拒绝|要求|主张|"
+        r"辩称|诉称|称|系|为|男|女|汉族|住|住所地|身份证|公民身份|于|在|已|将|以|向|与"
+        r")",
+        field,
+    )
+    if person_action:
+        name = person_action.group("name")
+        if not _is_false_person(name):
+            return name
+
+    # 3. 如果不是机构，移除可能存在的尾部括号（如人名的曾用名、简称等）
     field_clean = re.sub(r"（.*?）|\(.*?\)", "", field).strip()
     field_clean = field_clean.strip(" ：:，,。；;、")
-    
+
     if not field_clean:
         return ""
-        
-    # 3. 针对剩余情况（主要是人名或未被正则识别的罕见组织）
+
+    # 4. 叙述句含“判决/一案”等时：若句首为人名则仅取人名，否则整段丢弃
+    if any(kw in field_clean for kw in ("纠纷一案", "纠纷案", "一案", "本院", "审理", "查明", "判决", "裁定")):
+        leading = re.match(r"^(?P<name>[\u4e00-\u9fa5·]{2,4})", field_clean)
+        if leading:
+            name = leading.group("name")
+            if not _is_false_person(name):
+                return name
+        return ""
+
+    # 5. 针对剩余情况（主要是人名或未被正则识别的罕见组织）
     return field_clean
 
 
@@ -269,15 +296,52 @@ def classify_entity(text: str, role: str | None = None) -> str:
     return "person"
 
 
+def _best_organization_surface(raw: str) -> str:
+    """从可能左边界过宽的 ORG_RE 命中中选出可用的机构表面形式。
+
+    例如“郝亚雄去跟天津市慕尚…有限公司”应收敛为“天津市慕尚…有限公司”，
+    而“中国建设银行股份有限公司石家庄分行”应保留完整网点名。
+    """
+    cleaned = _clean_organization_text(raw) or _clean_org_simple(raw)
+    if cleaned and not _is_false_org(cleaned) and not re.match(r"^[跟与和及由在为的见向对]", cleaned):
+        return cleaned
+
+    best = ""
+    best_score = -1
+    for index in range(len(raw)):
+        match = ORG_RE.match(raw, index)
+        if not match:
+            continue
+        candidate = _clean_organization_text(match.group(0)) or match.group(0)
+        if (
+            not candidate
+            or candidate in {"公司", "该公司", "本公司", "分公司"}
+            or _is_false_org(candidate)
+            or re.match(r"^[跟与和及由在为的见向对]", candidate)
+        ):
+            continue
+        score = len(candidate)
+        if re.match(r"[\u4e00-\u9fa5]{2,5}(?:省|市|区|县|自治[区州县]|旗)", candidate):
+            score += 10
+        if candidate.endswith(("分行", "支行", "分公司", "营业部")):
+            score += 5
+        if score > best_score:
+            best = candidate
+            best_score = score
+    return best
+
+
 def extract_organization_entities(text: str) -> list[tuple[str, int, int]]:
     entities: list[tuple[str, int, int]] = []
     for match in ORG_RE.finditer(text):
         raw = match.group(0)
-        # ORG_RE 已经做了很好的筛选，这里只做最小清理
-        value = _clean_org_simple(raw)
-        if not value or value in {"公司", "该公司", "本公司", "分公司"}:
+        value = _best_organization_surface(raw)
+        if not value:
             continue
-        start = match.start() + raw.find(value)
+        local = raw.find(value)
+        if local < 0:
+            continue
+        start = match.start() + local
         entities.append((value, start, start + len(value)))
     return entities
 
@@ -377,7 +441,11 @@ def detect_inline_party_person_list_candidates(text: str) -> list[Candidate]:
         parts = re.split(r"[、,，]|(?:和|及)(?=[\u4e00-\u9fa5]{2,4}(?:[、,，]|$))", tail)
         for part in parts:
             raw = part.strip(" ：:，,。；;\n\t")
-            raw = re.split(r"(?:男|女|汉族|住|住所地|身份证|公民身份)", raw, maxsplit=1)[0]
+            raw = re.split(
+                r"(?:男|女|汉族|住|住所地|身份证|公民身份|到庭|出庭|参加|提出|申请|不服|负责|办理)",
+                raw,
+                maxsplit=1,
+            )[0]
             value = _clean_person_name(raw)
             if _is_false_person(value) or not re.fullmatch(r"[\u4e00-\u9fa5·]{2,6}", value):
                 continue
@@ -426,6 +494,7 @@ def detect_regex_candidates(text: str, include_addresses: bool = False) -> list[
 def detect_title_candidates(text: str) -> list[Candidate]:
     candidates: list[Candidate] = []
     non_empty_seen = 0
+    title_markers = ("判决书", "裁定书", "调解书", "决定书", "纠纷一案", "纠纷案")
     for line in iter_line_spans(text):
         stripped = line.text.strip()
         if not stripped:
@@ -433,7 +502,7 @@ def detect_title_candidates(text: str) -> list[Candidate]:
         non_empty_seen += 1
         if non_empty_seen > 12 or parse_party_line(stripped):
             break
-        if any(key in stripped for key in ("判决书", "裁定书", "调解书", "决定书")):
+        if any(key in stripped for key in title_markers):
             match = TITLE_ENTITY_RE.search(stripped)
             if match:
                 for group in ("a", "b"):
@@ -463,10 +532,6 @@ def detect_title_candidates(text: str) -> list[Candidate]:
 
 # 中文法律文书中常见的人名模式
 _FALLBACK_PERSON_PATTERNS = FALLBACK_PERSON_PATTERNS
-# 不应识别的常见词
-# Relocated to lexicon.FALSE_PERSON_WORDS; alias kept for backward-compatible
-# imports (pipeline.py, tests/test_sample_integration.py).
-_FALSE_PERSON_WORDS = FALSE_PERSON_WORDS
 
 
 def detect_fallback_person_candidates(text: str) -> list[Candidate]:
@@ -556,12 +621,15 @@ def detect_heuristic_ner_candidates(text: str) -> list[Candidate]:
             elif entity_type == "location":
                 value = _clean_location_text(raw)
             elif entity_type == "organization":
-                value = _clean_organization_text(raw)
+                value = _best_organization_surface(raw)
             else:
                 value = _clean_candidate_text(raw)
             if not value or value.startswith("某"):
                 continue
-            start = match.start() + match.group(0).find(value)
+            local = match.group(0).find(value)
+            if local < 0:
+                continue
+            start = match.start() + local
             # ── 地名上下文过滤：先收窄“张三住某地”这类边界，再判断是否伪地名 ──
             if entity_type == "location" and _looks_like_false_location(text, start, start + len(value), value):
                 continue
@@ -1000,7 +1068,6 @@ def remove_court_signatures(text: str) -> str:
     for i in range(len(lines) - 1, -1, -1):
         if _COURT_SIGNATURE_RE.match(lines[i]):
             # 找到了，删除从此行往后的所有符合模式的行
-            start = i
             # 往前找到第一个不匹配的，确定签名块范围
             # 实际上审判组织行通常是连续的几行，从前往后删
             clean = []
@@ -1020,17 +1087,3 @@ def remove_court_signatures(text: str) -> str:
                 j += 1
             return "\n".join(clean)
     return text
-
-
-# ── Backward-compat aliases ─────────────────────────────────────────
-# Clean/reject helpers have been relocated to .filters; these underscore
-# aliases keep existing `from .detectors import _...` call sites (pipeline,
-# linear_engine, org_masking, tests) working without changes.
-from . import filters as _filters
-
-_clean_person_name = _filters.clean_person_name
-_is_false_person = _filters.is_false_person
-_is_false_org = _filters.is_false_org
-_looks_like_false_location = _filters.looks_like_false_location
-_clean_organization_text = _filters.clean_organization_text
-_clean_unbalanced_brackets = _filters._clean_unbalanced_brackets

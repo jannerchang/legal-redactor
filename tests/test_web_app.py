@@ -30,8 +30,8 @@ try:
         _restore_risk_reasons,
         _should_apply_auto_prefill,
         _suggest_manual_mapping_entry,
-        _suggest_case_location_from_filenames,
         _suggest_case_location_from_relative_paths,
+        _safe_public_error_message,
         send_redacted_to_discord,
         attach_to_bound_discord_thread,
         app,
@@ -39,6 +39,7 @@ try:
         health,
         index,
     )
+    from legal_redactor.cases import suggest_case_location_from_filenames
 except RuntimeError as exc:  # Web deps are optional for non-Web unit runs.
     _case_creation_command = None
     _classify_mapping_review_row = None
@@ -55,13 +56,14 @@ except RuntimeError as exc:  # Web deps are optional for non-Web unit runs.
     _restore_risk_reasons = None
     _should_apply_auto_prefill = None
     _suggest_manual_mapping_entry = None
-    _suggest_case_location_from_filenames = None
+    suggest_case_location_from_filenames = None
     _suggest_case_location_from_relative_paths = None
     send_redacted_to_discord = None
     attach_to_bound_discord_thread = None
     app = None
     create_discord_thread = None
     health = None
+    _safe_public_error_message = None
     index = None
     _IMPORT_ERROR = exc
 else:
@@ -210,32 +212,6 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertIn("-convert", run.call_args.args[0])
         self.assertIn("txt", run.call_args.args[0])
 
-    def test_save_to_local_endpoint(self) -> None:
-        import asyncio
-        from legal_redactor.web_app import save_to_local
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            payload = {
-                "directory": tmpdir,
-                "files": [
-                    {"filename": "test1.txt", "content": "Hello World"},
-                    {"filename": "test2.json", "content": '{"a": 1}'}
-                ]
-            }
-            response = asyncio.run(save_to_local(MockJsonRequest(payload)))
-            self.assertEqual(response.status_code, 200)
-
-            data = json.loads(response.body.decode("utf-8"))
-            self.assertEqual(data["status"], "success")
-
-            # 校验物理文件确实存在且内容正确
-            self.assertTrue(os.path.exists(os.path.join(tmpdir, "test1.txt")))
-            self.assertTrue(os.path.exists(os.path.join(tmpdir, "test2.json")))
-
-            with open(os.path.join(tmpdir, "test1.txt"), "r", encoding="utf-8") as f:
-                self.assertEqual(f.read(), "Hello World")
-            with open(os.path.join(tmpdir, "test2.json"), "r", encoding="utf-8") as f:
-                self.assertEqual(f.read(), '{"a": 1}')
 
     def test_optional_case_redaction_persists_manifest_and_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -374,7 +350,7 @@ class WebAppUploadTests(unittest.TestCase):
                 "https://discord.com/channels/1/2/3",
             )
 
-            result = _suggest_case_location_from_filenames(["judgment.docx"], [Path(tmpdir)])
+            result = suggest_case_location_from_filenames(["judgment.docx"], [Path(tmpdir)])
 
             self.assertEqual(result["status"], "ok")
             self.assertEqual(result["case_folder"], "2026 3624")
@@ -397,7 +373,7 @@ class WebAppUploadTests(unittest.TestCase):
             (case_a / "证据目录.pdf").write_text("b", encoding="utf-8")
             (case_b / "起诉状.doc").write_text("c", encoding="utf-8")
 
-            result = _suggest_case_location_from_filenames(
+            result = suggest_case_location_from_filenames(
                 ["起诉状.doc", "证据目录.pdf"],
                 [root],
             )
@@ -739,6 +715,198 @@ class WebAppUploadTests(unittest.TestCase):
             self.assertEqual(manifest.discord_thread_url, "")
             self.assertEqual(manifest.discord_thread_id, "")
 
+    def test_redact_route_falls_back_to_offline_rules_when_mlx_unavailable_and_saves_case(self) -> None:
+        from pathlib import Path
+        from fastapi.testclient import TestClient
+        from legal_redactor.config import PipelineConfig
+        from legal_redactor.cases import load_manifest
+
+        configs = []
+
+        class FakePipeline:
+            def __init__(self, config) -> None:
+                self.config = config
+                configs.append(config)
+
+            def redact(self, text, source_file=None, base_redaction_map=None):
+                assert text == "原告张三。"
+                assert base_redaction_map is None
+                assert self.config.enable_local_llm is False
+                return RedactionResult(
+                    original_text=text,
+                    redacted_text="原告张某1。",
+                    redaction_map=RedactionMap.create(
+                        [
+                            MappingEntry(
+                                type="person",
+                                original="张三",
+                                masked="张某1",
+                                role=None,
+                                source="test",
+                                confidence=1.0,
+                                restore_by_default=True,
+                            )
+                        ]
+                    ),
+                    candidates=[],
+                    review_candidates=[],
+                    leaks=[],
+                    mode="test",
+                    warnings=[],
+                )
+
+        unavailable = SimpleNamespace(state="error", message="mlx missing", action="start mlx")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch("legal_redactor.web_app.ensure_mlx_server_ready", return_value=unavailable),
+                patch("legal_redactor.web_app.PipelineConfig.from_llm_mode", side_effect=lambda *args, **kwargs: PipelineConfig.max_effect(*args[1:], **kwargs)),
+                patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
+            ):
+                response = TestClient(app).post(
+                    "/redact",
+                    data={
+                        "text": "原告张三。",
+                        "case_root": tmpdir,
+                        "case_folder": "2026 3624",
+                    },
+                )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("原告张某1。", response.text)
+            self.assertEqual(len(configs), 1)
+            self.assertFalse(configs[0].enable_local_llm)
+            manifest = load_manifest(Path(tmpdir) / "2026 3624")
+            self.assertEqual(manifest.case_folder, "2026 3624")
+            self.assertTrue((Path(tmpdir) / "2026 3624" / "redacted" / "redacted.txt").exists())
+            self.assertTrue((Path(tmpdir) / "2026 3624" / "mapping" / "redaction_map.enc").exists())
+
+    def test_redact_confirmed_falls_back_to_offline_rules_when_mlx_unavailable(self) -> None:
+        from fastapi.testclient import TestClient
+        from legal_redactor.config import PipelineConfig
+
+        configs = []
+
+        class FakePipeline:
+            def __init__(self, config) -> None:
+                self.config = config
+                configs.append(config)
+
+            def apply_redaction_map(self, text, redaction_map):
+                return text.replace("张三", "张某1")
+
+            def scan_high_risk_leaks(self, text):
+                return []
+
+            def analyze(self, text):
+                assert self.config.enable_local_llm is False
+                return {"entity_groups": [], "locations": [], "warnings": []}
+
+        unavailable = SimpleNamespace(state="error", message="mlx missing", action="start mlx")
+        bundle = json.dumps([{"source_file": "a.txt", "text": "原告张三。"}], ensure_ascii=False)
+        analysis = json.dumps(
+            {
+                "entity_groups": [
+                    {
+                        "id": "g1",
+                        "type": "person",
+                        "full_name": "张三",
+                        "aliases": [],
+                        "role": "原告",
+                    }
+                ],
+                "locations": [],
+            },
+            ensure_ascii=False,
+        )
+        with (
+            patch("legal_redactor.web_app.ensure_mlx_server_ready", return_value=unavailable),
+            patch(
+                "legal_redactor.web_app.PipelineConfig.from_llm_mode",
+                side_effect=lambda *args, **kwargs: PipelineConfig.max_effect(*args[1:], **kwargs),
+            ),
+            patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
+        ):
+            response = TestClient(app).post(
+                "/redact/confirmed",
+                data={
+                    "bundle_json": bundle,
+                    "analysis_json": analysis,
+                    "group_g1_enabled": "1",
+                    "round": "0",
+                    "action": "continue",
+                    "previous_map_json": "{}",
+                    "previous_deselected_json": "[]",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        # first offline apply pipeline + second offline analyze pipeline
+        self.assertGreaterEqual(len(configs), 2)
+        self.assertTrue(all(cfg.enable_local_llm is False for cfg in configs))
+
+    def test_clear_samples_api_returns_delete_stats_and_rebuilds_auto_file(self) -> None:
+        from pathlib import Path
+        from fastapi.testclient import TestClient
+        from legal_redactor._samples import AUTO_SAMPLE_FILE, save_sample_auto
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            samples_dir = Path(tmpdir)
+            save_sample_auto(
+                [{"action": "add", "type": "manual", "original": "胖哥公司", "masked": "乙公司"}],
+                source="web-test",
+                samples_dir=samples_dir,
+            )
+            with patch("legal_redactor._samples.DEFAULT_SAMPLES_DIR", samples_dir):
+                response = TestClient(app).post("/api/samples/clear")
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["status"], "ok")
+            self.assertGreaterEqual(payload["removed_entries"], 1)
+            self.assertGreaterEqual(payload["removed_files"], 1)
+            self.assertEqual(payload["sample_file"], AUTO_SAMPLE_FILE)
+            auto_path = samples_dir / AUTO_SAMPLE_FILE
+            self.assertTrue(auto_path.exists())
+            data = json.loads(auto_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["entries"], [])
+            self.assertEqual(data["total"], 0)
+
+    def test_legacy_cli_redact_writes_encrypted_map_file(self) -> None:
+        from pathlib import Path
+        from legal_redactor import cli
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            input_path = root / "judgment.txt"
+            output_dir = root / "out"
+            input_path.write_text("原告张三。", encoding="utf-8")
+            encrypted_map_calls = []
+
+            def fake_redact(self, text, source_file=None):
+                return RedactionResult(
+                    original_text=text,
+                    redacted_text="原告张某1。",
+                    redaction_map=RedactionMap.create(
+                        [MappingEntry("person", "张三", "张某1", None, "test", 1.0, True)]
+                    ),
+                    candidates=[],
+                    review_candidates=[],
+                    leaks=[],
+                    mode="test",
+                    warnings=[],
+                )
+
+            with (
+                patch("legal_redactor.cli.RedactionPipeline.redact", fake_redact),
+                patch("legal_redactor.cli.save_redaction_map_auto", side_effect=lambda path, redaction_map: encrypted_map_calls.append(Path(path))),
+            ):
+                exit_code = cli.main(["redact", str(input_path), "--out", str(output_dir), "--no-llm"])
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((output_dir / "judgment.redacted.txt").exists())
+            self.assertEqual(encrypted_map_calls, [output_dir / "redaction_map.enc"])
+            self.assertFalse((output_dir / "redaction_map.json").exists())
+
     def test_redact_route_directory_upload_prefers_inferred_root_over_default_root(self) -> None:
         from pathlib import Path
         from fastapi.testclient import TestClient
@@ -765,7 +933,7 @@ class WebAppUploadTests(unittest.TestCase):
             (actual / "2026 8888").mkdir()
             with (
                 patch.dict(os.environ, {"LEGAL_REDACTOR_CASE_ROOT": default_root}),
-                patch("legal_redactor.web_app._case_location_search_roots", return_value=[actual]),
+                patch("legal_redactor.web_app.case_location_search_roots", return_value=[actual]),
                 patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
             ):
                 response = TestClient(app).post(
@@ -1155,6 +1323,23 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(data["status"], "success")
         self.assertEqual(calls, [("3", "redacted.txt", "脱敏内容", "请按我填写的附言发送。")])
+
+    def test_public_error_message_scrubs_cross_platform_paths(self) -> None:
+        cases = {
+            "/Users/alice/private/case.docx": ["alice", "case.docx"],
+            "/tmp/legal-redactor/secret/map.enc": ["legal-redactor", "map.enc"],
+            r"C:\Users\alice\private\case.docx": ["alice", "case.docx"],
+            r"\\server\share\private\case.docx": ["server", "share", "case.docx"],
+        }
+
+        for path, forbidden_parts in cases.items():
+            message = _safe_public_error_message(f"案件保存失败：{path} permission denied")
+            self.assertIn("<local-path>", message)
+            for part in forbidden_parts:
+                self.assertNotIn(part, message)
+
+        legal_text = "合同编号 A\\B-001 无法解析"
+        self.assertEqual(_safe_public_error_message(legal_text), legal_text)
 
     def test_send_redacted_to_discord_falls_back_when_message_contains_path(self) -> None:
         import asyncio

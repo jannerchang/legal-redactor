@@ -236,10 +236,24 @@ def test_restore_path_and_timing_helpers_are_safe(tmp_path) -> None:
 
 def test_remote_payload_safety_rejects_forbidden_fields_and_values() -> None:
     assert_remote_payload_safe({"restore": {"restored_filename": "judgment.txt"}})
-    with pytest.raises(ValueError):
-        assert_remote_payload_safe({"restore": {"unresolved_placeholders": ["【PERSON_001】"]}})
-    with pytest.raises(ValueError):
-        assert_remote_payload_safe({"restore": {"restored_relative_path": "/Users/jannerchang/private.txt"}})
+    assert_remote_payload_safe({"restore": {"restored_relative_path": "restored/judgment.txt"}})
+    for payload in [
+        {"restore": {"unresolved_placeholders": ["【PERSON_001】"]}},
+        {"restore": {"restored_relative_path": "/Users/jannerchang/private.txt"}},
+        {"restore": {"restored_relative_path": "../../secret.txt"}},
+        {"restore": {"restored_relative_path": "/private/model.bin"}},
+        {"restore": {"restored_relative_path": "C:\\Users\\jannerchang\\private-model\\model.bin"}},
+        {"restore": {"restored_relative_path": "C:/Users/jannerchang/private-model/model.bin"}},
+        {"restore": {"restored_relative_path": "\\\\server\\share\\private-model\\model.bin"}},
+        {"restore": {"restored_relative_path": "//server/share/private-model/model.bin"}},
+        {"restore": {"restored_relative_path": "\\\\fileserver"}},
+        {"restore": {"restored_relative_path": "restored\\judgment.txt"}},
+        {"restore": {"restored_filename": "dir/judgment.txt"}},
+        {"restore": {"restored_filename": "\\\\server\\share\\x.txt"}},
+    ]:
+        with pytest.raises(ValueError):
+            assert_remote_payload_safe(payload)
+
 
 
 def test_suggest_case_location_returns_evidence_and_manifest_summary(tmp_path) -> None:

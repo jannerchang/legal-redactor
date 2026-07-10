@@ -194,19 +194,8 @@ class LocalLLMConfig:
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    strategy: str = "linear"
-    replacement_order: str = "longest_first"
     semantic_llm_first: bool = False
-    preserve_core_facts: bool = True
-    human_review: bool = True
-    fail_on_high_risk_leak: bool = True
-    auto_accept_confidence: float = 0.92
-    review_confidence_min: float = 0.50
-    high_risk_auto_redact: bool = True
-    high_risk_types: set[str] = field(default_factory=lambda: set(HIGH_RISK_TYPES))
     enable_regex: bool = True
-    enable_party_parser: bool = True
-    enable_title_parser: bool = True
     enable_hebei_admin_db: bool = True
     hebei_admin_db_path: str = "data/hebei_admin_divisions.sqlite"
     enable_china_admin_db: bool = True
@@ -219,7 +208,6 @@ class PipelineConfig:
     enable_local_llm: bool = True
     local_llm: LocalLLMConfig = field(default_factory=LocalLLMConfig)
     redaction_profile: RedactionProfile = field(default_factory=RedactionProfile.standard)
-    enable_sample_library: bool = True
 
     @property
     def profile(self) -> str:
@@ -276,4 +264,6 @@ class PipelineConfig:
             return cls.offline_without_llm(profile_name)
         if llm_mode == "balanced":
             return cls.balanced_llm(profile_name)
-        return cls.max_effect(profile_name)
+        if llm_mode == "max-effect":
+            return cls.max_effect(profile_name)
+        raise ValueError(f"unsupported llm mode: {llm_mode}")

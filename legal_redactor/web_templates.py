@@ -656,55 +656,6 @@ def _page(title: str, body: str) -> str:
         createDiscordThread(btn);
       }});
 
-      // 本地直接保存 API 调用
-      async function saveToLocalPath(files, buttonEl) {{
-        var dirInput = document.getElementById('local-save-dir');
-        if (!dirInput) {{
-          toast('系统错误：找不到路径输入框', 'warn');
-          return;
-        }}
-        var directory = dirInput.value.trim();
-        if (!directory) {{
-          toast('请输入或粘贴保存目录路径！', 'warn');
-          dirInput.focus();
-          return;
-        }}
-
-        if (buttonEl) {{
-          buttonEl.disabled = true;
-          var origText = buttonEl.textContent || buttonEl.innerText;
-          buttonEl.textContent = '正在保存...';
-        }}
-
-        try {{
-          var resp = await fetch('/api/save-to-local', {{
-            method: 'POST',
-            headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify({{
-              directory: directory,
-              files: files
-            }})
-          }});
-          var res = await resp.json();
-          if (resp.ok && res.status === 'success') {{
-            toast('文件已成功保存到本地！');
-            localStorage.setItem('last_local_save_dir', res.directory);
-            document.querySelectorAll('#local-save-dir').forEach(function(inp) {{
-              inp.value = res.directory;
-            }});
-          }} else {{
-            toast(res.message || '保存失败', 'warn');
-          }}
-        }} catch (err) {{
-          console.error(err);
-          toast('网络或系统错误：' + err.message, 'warn');
-        }} finally {{
-          if (buttonEl) {{
-            buttonEl.disabled = false;
-            buttonEl.textContent = origText;
-          }}
-        }}
-      }}
 
       // 全局拦截下载链接点击，使用 showSaveFilePicker 选择自定义路径
       document.addEventListener('click', async function(e) {{
@@ -844,16 +795,12 @@ def render_home_page(
               <p class="hint">统一标准脱敏：人名、地名、机构名称及敏感编号按同一套规则处理。</p>
               <input type="hidden" name="enable_llm" value="1">
             </div>
-            <label style="display:flex; align-items:center; gap:8px; margin-top:12px; margin-bottom:12px; cursor:pointer;">
-              <input type="checkbox" name="enable_samples" value="1" checked style="width:auto; margin:0;">
-              <span>使用样本库（利用历史黑名单与正样本）</span>
-            </label>
             <label>分析模型</label>
             <p class="hint">固定使用 MLX Qwen3.5 9B 本地模型。</p>
             <input type="hidden" name="llm_mode" value="max-effect">
             <label style="display:flex; align-items:center; gap:8px; margin-top:12px; margin-bottom:12px; cursor:pointer;">
               <input type="checkbox" name="enable_hanlp" value="1" {hanlp_attr} style="width:auto; margin:0;">
-              <span>HanLP 本地候选识别（已安装时默认启用）</span>
+              <span>HanLP 本地候选识别（可选启用，默认关闭以节省内存）</span>
             </label>
             <label>HanLP 模型（故障排查时再调整）</label>
             <input type="text" name="hanlp_model" value="MSRA_NER_ELECTRA_SMALL_ZH" style="max-width:320px">
@@ -948,36 +895,6 @@ def render_redaction_result_page(
 
         {workflow_panel}
 
-        <section class="local-save-section" style="border-left: 4px solid var(--accent); background: linear-gradient(135deg, var(--surface) 0%, rgba(26, 122, 109, 0.02) 100%); padding: 18px 24px; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 18px; box-shadow: var(--shadow);">
-          <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 15px;">
-            <div style="flex: 1; min-width: 280px;">
-              <h3 style="margin: 0 0 6px 0; font-size: 14px; font-weight: 600; color: var(--ink); display: flex; align-items: center; gap: 6px;">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" class="feather feather-folder"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
-                本地直接保存 <span class="hint" style="font-weight: normal; font-size: 11px; margin-left: 4px;">(保存至本地任意文件夹)</span>
-              </h3>
-              <div style="display: flex; gap: 8px; align-items: center; margin-top: 8px;">
-                <span class="hint" style="white-space: nowrap; font-weight: 500;">保存路径:</span>
-                <input type="text" id="local-save-dir" value="{html.escape(default_dir)}" style="flex: 1; min-width: 200px; padding: 6px 10px; border-radius: 6px; font-family: monospace; font-size: 13px;" placeholder="例如: ~/Desktop">
-              </div>
-            </div>
-            <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px;">
-              <button type="button" class="btn btn-sm" onclick="saveToLocalPath([{{filename: {html.escape(redacted_filename_json)}, content: document.getElementById('redacted-output').value}}], this)">保存脱敏文本</button>
-              <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'redaction_map.json', content: readCurrentMappingJson()}}], this)">保存映射表</button>
-              <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'debug_trace.json', content: document.getElementById('debug-trace-output').value}}], this)">保存调试追踪</button>
-              <button type="button" class="btn btn-sm" style="background: #e18c12; border-color: #e18c12; color: #fff;" onclick="if(ensureAppliedMappingForText())saveToLocalPath([{{filename: {html.escape(redacted_filename_json)}, content: document.getElementById('redacted-output').value}}, {{filename: 'redaction_map.json', content: readCurrentMappingJson()}}], this)">一键保存全部</button>
-            </div>
-          </div>
-          <script>
-            (function(){{
-              var savedDir = localStorage.getItem('last_local_save_dir');
-              var hasPreferredDir = {json.dumps(bool(save_dir.strip()))};
-              if (savedDir && !hasPreferredDir) {{
-                var inp = document.getElementById('local-save-dir');
-                if (inp) inp.value = savedDir;
-              }}
-            }})();
-          </script>
-        </section>
 
         {discord_create_section}
         {discord_section}
@@ -1078,37 +995,6 @@ def render_batch_redaction_result_page(
 
         {workflow_panel}
 
-        <section class="local-save-section" style="border-left: 4px solid var(--accent); background: linear-gradient(135deg, var(--surface) 0%, rgba(26, 122, 109, 0.02) 100%); padding: 18px 24px; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 18px; box-shadow: var(--shadow);">
-          <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 15px;">
-            <div style="flex: 1; min-width: 280px;">
-              <h3 style="margin: 0 0 6px 0; font-size: 14px; font-weight: 600; color: var(--ink); display: flex; align-items: center; gap: 6px;">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" class="feather feather-folder"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
-                本地直接保存 <span class="hint" style="font-weight: normal; font-size: 11px; margin-left: 4px;">(保存至本地任意文件夹)</span>
-              </h3>
-              <div style="display: flex; gap: 8px; align-items: center; margin-top: 8px;">
-                <span class="hint" style="white-space: nowrap; font-weight: 500;">保存路径:</span>
-                <input type="text" id="local-save-dir" value="{html.escape(default_dir)}" style="flex: 1; min-width: 200px; padding: 6px 10px; border-radius: 6px; font-family: monospace; font-size: 13px;" placeholder="例如: ~/Desktop">
-              </div>
-            </div>
-            <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px;">
-              <button type="button" class="btn btn-sm" onclick="saveToLocalPath([{{filename: {html.escape(combined_filename_json)}, content: document.getElementById('redacted-output').value}}], this)">保存合并文本</button>
-              <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'redaction_map.json', content: readCurrentMappingJson()}}], this)">保存统一映射表</button>
-              <button type="button" class="btn btn-secondary btn-sm" onclick="saveToLocalPath([{{filename: 'debug_trace.json', content: document.getElementById('debug-trace-output').value}}], this)">保存调试追踪</button>
-              <button type="button" class="btn btn-sm" style="background: #e18c12; border-color: #e18c12; color: #fff;" onclick="if(ensureAppliedMappingForText())saveToLocalPath([{{filename: {html.escape(combined_filename_json)}, content: document.getElementById('redacted-output').value}}, {{filename: 'redaction_map.json', content: readCurrentMappingJson()}}].concat(_individualRedactedFiles), this)">一键保存全部</button>
-            </div>
-          </div>
-          <script>
-            var _individualRedactedFiles = {individual_files_json};
-            (function(){{
-              var savedDir = localStorage.getItem('last_local_save_dir');
-              var hasPreferredDir = {json.dumps(bool(save_dir.strip()))};
-              if (savedDir && !hasPreferredDir) {{
-                var inp = document.getElementById('local-save-dir');
-                if (inp) inp.value = savedDir;
-              }}
-            }})();
-          </script>
-        </section>
 
         {discord_create_section}
         {discord_section}

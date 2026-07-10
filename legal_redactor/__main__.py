@@ -5,7 +5,7 @@
   python -m legal_redactor samples/labor_dispute.txt
 
   # 还原
-  python -m legal_redactor --restore output/redaction_map.json output/redacted.txt
+  python -m legal_redactor --restore output/redaction_map.enc output/redacted.txt
 
   # 启动 Web 界面
   python -m legal_redactor --web
@@ -84,7 +84,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--restore", "-r",
         action="store_true",
-        help="还原模式：第一个参数是 redaction_map.json，第二个是脱敏后的文件",
+        help="还原模式：第一个参数是 redaction_map.enc/.json，第二个是脱敏后的文件",
     )
     parser.add_argument(
         "--debug-trace",
@@ -209,7 +209,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.restore:
         if len(args.inputs) < 2:
-            print("还原模式需要两个参数：redaction_map.json 脱敏文件.txt")
+            print("还原模式需要两个参数：redaction_map.enc/.json 脱敏文件.txt")
             sys.exit(1)
         _do_restore(args.inputs[0], args.inputs[1], args.output_dir)
         return

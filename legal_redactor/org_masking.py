@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Callable, Mapping
 
-from .detectors import _clean_organization_text, _is_false_org
+from .filters import clean_organization_text as _clean_organization_text, is_false_org as _is_false_org
 from .lexicon import (
     INDUSTRY_TERMS_BY_LEN,
     LEGAL_SUFFIXES,

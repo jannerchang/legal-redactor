@@ -23,11 +23,13 @@ try:
     import fastapi  # noqa: F401
     import uvicorn  # noqa: F401
     import docx  # noqa: F401
+    import multipart  # noqa: F401
+    import pypdf  # noqa: F401
     import cryptography  # noqa: F401
 except ImportError as exc:
     raise SystemExit(
         "缺少依赖。首次运行请执行：./start.sh --install-deps\n"
-        "然后手动安装：pip install cryptography"
+        "或手动安装：pip install -r requirements.txt"
     ) from exc
 PY
 

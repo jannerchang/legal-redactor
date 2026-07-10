@@ -97,6 +97,57 @@ def save_sample_auto(
     return file_path
 
 
+def clear_sample_library(samples_dir: str | Path | None = None) -> dict[str, Any]:
+    """Clear accumulated optimization entries and start a fresh error-learning cycle.
+
+    Public legal sample documents are not touched. Only ``*.sample.json``
+    optimization stores are removed; the automatic store is recreated as an
+    empty, permission-restricted JSON document so later corrections can be
+    appended normally.
+    """
+    dir_path = Path(samples_dir) if samples_dir is not None else Path(DEFAULT_SAMPLES_DIR)
+    dir_path.mkdir(parents=True, exist_ok=True)
+    sample_files = _sample_files(dir_path)
+    removed_entries = 0
+    removed_files = 0
+    for path in sample_files:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            entries = data.get("entries", [])
+            if isinstance(entries, list):
+                removed_entries += len(entries)
+        except (json.JSONDecodeError, OSError):
+            pass
+        try:
+            path.unlink()
+            removed_files += 1
+        except FileNotFoundError:
+            pass
+
+    now = _now_iso()
+    auto_path = _auto_sample_path(dir_path)
+    auto_path.write_text(
+        json.dumps(
+            {
+                "version": SAMPLE_VERSION,
+                "updated_at": now,
+                "total": 0,
+                "entries": [],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(auto_path, 0o600)
+    return {
+        "removed_entries": removed_entries,
+        "removed_files": removed_files,
+        "sample_file": auto_path.name,
+        "updated_at": now,
+    }
+
+
 def _merge_entries(
     existing: list[dict],
     incoming: list[dict],

@@ -30,6 +30,7 @@ tests/*
 !tests/test_linear_engine.py
 !tests/test_china_admin.py
 !tests/test_postprocess.py
+!tests/test_detectors.py
 test_new_rules.py
 scratch_test_samples.py
 .ff-state/

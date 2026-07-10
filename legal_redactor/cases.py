@@ -7,7 +7,7 @@ import tempfile
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
 from .io import save_redaction_map_auto
@@ -65,6 +65,43 @@ REMOTE_FORBIDDEN_VALUE_PATTERNS = (
     re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE),
     re.compile(r"secret-token[^\s,;\"']*", re.IGNORECASE),
 )
+
+
+_REMOTE_PATH_KEYS = ("relative_path", "filename")
+_WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_UNC_PATH_RE = re.compile(r"^(?:\\\\|//)[^\\/]+(?:[\\/]|$)")
+
+
+def _remote_path_issue(key: str, value: str) -> str | None:
+    lower = key.lower()
+    text = value.strip()
+    if not text:
+        return None
+    if "filename" in lower:
+        if (
+            Path(text).name != text
+            or PurePosixPath(text).name != text
+            or _WINDOWS_ABSOLUTE_PATH_RE.match(text)
+            or _UNC_PATH_RE.match(text)
+            or "\\" in text
+            or "/" in text
+        ):
+            return "filename must be basename"
+        return None
+    if not any(marker in lower for marker in _REMOTE_PATH_KEYS):
+        return None
+    if _UNC_PATH_RE.match(text) or text.startswith("\\\\"):
+        return "path must not be remote or network path"
+    if text.startswith(("/", "~")) or _WINDOWS_ABSOLUTE_PATH_RE.match(text):
+        return "path must be relative"
+    if "\\" in text:
+        return "path must use posix separators"
+    parts = PurePosixPath(text).parts
+    if any(part in {"..", ""} for part in parts):
+        return "path must not escape case folder"
+    if parts and parts[0] in {"private", "Users", "Volumes", "var"}:
+        return "path must not expose local system path"
+    return None
 
 
 class CaseError(ValueError):
@@ -964,6 +1001,10 @@ def _collect_remote_payload_issues(value: object, path: str, issues: list[str]) 
             item_path = f"{path}.{key_text}"
             if key_text in REMOTE_FORBIDDEN_KEYS:
                 issues.append(f"forbidden key {item_path}")
+            if isinstance(item, str):
+                path_issue = _remote_path_issue(key_text, item)
+                if path_issue:
+                    issues.append(f"forbidden path at {item_path}: {path_issue}")
             _collect_remote_payload_issues(item, item_path, issues)
     elif isinstance(value, list):
         for index, item in enumerate(value):

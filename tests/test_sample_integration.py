@@ -1,15 +1,19 @@
 import json
+
 import pytest
+
 from legal_redactor._samples import (
-    save_sample_auto,
+    AUTO_SAMPLE_FILE,
+    clear_sample_library,
     get_few_shot_examples,
     load_all_samples,
     load_recent_error_samples,
     load_sample_blacklist_for_optimization,
     load_trusted_sample_mappings,
-    AUTO_SAMPLE_FILE,
+    save_sample_auto,
 )
-from legal_redactor.config import PipelineConfig
+from legal_redactor.config import LocalLLMConfig, PipelineConfig
+from legal_redactor.llm import LegalEntityAuditor
 from legal_redactor.pipeline import RedactionPipeline
 from legal_redactor.web_app import _diagnose_sample_entry
 
@@ -48,22 +52,24 @@ def mock_samples(tmp_path):
     return tmp_path, filepath
 
 
-def test_pipeline_reuses_modify_samples_without_delete_blacklist(mock_samples, monkeypatch):
-    tmp_path, filepath = mock_samples
+def test_pipeline_ignores_sample_library_contents_at_runtime(mock_samples, monkeypatch):
+    """Runtime redaction must not reuse sample masks or honor sample deletes."""
+    tmp_path, _filepath = mock_samples
 
-    import legal_redactor._samples
-    monkeypatch.setattr(legal_redactor._samples, "DEFAULT_SAMPLES_DIR", tmp_path)
+    import legal_redactor._samples as samples_module
 
-    config = PipelineConfig.offline_without_llm()
-    pipeline = RedactionPipeline(config=config)
-    test_text = "原告：张小明。被告：来我去公司。案件涉及绝密代号。"
+    monkeypatch.setattr(samples_module, "DEFAULT_SAMPLES_DIR", tmp_path)
 
-    result = pipeline.redact(test_text, mode="standard")
+    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
+    result = pipeline.redact("原告：张小明。被告：来我去公司。案件涉及绝密代号。", mode="standard")
 
-    assert "张小明" not in result.redacted_text
-    assert "【小明特制掩码】" in result.redacted_text
-    assert "绝密代号" in result.redacted_text
+    # Sample-only mappings/masks must not be injected into runtime results.
+    assert "【小明特制掩码】" not in result.redacted_text
     assert "【代号X】" not in result.redacted_text
+    assert all(
+        not str(mapping.source or "").startswith("sample_library:")
+        for mapping in result.redaction_map.mappings
+    )
 
 
 def test_delete_samples_remain_for_optimization(mock_samples, monkeypatch):
@@ -211,58 +217,19 @@ def test_modify_old_short_person_name_does_not_pollute_blacklist(tmp_path):
     assert lookup["王五明"] == "王某2"
 
 
-def test_pipeline_reuses_trusted_added_company_sample(tmp_path, monkeypatch):
-    import legal_redactor._samples
+def test_pipeline_redaction_is_independent_of_sample_directory_contents(tmp_path, monkeypatch):
+    """Different sample stores must not change runtime redaction outputs."""
+    import legal_redactor._samples as samples_module
 
-    save_sample_auto(
-        [{"action": "add", "type": "manual", "original": "胖哥公司", "masked": "乙公司"}],
-        source="today",
-        samples_dir=tmp_path,
-    )
-    monkeypatch.setattr(legal_redactor._samples, "DEFAULT_SAMPLES_DIR", tmp_path)
-
-    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
-    result = pipeline.redact("胖哥公司与起航小镇签订合同。")
-
-    assert "胖哥公司" not in result.redacted_text
-    assert "乙公司" in result.redacted_text
-
-
-def test_pipeline_reuses_trusted_added_locations_and_ignores_case_abbr(tmp_path, monkeypatch):
-    import legal_redactor._samples
-
+    empty_dir = tmp_path / "empty"
+    populated_dir = tmp_path / "populated"
+    empty_dir.mkdir()
+    populated_dir.mkdir()
     save_sample_auto(
         [
-            {"action": "add", "type": "manual", "original": "河北", "masked": "甲省"},
+            {"action": "add", "type": "manual", "original": "胖哥公司", "masked": "乙公司"},
+            {"action": "delete", "type": "organization", "original": "河北星河建筑工程有限公司"},
             {"action": "add", "type": "manual", "original": "唐山", "masked": "己市"},
-            {"action": "add", "type": "manual", "original": "迁安市", "masked": "戊市"},
-            {"action": "add", "type": "manual", "original": "井陉县", "masked": "丁县"},
-            {"action": "add", "type": "manual", "original": "冀", "masked": "新"},
-        ],
-        source="today",
-        samples_dir=tmp_path,
-    )
-    monkeypatch.setattr(legal_redactor._samples, "DEFAULT_SAMPLES_DIR", tmp_path)
-
-    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
-    result = pipeline.redact("河北唐山迁安市、井陉县，案号（2025）冀01民终123号。")
-
-    assert "河北" not in result.redacted_text
-    assert "唐山" not in result.redacted_text
-    assert "迁安市" not in result.redacted_text
-    assert "井陉县" not in result.redacted_text
-    assert "甲省" in result.redacted_text
-    assert "己市" in result.redacted_text
-    assert "戊市" in result.redacted_text
-    assert "丁县" in result.redacted_text
-    assert all(mapping.original != "冀" for mapping in result.redaction_map.mappings)
-
-
-def test_pipeline_reuses_today_company_and_location_corrections(tmp_path, monkeypatch):
-    import legal_redactor._samples
-
-    save_sample_auto(
-        [
             {
                 "action": "modify",
                 "type": "organization",
@@ -272,69 +239,110 @@ def test_pipeline_reuses_today_company_and_location_corrections(tmp_path, monkey
                 "new_masked": "甲公司",
             },
             {
-                "action": "modify",
-                "type": "organization",
-                "old_original": "鹿泉市裕华精密铸造有限公司",
-                "new_original": "鹿泉市裕华精密铸造有限公司",
-                "old_masked": "乙公司",
-                "new_masked": "甲公司",
-            },
-            {
-                "action": "add",
-                "type": "manual",
-                "original": "裕华公司",
-                "masked": "甲公司",
-            },
-            {
-                "action": "add",
-                "type": "manual",
-                "original": "石药集团",
-                "masked": "乙集团",
-            },
-            {
-                "action": "modify",
-                "type": "location",
-                "old_original": "鹿泉",
-                "new_original": "鹿泉",
-                "old_masked": "某区",
-                "new_masked": "丙区",
-            },
-        ],
-        source="today",
-        samples_dir=tmp_path,
-    )
-    monkeypatch.setattr(legal_redactor._samples, "DEFAULT_SAMPLES_DIR", tmp_path)
-
-    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
-    result = pipeline.redact(
-        "石家庄裕华精密铸造有限公司与鹿泉市裕华精密铸造有限公司相关，裕华公司位于鹿泉。石药集团提交说明。"
-    )
-
-    assert result.redacted_text == "甲公司与甲公司相关，甲公司位于丙区。乙集团提交说明。"
-
-
-def test_pipeline_drops_rule_fragments_inside_trusted_company_sample(tmp_path, monkeypatch):
-    import legal_redactor._samples
-
-    save_sample_auto(
-        [
-            {
                 "action": "add",
                 "type": "manual",
                 "original": "诺亚人力资源发展集团有限公司",
                 "masked": "乙人力资源发展集团有限公司",
-            }
+            },
+        ],
+        source="today",
+        samples_dir=populated_dir,
+    )
+
+    text = (
+        "原告胖哥公司与河北星河建筑工程有限公司签订合同。"
+        "石家庄裕华精密铸造有限公司位于唐山。"
+        "诺亚人力资源发展集团有限公司提交了证据。"
+    )
+    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
+
+    monkeypatch.setattr(samples_module, "DEFAULT_SAMPLES_DIR", empty_dir)
+    empty_result = pipeline.redact(text, mode="standard")
+    monkeypatch.setattr(samples_module, "DEFAULT_SAMPLES_DIR", populated_dir)
+    populated_result = pipeline.redact(text, mode="standard")
+
+    assert empty_result.redacted_text == populated_result.redacted_text
+    assert [m.original for m in empty_result.redaction_map.mappings] == [
+        m.original for m in populated_result.redaction_map.mappings
+    ]
+    assert [m.masked for m in empty_result.redaction_map.mappings] == [
+        m.masked for m in populated_result.redaction_map.mappings
+    ]
+    assert all(
+        not str(mapping.source or "").startswith("sample_library:")
+        for mapping in populated_result.redaction_map.mappings
+    )
+
+
+def test_llm_prompt_builders_never_inject_sample_few_shot(tmp_path, monkeypatch):
+    import legal_redactor._samples as samples_module
+
+    unique_negative = "样例误报词XYZ不应出现在提示词"
+    unique_positive = "样例正样本公司UVW"
+    save_sample_auto(
+        [
+            {"action": "delete", "type": "organization", "original": unique_negative},
+            {"action": "add", "type": "manual", "original": unique_positive, "masked": "乙公司"},
         ],
         source="today",
         samples_dir=tmp_path,
     )
-    monkeypatch.setattr(legal_redactor._samples, "DEFAULT_SAMPLES_DIR", tmp_path)
+    monkeypatch.setattr(samples_module, "DEFAULT_SAMPLES_DIR", tmp_path)
+    few_shot = get_few_shot_examples(samples_dir=tmp_path)
+    assert unique_negative in few_shot
+    assert unique_positive in few_shot
 
-    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
-    result = pipeline.redact("诺亚人力资源发展集团有限公司提交了证据。")
+    auditor = LegalEntityAuditor(LocalLLMConfig(enabled=False))
+    sentence_prompt = auditor._build_sentence_extraction_prompt(
+        [{"id": "s1", "previous": "", "target": "原告胖哥公司。", "next": ""}],
+        enable_samples=True,
+    )
+    merged_prompt = auditor._build_merged_prompt(
+        "原告胖哥公司。",
+        [{"text": "胖哥公司", "type": "organization", "context": "原告胖哥公司。"}],
+        enable_samples=True,
+    )
 
-    assert result.redacted_text == "乙人力资源发展集团有限公司提交了证据。"
-    assert [m.original for m in result.redaction_map.mappings] == ["诺亚人力资源发展集团有限公司"]
+    assert unique_negative not in sentence_prompt
+    assert unique_positive not in sentence_prompt
+    assert unique_negative not in merged_prompt
+    assert unique_positive not in merged_prompt
+
+
+def test_clear_sample_library_removes_entries_and_allows_future_writes(tmp_path):
+    save_sample_auto(
+        [
+            {"action": "delete", "type": "organization", "original": "来我去公司"},
+            {"action": "add", "type": "manual", "original": "胖哥公司", "masked": "乙公司"},
+        ],
+        source="today",
+        samples_dir=tmp_path,
+    )
+    lookup_before, blacklist_before = load_all_samples(samples_dir=tmp_path)
+    assert lookup_before or blacklist_before
+
+    result = clear_sample_library(tmp_path)
+    assert result["removed_entries"] >= 2
+    assert result["removed_files"] >= 1
+    assert result["sample_file"] == AUTO_SAMPLE_FILE
+
+    auto_path = tmp_path / AUTO_SAMPLE_FILE
+    assert auto_path.exists()
+    data = json.loads(auto_path.read_text(encoding="utf-8"))
+    assert data["entries"] == []
+    assert data["total"] == 0
+
+    lookup_after, blacklist_after = load_all_samples(samples_dir=tmp_path)
+    assert lookup_after == {}
+    assert blacklist_after == set()
+
+    save_sample_auto(
+        [{"action": "add", "type": "manual", "original": "新样本公司", "masked": "丙公司"}],
+        source="after-clear",
+        samples_dir=tmp_path,
+    )
+    lookup_rebuilt, _ = load_all_samples(samples_dir=tmp_path)
+    assert lookup_rebuilt["新样本公司"] == "丙公司"
 
 
 def test_sample_entries_are_timestamped_and_recent_errors_sorted(tmp_path):
@@ -741,161 +749,3 @@ async def test_save_sample_page_reports_effective_retry_delta(tmp_path, monkeypa
     assert "新增 0" in second_payload["msg"]
     assert "未变化 1" in second_payload["msg"]
     assert second_payload["summary"]["manual_corrections"] == 1
-
-
-def test_fallback_person_missed_names_are_detected():
-    """测试通过优化后的 _FALLBACK_PERSON_PATTERNS 能够成功识别以前遗漏的人名。"""
-    from legal_redactor.detectors import detect_fallback_person_candidates
-
-    # 模拟包含遗漏人名的文书文本
-    text_1 = "本案交由陈戊靖负责审计，相关账目清晰。"
-    text_2 = "陶玉静的主张得到了法庭的支持。"
-    text_3 = "经核实，陈戊靖于2023年办理了离职。"
-
-    candidates_1 = detect_fallback_person_candidates(text_1)
-    candidates_2 = detect_fallback_person_candidates(text_2)
-    candidates_3 = detect_fallback_person_candidates(text_3)
-
-    # 验证是否成功检出 "陈戊靖"
-    assert any(c.text == "陈戊靖" for c in candidates_1)
-    # 验证是否成功检出 "陶玉静"
-    assert any(c.text == "陶玉静" for c in candidates_2)
-    # 验证是否成功检出 "陈戊靖" (句中动作形式)
-    assert any(c.text == "陈戊靖" for c in candidates_3)
-
-
-def test_clean_organization_and_validate_llm_person():
-    """测试组织机构清洗优化以及 LLM 人名提取校验的正确性。"""
-    from legal_redactor.detectors import _clean_organization_text, _is_false_org
-
-    # 1. 组织清洗只做格式归一化，不再凭动作词猜实体边界
-    c1 = _clean_organization_text("是由郝亚雄去跟天津市慕尚园林绿化工程有限公司")
-    assert c1 == "是由郝亚雄去跟天津市慕尚园林绿化工程有限公司"
-
-    c2 = _clean_organization_text("接管河北奥星集团药业有限公司")
-    assert c2 == "接管河北奥星集团药业有限公司"
-
-    c3 = _clean_organization_text("（华禾康源生物科技河北有限公司")
-    assert c3 == "华禾康源生物科技河北有限公司"
-
-    c4 = _clean_organization_text("其实壹州公司")
-    assert c4 == "其实壹州公司"
-
-    c5 = _clean_organization_text("确实壹州公司")
-    assert c5 == "确实壹州公司"
-
-    c6 = _clean_organization_text("证实壹州公司")
-    assert c6 == "证实壹州公司"
-
-    # 验证未对称括号与未带后缀品牌名清洗
-    assert _clean_organization_text("（华禾康源生物科技河北") == "华禾康源生物科技河北"
-    assert _clean_organization_text("）河北立生") == "河北立生"
-    assert _clean_organization_text("加盖慕尚") == "加盖慕尚"
-    assert _clean_organization_text("接管河北奥星") == "接管河北奥星"
-
-    # 2. 验证伪公司过滤
-    assert _is_false_org("严重违反公司") is True
-    assert _is_false_org("继续违反公司") is True
-    assert _is_false_org("否返还立生公司") is True
-    assert _is_false_org("加盖慕尚公司") is True
-    assert _is_false_org("其实公司") is True
-    assert _is_false_org("但是公司") is True
-    assert _is_false_org("确实公司") is True
-    assert _is_false_org("但公司") is True
-    assert _is_false_org("并公司") is True
-    assert _is_false_org("天津市慕尚园林绿化工程有限公司") is False
-
-
-    # 构造含大模型幻觉人名/句子的 Mock LLM 输出
-    mock_analysis = {
-        "locations": [],
-        "companies": [],
-        "persons": [
-            {"name": "我是去给郝亚雄帮忙的", "surname": "我"},
-            {"name": "外围这一块、通道、下面这一半圈、中间这一块", "surname": "外"},
-            {"name": "当时苗确实没有死", "surname": "当"},
-            {"name": "我们做过结算", "surname": "我"},
-            {"name": "见过", "surname": "见"},
-            {"name": "分了几块", "surname": "分"},
-            {"name": "对", "surname": "对"},
-            {"name": "开庭后", "surname": "开"},
-            {"name": "张三", "surname": "张"},  # 唯一合法名字
-        ],
-        "reject": []
-    }
-
-
-    # 复制 pipeline 内部的 name 校验逻辑来验证
-    common_surnames = frozenset(
-        "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜"
-        "戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳史唐"
-        "费薛雷贺倪汤罗毕郝安常于时傅齐康伍余元顾孟平黄和萧尹姚邵汪祁毛"
-        "狄米明计成戴谈宋庞熊纪舒屈项祝董梁杜阮蓝季强贾路娄危江童颜郭梅盛林"
-        "钟徐邱骆高夏蔡田樊胡凌霍万柯管卢莫经房裘干解应宗丁宣邓郁单洪包诸左"
-        "石崔吉龚程邢裴陆荣翁惠甄曲家封储松段富巫焦巴弓秋仲伊宁仇暴甘厉戎祖"
-        "武符刘景詹龙叶幸司黎薄白从赖卓屠池乔阴能苍双闻党谭贡劳姬申冉郦"
-        "桂牛寿通边燕浦尚农温庄晏柴瞿阎慕连茹习艾向古易戈廖终居衡步都耿满弘"
-        "国文寇广禄阙东欧利师巩聂勾融冷辛简饶空曾沙养鞠须丰巢关查后荆红游权"
-        "盖益公万俟司马上官欧阳夏侯诸葛闻人东方赫连皇甫尉迟公羊澹台公冶宗政"
-        "濮阳淳于单于太叔申屠公孙仲孙轩辕令狐钟离宇文长孙慕容鲜于闾丘司徒司空"
-        "端木巫马公西漆雕乐正拓跋夹谷谷梁晋楚闫法涂钦呼延羊舌岳帅有琴梁丘左丘"
-        "南宫"
-    )
-
-    valid_names = []
-    for person in mock_analysis["persons"]:
-        name = person["name"]
-        # ── 过滤明显的大模型抽取幻觉/长句误切 ──
-        if len(name) > 6 or len(name) < 2:
-            continue
-        if any(char in name for char in "，。；、：:,\r\n"):
-            continue
-        if any(word in name for word in ("的", "了", "在", "是", "去", "给", "有", "我", "你", "他", "们", "这", "那", "个", "谁", "对", "后")):
-            continue
-        is_valid_han = len(name) <= 4 and (name[0] in common_surnames or (len(name) > 2 and name[:2] in common_surnames))
-        is_valid_minority = "·" in name and len(name) <= 15
-        if not (is_valid_han or is_valid_minority):
-            continue
-        valid_names.append(name)
-
-    assert valid_names == ["张三"]
-
-
-def test_advanced_rules_optimization():
-    """测试识别规则深度优化路线图各项工作的正确性。"""
-    from legal_redactor.detectors import ORG_RE, detect_fallback_person_candidates
-    from legal_redactor.lexicon import FALSE_PERSON_WORDS
-
-    # 1. 验证 ORG_RE 行政区划前置长度限制由 10 缩减为 5 字
-    # "郝亚雄去跟天津市" 前置有 5 个非行政区字 + 天津(2字)，总长度 7，因此匹配范围绝不能以“郝”开始！
-    # 天津市(3字)在 [2,5] 范围内，所以必须只以“天津市”开始匹配！
-    text_org = "郝亚雄去跟天津市慕尚园林绿化工程有限公司"
-    match = ORG_RE.search(text_org)
-    assert match is not None
-    from legal_redactor.detectors import _clean_organization_text
-    cleaned = _clean_organization_text(match.group(0))
-    # 组织清洗不再凭动作词裁剪实体边界；该类边界由候选生成或 LLM 校准负责。
-    assert cleaned == match.group(0)
-
-    # 2. 验证 fallback 人名匹配的全新动作词 lookahead
-    # 检查新增的动作词（转账、汇款、下载、发送、立案、驳回等）是否能完美匹配
-    candidates_1 = detect_fallback_person_candidates("本案由陈戊靖转账处理。")
-    candidates_2 = detect_fallback_person_candidates("陶玉静汇款五百元。")
-    candidates_3 = detect_fallback_person_candidates("经查，陈戊靖下载了文件。")
-    candidates_4 = detect_fallback_person_candidates("相关材料已由陶玉静发送。")
-    candidates_5 = detect_fallback_person_candidates("陈戊靖立案起诉。")
-    candidates_6 = detect_fallback_person_candidates("陶玉静驳回了上诉。")
-
-    assert any(c.text == "陈戊靖" for c in candidates_1)
-    assert any(c.text == "陶玉静" for c in candidates_2)
-    assert any(c.text == "陈戊靖" for c in candidates_3)
-    assert any(c.text == "陶玉静" for c in candidates_4)
-    assert any(c.text == "陈戊靖" for c in candidates_5)
-    assert any(c.text == "陶玉静" for c in candidates_6)
-
-    # 3. 验证 FALSE_PERSON_WORDS 排除词库的扩充
-    assert "案情" in FALSE_PERSON_WORDS
-    assert "起诉状" in FALSE_PERSON_WORDS
-    assert "答辩状" in FALSE_PERSON_WORDS
-    assert "委托书" in FALSE_PERSON_WORDS
-    assert "代理词" in FALSE_PERSON_WORDS

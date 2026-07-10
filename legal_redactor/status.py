@@ -124,6 +124,15 @@ def probe_mlx_server(
 ) -> StatusItem:
     env = os.environ if environ is None else environ
     host = host or env.get("LEGAL_REDACTOR_MLX_HOST", "127.0.0.1")
+    if env.get("LEGAL_REDACTOR_SKIP_MLX") == "1":
+        return StatusItem(
+            "mlx_server",
+            "MLX 本地模型",
+            "skipped",
+            "已设置跳过 MLX，将以离线规则/HanLP 可用部分运行。",
+            "取消 LEGAL_REDACTOR_SKIP_MLX=1 后重新运行 ./start.sh",
+            {"host": host, "reason": "skip_env"},
+        )
     try:
         port = port or int(env.get("LEGAL_REDACTOR_MLX_PORT", "18080"))
     except ValueError:
@@ -147,16 +156,6 @@ def probe_mlx_server(
             details,
         )
     details: dict[str, Any] = {"host": host, "port": port, "expected_model": expected_model}
-    if env.get("LEGAL_REDACTOR_SKIP_MLX") == "1":
-        details["reason"] = "skip_env"
-        return StatusItem(
-            "mlx_server",
-            "MLX 本地模型",
-            "skipped",
-            "已设置跳过 MLX，将以规则/样本/HanLP 可用部分运行。",
-            "取消 LEGAL_REDACTOR_SKIP_MLX=1 后重新运行 ./start.sh",
-            details,
-        )
 
     try:
         status_code, body = _http_get_models(host, port, timeout)
@@ -420,9 +419,9 @@ def _public_detail_entry(key: str, value: Any) -> tuple[str | None, Any]:
     if any(word in lower for word in blocked) and not lower.endswith("_present"):
         return None, None
     if lower in path_like_keys:
-        return f"{key}_name", _path_display_name(value)
+        return f"{key}_configured", _path_configured_value(value)
     if isinstance(value, str) and _looks_like_local_path(value):
-        return f"{key}_name", _path_display_name(value)
+        return f"{key}_configured", _path_configured_value(value)
     return key, _public_detail_value(value)
 
 
@@ -433,7 +432,7 @@ def _public_detail_value(value: Any) -> Any:
         return [_public_detail_value(item) for item in value]
     if isinstance(value, str):
         if _looks_like_local_path(value):
-            return _path_display_name(value)
+            return _path_configured_value(value)
         if _looks_like_secret_value(value):
             return "<redacted>"
     return value
@@ -441,7 +440,20 @@ def _public_detail_value(value: Any) -> Any:
 
 def _looks_like_local_path(value: str) -> bool:
     text = value.strip()
-    return text.startswith(("/", "~")) or "/Users/" in text or "/Volumes/" in text
+    if not text:
+        return False
+    # POSIX absolute / home, and common host-sensitive prefixes.
+    if text.startswith(("/", "~")) or "/Users/" in text or "/Volumes/" in text:
+        return True
+    # Windows drive absolute: C:\path or C:/path (mixed separators included).
+    if len(text) >= 3 and text[0].isalpha() and text[1] == ":" and text[2] in "\\/":
+        return True
+    # UNC: \\server\share ... and //server/share ...
+    if text.startswith("\\\\"):
+        return True
+    if text.startswith("//") and len(text) > 2 and text[2] not in "/\\":
+        return True
+    return False
 
 
 def _looks_like_secret_value(value: str) -> bool:
@@ -449,8 +461,5 @@ def _looks_like_secret_value(value: str) -> bool:
     return text.startswith("bearer ") or " secret" in text or "secret-" in text or "-secret" in text or "token" in text
 
 
-def _path_display_name(value: Any) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    return Path(text).expanduser().name or "configured"
+def _path_configured_value(value: Any) -> str:
+    return "configured" if str(value or "").strip() else ""

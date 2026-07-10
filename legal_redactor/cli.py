@@ -8,7 +8,7 @@ from .config import PipelineConfig
 from .io import (
     load_redaction_map_auto,
     read_document,
-    save_redaction_map,
+    save_redaction_map_auto,
     write_document,
 )
 from .pipeline import RedactionPipeline
@@ -33,14 +33,20 @@ def main(argv: list[str] | None = None) -> int:
 
     restore_parser = subparsers.add_parser("restore", help="按 redaction_map 反向还原")
     restore_parser.add_argument("input", help="AI 修改后的脱敏文档")
-    restore_parser.add_argument("map", help="redaction_map.json")
+    restore_parser.add_argument("map", help="redaction_map.enc/.json")
     restore_parser.add_argument("--out", default="output/restored.txt", help="还原输出路径")
     restore_parser.add_argument("--preview", action="store_true", help="输出差异预览")
 
-    samples_parser = subparsers.add_parser("samples", help="查看样本库")
+    samples_parser = subparsers.add_parser("samples", help="管理样本库（仅优化用途，不参与运行时脱敏）")
     samples_subparsers = samples_parser.add_subparsers(dest="samples_command", required=True)
     recent_errors_parser = samples_subparsers.add_parser("recent-errors", help="按时间查看最新错误样本")
     recent_errors_parser.add_argument("--limit", type=int, default=50, help="最多输出条数")
+    clear_parser = samples_subparsers.add_parser("clear", help="清空样本库并重建可写空自动样本")
+    clear_parser.add_argument(
+        "--samples-dir",
+        default="",
+        help="样本目录（默认 samples/）",
+    )
 
     eval_parser = subparsers.add_parser("eval", help="用 gold set 评估识别率")
     eval_parser.add_argument("gold", help="gold set JSON 路径")
@@ -62,6 +68,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_restore(args)
     if args.command == "samples" and args.samples_command == "recent-errors":
         return _run_recent_errors(args)
+    if args.command == "samples" and args.samples_command == "clear":
+        return _run_clear_samples(args)
     if args.command == "eval":
         return _run_eval(args)
     return 1
@@ -77,9 +85,9 @@ def _run_redact(args: argparse.Namespace) -> int:
     output_dir = Path(args.out)
     output_dir.mkdir(parents=True, exist_ok=True)
     redacted_path = output_dir / f"{input_path.stem}.redacted{input_path.suffix if input_path.suffix else '.txt'}"
-    map_path = output_dir / "redaction_map.json"
+    map_path = output_dir / "redaction_map.enc"
     write_document(redacted_path, result.redacted_text)
-    save_redaction_map(map_path, result.redaction_map)
+    save_redaction_map_auto(map_path, result.redaction_map)
     if args.debug_trace:
         from .debug_trace import debug_trace_to_json, redaction_debug_trace
 
@@ -134,6 +142,18 @@ def _run_recent_errors(args: argparse.Namespace) -> int:
         original = entry.get("original", "")
         source = entry.get("last_source") or entry.get("source") or ""
         print(f"{updated_at}\t{entity_type}\t{original}\t{source}")
+    return 0
+
+
+def _run_clear_samples(args: argparse.Namespace) -> int:
+    from ._samples import DEFAULT_SAMPLES_DIR, clear_sample_library
+
+    samples_dir = Path(args.samples_dir) if args.samples_dir else DEFAULT_SAMPLES_DIR
+    result = clear_sample_library(samples_dir)
+    print(
+        "cleared samples: removed_entries={removed_entries} removed_files={removed_files} "
+        "sample_file={sample_file} updated_at={updated_at}".format(**result)
+    )
     return 0
 
 
