@@ -62,7 +62,6 @@ class LinearRuleEngine:
     source_text: str = ""
     _alias_cores_cache: dict[str, frozenset[str]] = field(default_factory=dict, repr=False)
     _organization_plans: dict[str, CompanyMaskPlan] = field(default_factory=dict, repr=False)
-    _known_brand_masks: dict[str, str] = field(default_factory=dict, repr=False)
 
     def discover(
         self,
@@ -248,8 +247,6 @@ class LinearRuleEngine:
             source_text=self.source_text,
         )
         if related_plan is not None:
-            if related_plan.brand:
-                self._known_brand_masks[related_plan.brand] = related_plan.brand_mask
             location_updates: tuple[tuple[str, str], ...] = ()
             if is_short_company_surface(value, brand=related_plan.brand):
                 masked = organization_mask_for_surface(value, related_plan)
@@ -361,13 +358,6 @@ class LinearRuleEngine:
                     ),
                 )
 
-    def _brand_mask_for(self, brand: str) -> str:
-        cleaned = brand.strip()
-        if not cleaned:
-            return self.counters.next("group_prefix")
-        if cleaned not in self._known_brand_masks:
-            self._known_brand_masks[cleaned] = self.counters.next("group_prefix")
-        return self._known_brand_masks[cleaned]
 
     def accept_project(self, candidate: Candidate) -> None:
         if not self.profile.redact_projects:

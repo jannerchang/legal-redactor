@@ -70,7 +70,7 @@ def _request(method: str, path: str, payload: dict[str, Any] | None = None) -> d
             "Office API returned an error",
             office_error.get("next_action") or "check_office_api",
         )
-    except OSError as exc:
+    except OSError:
         return _safe_error("office_unreachable", None, "Office API is unreachable", "start_office_api")
 
 
@@ -132,7 +132,7 @@ def _handle_jsonrpc(message: dict[str, Any]) -> dict[str, Any] | None:
             result = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "legal-redactor", "version": "0.1.1"},
+                "serverInfo": {"name": "legal-redactor", "version": "0.1.2"},
             }
         elif method == "notifications/initialized":
             return None

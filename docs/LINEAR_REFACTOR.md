@@ -25,6 +25,13 @@
 - `LinearRuleEngine` 只接收已收集候选，先应用 LLM reject/calibrate verdict，再做 span 冲突消解、确认实体并扩展确定性映射；
 - LLM 只补充原文中真实存在的精确实体；
 
+### 稳定接口与内部 seam
+
+- 生产调用只通过 `CandidateCollector.collect(context)` 进入候选发现模块。句子切分、offset 重写、机构正则和 LLM 精确定位均为内部实现，不应被 pipeline 或其他模块直接调用。
+- 非主 LLM 路径先收集一次规则候选用于 review；审核完成后通过 `CandidateCollectionResult.with_llm_analysis(...)` 仅追加审计产生的精确候选，避免再次执行全文 detector 扫描。
+- `LinearRuleEngine.discover(...)` 的顺序不变量是 `reject/calibrate -> span overlap -> document-order acceptance -> alias expansion`。改变顺序属于产品行为变更，必须先补 characterization test。
+- 行政区划数据库仍由 pipeline 预接受并形成 span gate；全国行政区划规则的双来源行为暂时保留，后续只有在 parity 证据充分时才能统一。
+
 ## 替换规则
 
 本节所有示例名称均为虚构，不对应任何实际个人或机构。

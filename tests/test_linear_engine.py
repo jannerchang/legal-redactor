@@ -60,8 +60,6 @@ def _collect(
     result = CandidateCollector().collect(
         CandidateCollectionContext(
             text=text,
-            profile=_Profile(),
-            sample_blacklist=sample_blacklist or set(),
             seed_candidates=list(seed_candidates or ()),
             llm_analysis=llm_analysis or {},
             llm_primary_discovery=llm_primary_discovery,
@@ -308,63 +306,79 @@ def test_resolve_candidate_overlaps_prefers_higher_priority_source() -> None:
     assert resolved[0].source == "party_section"
 
 
-def test_append_exact_candidate_skips_ambiguous_global_find_when_window_misses() -> None:
+def test_collect_skips_ambiguous_global_find_when_window_misses() -> None:
     text = "甲公司提交说明。乙公司到庭。"
-    candidates: list[Candidate] = []
-    CandidateCollector.append_exact_candidate(
-        candidates,
-        text,
-        "乙公司",
-        "organization",
-        {"window": "s2"},
-        {
-            "s2": {"start": 0, "end": 6},
-        },
+    result = CandidateCollector().collect(
+        CandidateCollectionContext(
+            text=text,
+            llm_analysis={
+                "_sentence_windows": [{"id": "s2", "start": 0, "end": 6}],
+                "companies": [{"window": "s2", "name": "乙公司"}],
+            },
+            llm_primary_discovery=True,
+        )
     )
-    assert candidates == []
+
+    assert result.candidates == []
 
 
-def test_append_exact_candidate_uses_single_occurrence_fallback_when_window_misses() -> None:
+def test_collect_uses_single_occurrence_fallback_when_window_misses() -> None:
     text = "原告江苏路达电力工程有限公司，后更名为淮安载道电力工程有限公司。张三住河北省石家庄市长安区。"
-    candidates: list[Candidate] = []
-    CandidateCollector.append_exact_candidate(
-        candidates,
-        text,
-        "张三",
-        "person",
-        {"window": "s1"},
-        {"s1": {"start": 0, "end": 32}},
+    result = CandidateCollector().collect(
+        CandidateCollectionContext(
+            text=text,
+            llm_analysis={
+                "_sentence_windows": [{"id": "s1", "start": 0, "end": 32}],
+                "persons": [{"window": "s1", "name": "张三"}],
+            },
+            llm_primary_discovery=True,
+        )
     )
-    assert len(candidates) == 1
-    assert candidates[0].text == "张三"
-    assert candidates[0].start == text.index("张三")
-    assert candidates[0].source == "linear_llm_exact"
+
+    assert len(result.candidates) == 1
+    assert result.candidates[0].text == "张三"
+    assert result.candidates[0].start == text.index("张三")
+    assert result.candidates[0].source == "linear_llm_exact"
 
 
-def test_offset_candidates_rewrites_local_spans_to_document_coordinates() -> None:
+def test_collect_rewrites_local_spans_to_document_coordinates() -> None:
+    from unittest.mock import patch
+
     local = [
         Candidate(
             type="person",
             text="张三",
-            start=2,
-            end=4,
+            start=0,
+            end=2,
             source="party_section",
             confidence=0.95,
             risk_level="low",
             auto_redact=True,
         )
     ]
+    text = "前言。原告张三提交证据。"
 
-    rewritten = CandidateCollector.offset_candidates(local, offset=10)
+    with patch(
+        "legal_redactor.candidate_collector.detect_party_candidates",
+        side_effect=[([], []), (local, [])],
+    ):
+        result = CandidateCollector().collect(
+            CandidateCollectionContext(
+                text=text,
+                use_semantic_rules=False,
+                use_china_admin_rules=False,
+            )
+        )
 
-    assert len(rewritten) == 1
-    assert rewritten[0].text == "张三"
-    assert rewritten[0].start == 12
-    assert rewritten[0].end == 14
-    assert rewritten[0].source == "party_section"
+    party_candidate = next(
+        candidate for candidate in result.candidates if candidate.source == "party_section"
+    )
+    assert party_candidate.text == "张三"
+    assert party_candidate.start == text.index("原告")
+    assert party_candidate.end == text.index("原告") + len("张三")
 
 
-def test_deduplicate_candidates_keeps_higher_confidence_for_same_span() -> None:
+def test_collect_keeps_higher_confidence_for_same_span() -> None:
     lower = Candidate(
         type="organization",
         text="兴代公司",
@@ -386,11 +400,17 @@ def test_deduplicate_candidates_keeps_higher_confidence_for_same_span() -> None:
         auto_redact=True,
     )
 
-    deduped = CandidateCollector.deduplicate_candidates([lower, higher])
+    result = CandidateCollector().collect(
+        CandidateCollectionContext(
+            text="兴代公司",
+            seed_candidates=[lower, higher],
+            llm_primary_discovery=True,
+        )
+    )
 
-    assert len(deduped) == 1
-    assert deduped[0].source == "linear_bare_org_alias"
-    assert deduped[0].confidence == 0.91
+    assert len(result.candidates) == 1
+    assert result.candidates[0].source == "linear_bare_org_alias"
+    assert result.candidates[0].confidence == 0.91
 
 
 def test_resolve_candidate_overlaps_prefers_clean_nested_org_alias() -> None:
@@ -800,6 +820,69 @@ def test_pipeline_review_candidates_are_deduped_by_type_text_and_capped() -> Non
     assert result.review_candidates[0].text == "某某科技有限公司0"
     assert result.review_candidates[-1].text == "某某科技有限公司79"
     assert all(candidate_needs_llm_review(candidate) for candidate in result.review_candidates)
+
+
+def test_pipeline_collects_rule_detectors_once_before_optional_llm_review() -> None:
+    from unittest.mock import patch
+
+    import legal_redactor.candidate_collector as collector_module
+
+    with (
+        patch.object(
+            collector_module,
+            "detect_title_candidates",
+            wraps=collector_module.detect_title_candidates,
+        ) as title_spy,
+        patch.object(
+            collector_module,
+            "detect_china_admin_rule_candidates",
+            wraps=collector_module.detect_china_admin_rule_candidates,
+        ) as china_admin_spy,
+    ):
+        result = RedactionPipeline(config=PipelineConfig.offline_without_llm()).redact(
+            "原告张三提交证据。"
+        )
+
+    assert title_spy.call_count == 1
+    assert china_admin_spy.call_count == 1
+    assert any(mapping.original == "张三" for mapping in result.redaction_map.mappings)
+
+
+def test_fail_closed_sentence_extraction_skips_collector_and_engine() -> None:
+    from dataclasses import replace
+    from unittest.mock import patch
+
+    config = replace(
+        PipelineConfig.balanced_llm(),
+        enable_hebei_admin_db=False,
+        enable_china_admin_db=False,
+        enable_sample_library=False,
+    )
+
+    with (
+        patch(
+            "legal_redactor.llm.LegalEntityAuditor.extract_sentence_entities",
+            return_value={"error": "simulated extraction failure"},
+        ),
+        patch.object(
+            CandidateCollector,
+            "collect",
+            side_effect=AssertionError("collector must not run after fail-closed extraction"),
+        ),
+        patch.object(
+            LinearRuleEngine,
+            "discover",
+            side_effect=AssertionError("engine must not run after fail-closed extraction"),
+        ),
+    ):
+        result = RedactionPipeline(config=config).redact("原告张三，电话13800138000。")
+
+    assert "13800138000" not in result.redacted_text
+    assert any(mapping.type == "phone" for mapping in result.redaction_map.mappings)
+    assert result.review_candidates == []
+    assert result.warnings == [
+        "整句 LLM 识别失败，已仅保留固定结构化正则脱敏：simulated extraction failure"
+    ]
 
 
 def test_apply_mappings_does_not_replace_bare_alias_inside_different_company() -> None:

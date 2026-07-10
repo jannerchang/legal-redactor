@@ -7,6 +7,7 @@ from typing import Any
 
 from .candidate_collector import (
     CandidateCollectionContext,
+    CandidateCollectionResult,
     CandidateCollector,
     candidate_needs_llm_review,
 )
@@ -677,12 +678,21 @@ def _linear_run_engine(pipeline, ctx) -> None:
     )
     seed_candidates = [*ctx.admin_candidates, *ctx.hanlp_candidates]
 
-    if not ctx.sentence_extraction_success:
+    if ctx.sentence_extraction_success:
+        final_candidates = collector.collect(
+            CandidateCollectionContext(
+                text=ctx.scan_text,
+                seed_candidates=seed_candidates,
+                llm_analysis=ctx.analysis,
+                llm_primary_discovery=True,
+                use_semantic_rules=False,
+                use_china_admin_rules=pipeline.config.enable_china_admin_rules,
+            )
+        ).candidates
+    else:
         rule_candidates = collector.collect(
             CandidateCollectionContext(
                 text=ctx.scan_text,
-                profile=ctx.profile,
-                sample_blacklist=ctx.sample_blacklist,
                 seed_candidates=seed_candidates,
                 llm_analysis={},
                 llm_primary_discovery=False,
@@ -736,18 +746,10 @@ def _linear_run_engine(pipeline, ctx) -> None:
             if ctx.analysis.get("error"):
                 ctx.warnings.append(str(ctx.analysis["error"]))
 
-    final_candidates = collector.collect(
-        CandidateCollectionContext(
-            text=ctx.scan_text,
-            profile=ctx.profile,
-            sample_blacklist=ctx.sample_blacklist,
-            seed_candidates=seed_candidates,
-            llm_analysis=ctx.analysis,
-            llm_primary_discovery=ctx.sentence_extraction_success,
-            use_semantic_rules=not ctx.sentence_extraction_success,
-            use_china_admin_rules=pipeline.config.enable_china_admin_rules,
-        )
-    ).candidates
+        final_candidates = CandidateCollectionResult(
+            candidates=rule_candidates
+        ).with_llm_analysis(collector, ctx.scan_text, ctx.analysis).candidates
+
     ctx.mappings.extend(engine.discover(ctx.scan_text, final_candidates, ctx.analysis))
 
 

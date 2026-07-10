@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 import pytest
 from legal_redactor._samples import (
     save_sample_auto,
@@ -8,7 +7,6 @@ from legal_redactor._samples import (
     load_recent_error_samples,
     load_sample_blacklist_for_optimization,
     load_trusted_sample_mappings,
-    DEFAULT_SAMPLES_DIR,
     AUTO_SAMPLE_FILE,
 )
 from legal_redactor.config import PipelineConfig
@@ -807,9 +805,6 @@ def test_clean_organization_and_validate_llm_person():
     assert _is_false_org("并公司") is True
     assert _is_false_org("天津市慕尚园林绿化工程有限公司") is False
 
-    # 3. 验证 pipeline 中对 LLM 提取名字的深度校验 (通过 mock LLM 输出来做 pipeline 测试)
-    from legal_redactor.pipeline import RedactionPipeline
-    from legal_redactor.config import PipelineConfig
 
     # 构造含大模型幻觉人名/句子的 Mock LLM 输出
     mock_analysis = {
@@ -829,13 +824,6 @@ def test_clean_organization_and_validate_llm_person():
         "reject": []
     }
 
-    # 使用 mock_analysis 验证 pipeline
-    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
-
-    # 手动触发 pipeline redact 中对 LLM 人名的处理逻辑
-    # 我们可以模拟 pipeline._profile 允许 person
-    mappings = []
-    counters = type("MockCounters", (object,), {"next": lambda self, k: "甲"})()
 
     # 复制 pipeline 内部的 name 校验逻辑来验证
     common_surnames = frozenset(
@@ -857,7 +845,6 @@ def test_clean_organization_and_validate_llm_person():
     valid_names = []
     for person in mock_analysis["persons"]:
         name = person["name"]
-        surname = person["surname"]
         # ── 过滤明显的大模型抽取幻觉/长句误切 ──
         if len(name) > 6 or len(name) < 2:
             continue
@@ -876,7 +863,8 @@ def test_clean_organization_and_validate_llm_person():
 
 def test_advanced_rules_optimization():
     """测试识别规则深度优化路线图各项工作的正确性。"""
-    from legal_redactor.detectors import ORG_RE, detect_fallback_person_candidates, _FALSE_PERSON_WORDS
+    from legal_redactor.detectors import ORG_RE, detect_fallback_person_candidates
+    from legal_redactor.lexicon import FALSE_PERSON_WORDS
 
     # 1. 验证 ORG_RE 行政区划前置长度限制由 10 缩减为 5 字
     # "郝亚雄去跟天津市" 前置有 5 个非行政区字 + 天津(2字)，总长度 7，因此匹配范围绝不能以“郝”开始！
@@ -905,9 +893,9 @@ def test_advanced_rules_optimization():
     assert any(c.text == "陈戊靖" for c in candidates_5)
     assert any(c.text == "陶玉静" for c in candidates_6)
 
-    # 3. 验证 _FALSE_PERSON_WORDS 排除词库的扩充
-    assert "案情" in _FALSE_PERSON_WORDS
-    assert "起诉状" in _FALSE_PERSON_WORDS
-    assert "答辩状" in _FALSE_PERSON_WORDS
-    assert "委托书" in _FALSE_PERSON_WORDS
-    assert "代理词" in _FALSE_PERSON_WORDS
+    # 3. 验证 FALSE_PERSON_WORDS 排除词库的扩充
+    assert "案情" in FALSE_PERSON_WORDS
+    assert "起诉状" in FALSE_PERSON_WORDS
+    assert "答辩状" in FALSE_PERSON_WORDS
+    assert "委托书" in FALSE_PERSON_WORDS
+    assert "代理词" in FALSE_PERSON_WORDS

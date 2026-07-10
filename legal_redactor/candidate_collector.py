@@ -9,11 +9,10 @@ overlap resolution, and deterministic mapping expansion.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable
 
 from .china_admin_rules import detect_china_admin_rule_candidates
-from .config import RedactionProfile
 from .detectors import (
     detect_fallback_person_candidates,
     detect_inline_party_person_list_candidates,
@@ -33,8 +32,6 @@ SENTENCE_SPLIT_RE = re.compile(r"[^\n。！？；;，,、]+[。！？；;，,、
 @dataclass(frozen=True)
 class CandidateCollectionContext:
     text: str
-    profile: RedactionProfile
-    sample_blacklist: set[str]
     seed_candidates: list[Candidate] = field(default_factory=list)
     llm_analysis: dict[str, Any] = field(default_factory=dict)
     llm_primary_discovery: bool = False
@@ -46,6 +43,18 @@ class CandidateCollectionContext:
 class CandidateCollectionResult:
     candidates: list[Candidate]
 
+    def with_llm_analysis(
+        self,
+        collector: "CandidateCollector",
+        text: str,
+        analysis: dict[str, Any],
+    ) -> "CandidateCollectionResult":
+        return CandidateCollectionResult(
+            candidates=collector._deduplicate_candidates(
+                [*self.candidates, *collector._llm_candidates(text, analysis)]
+            )
+        )
+
 
 class CandidateCollector:
     """Collect ordered candidates behind one small discovery interface."""
@@ -53,8 +62,8 @@ class CandidateCollector:
     def collect(self, context: CandidateCollectionContext) -> CandidateCollectionResult:
         candidates = list(context.seed_candidates)
         if context.llm_primary_discovery:
-            candidates.extend(self.llm_candidates(context.text, context.llm_analysis))
-            return CandidateCollectionResult(candidates=self.deduplicate_candidates(candidates))
+            candidates.extend(self._llm_candidates(context.text, context.llm_analysis))
+            return CandidateCollectionResult(candidates=self._deduplicate_candidates(candidates))
 
         has_local_org_ner = any(
             candidate.type == "organization" and candidate.source.startswith("hanlp_ner")
@@ -65,18 +74,18 @@ class CandidateCollector:
         party_candidates: list[Candidate] = []
         fallback_people: list[Candidate] = []
         local_orgs: list[Candidate] = []
-        for segment, offset in self.sentence_spans(context.text):
+        for segment, offset in self._sentence_spans(context.text):
             segment_party, _ = detect_party_candidates(segment)
-            party_candidates.extend(self.offset_candidates(segment_party, offset))
+            party_candidates.extend(self._offset_candidates(segment_party, offset))
             if context.use_semantic_rules:
                 fallback_people.extend(
-                    self.offset_candidates(
+                    self._offset_candidates(
                         detect_fallback_person_candidates(segment),
                         offset,
                     )
                 )
                 if not has_local_org_ner:
-                    local_orgs.extend(self.organization_candidates(segment, offset))
+                    local_orgs.extend(self._organization_candidates(segment, offset))
         candidates.extend(party_candidates)
 
         if context.use_semantic_rules:
@@ -85,11 +94,11 @@ class CandidateCollector:
                 candidates.extend(detect_china_admin_rule_candidates(context.text))
             candidates.extend(local_orgs)
 
-        candidates.extend(self.llm_candidates(context.text, context.llm_analysis))
-        return CandidateCollectionResult(candidates=self.deduplicate_candidates(candidates))
+        candidates.extend(self._llm_candidates(context.text, context.llm_analysis))
+        return CandidateCollectionResult(candidates=self._deduplicate_candidates(candidates))
 
     @staticmethod
-    def sentence_spans(text: str) -> list[tuple[str, int]]:
+    def _sentence_spans(text: str) -> list[tuple[str, int]]:
         spans = [
             (match.group(0), match.start())
             for match in SENTENCE_SPLIT_RE.finditer(text)
@@ -98,30 +107,20 @@ class CandidateCollector:
         return spans or [(text, 0)]
 
     @staticmethod
-    def offset_candidates(candidates: Iterable[Candidate], offset: int) -> list[Candidate]:
+    def _offset_candidates(candidates: Iterable[Candidate], offset: int) -> list[Candidate]:
         if offset == 0:
             return list(candidates)
         return [
-            Candidate(
-                type=candidate.type,
-                text=candidate.text,
+            replace(
+                candidate,
                 start=candidate.start + offset,
                 end=candidate.end + offset,
-                source=candidate.source,
-                confidence=candidate.confidence,
-                risk_level=candidate.risk_level,
-                auto_redact=candidate.auto_redact,
-                role=candidate.role,
-                reason=candidate.reason,
-                suggested_mask_type=candidate.suggested_mask_type,
-                needs_review=candidate.needs_review,
-                metadata=candidate.metadata,
             )
             for candidate in candidates
         ]
 
     @staticmethod
-    def organization_candidates(text: str, offset: int = 0) -> list[Candidate]:
+    def _organization_candidates(text: str, offset: int = 0) -> list[Candidate]:
         candidates: list[Candidate] = []
         for match in ORG_FULL_RE.finditer(text):
             value = _clean_organization_text(match.group(0))
@@ -161,7 +160,7 @@ class CandidateCollector:
                 )
         return candidates
 
-    def llm_candidates(self, text: str, analysis: dict[str, Any]) -> list[Candidate]:
+    def _llm_candidates(self, text: str, analysis: dict[str, Any]) -> list[Candidate]:
         candidates: list[Candidate] = []
         windows = analysis.get("_sentence_windows", [])
         window_by_id = {
@@ -170,25 +169,25 @@ class CandidateCollector:
             if isinstance(item, dict) and isinstance(item.get("id"), str)
         } if isinstance(windows, list) else {}
         for item in analysis.get("locations", []):
-            for value in self.entity_values(item, "full", "name", "text"):
-                self.append_exact_candidate(candidates, text, value, "location", item, window_by_id)
+            for value in self._entity_values(item, "full", "name", "text"):
+                self._append_exact_candidate(candidates, text, value, "location", item, window_by_id)
         for item in analysis.get("persons", []):
-            for value in self.entity_values(item, "name", "text"):
-                self.append_exact_candidate(candidates, text, value, "person", item, window_by_id)
+            for value in self._entity_values(item, "name", "text"):
+                self._append_exact_candidate(candidates, text, value, "person", item, window_by_id)
         for item in analysis.get("companies", []):
-            for value in self.entity_values(item, "name", "full", "brand", "text"):
-                self.append_exact_candidate(candidates, text, value, "organization", item, window_by_id)
+            for value in self._entity_values(item, "name", "full", "brand", "text"):
+                self._append_exact_candidate(candidates, text, value, "organization", item, window_by_id)
             variants = item.get("variants", []) if isinstance(item, dict) else []
             if isinstance(variants, list):
                 for value in variants:
-                    self.append_exact_candidate(candidates, text, value, "organization", item, window_by_id)
+                    self._append_exact_candidate(candidates, text, value, "organization", item, window_by_id)
         for item in analysis.get("projects", []):
-            for value in self.entity_values(item, "name", "full", "text"):
-                self.append_exact_candidate(candidates, text, value, "project", item, window_by_id)
+            for value in self._entity_values(item, "name", "full", "text"):
+                self._append_exact_candidate(candidates, text, value, "project", item, window_by_id)
         return candidates
 
     @staticmethod
-    def entity_values(item: dict[str, Any], *keys: str) -> list[str]:
+    def _entity_values(item: dict[str, Any], *keys: str) -> list[str]:
         values: list[str] = []
         if not isinstance(item, dict):
             return values
@@ -199,7 +198,7 @@ class CandidateCollector:
         return values
 
     @staticmethod
-    def append_exact_candidate(
+    def _append_exact_candidate(
         candidates: list[Candidate],
         text: str,
         value: object,
@@ -262,7 +261,7 @@ class CandidateCollector:
         )
 
     @staticmethod
-    def deduplicate_candidates(candidates: list[Candidate]) -> list[Candidate]:
+    def _deduplicate_candidates(candidates: list[Candidate]) -> list[Candidate]:
         best: dict[tuple[str, str, int], Candidate] = {}
         for candidate in candidates:
             key = (candidate.type, candidate.text, candidate.start)
@@ -288,7 +287,8 @@ def candidate_needs_llm_review(candidate: Candidate) -> bool:
         if candidate.type == "organization":
             return len(candidate.text) <= 6 or not any(
                 candidate.text.endswith(suffix)
-                for suffix in ("有限责任公司", "股份有限公司", "集团有限公司", "有限公司")
+                for suffix in LEGAL_SUFFIXES
+                if suffix not in {"公司", "集团"}
             )
     return False
 
