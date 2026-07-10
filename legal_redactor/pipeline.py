@@ -25,9 +25,10 @@ from .location_utils import get_location_core
 from .models import BatchRedactionResult, Candidate, Leak, MappingEntry, RedactedDocument, RedactionMap, RedactionResult
 from .postprocess import PostprocessConfig, apply_postprocess
 from ._samples import load_all_samples, load_trusted_sample_mappings  # noqa: F401
-# Sample-library loaders are kept importable on this module as legacy mock
-# anchors for tests and tools. Runtime redaction intentionally does not consume
-# sample mappings or delete blacklists; samples are optimization evidence only.
+# load_all_samples is not called in this module, but tests patch
+# legal_redactor.pipeline.load_all_samples as a mock anchor
+# (tests/test_hebei_admin.py, tests/test_china_admin.py); keep the name
+# importable on this module so mock.patch can resolve it.
 
 
 _COMPANY_SUFFIXES_FOR_ALIAS_BOUNDARY = (
@@ -428,12 +429,18 @@ def _linear_init_ctx(pipeline, text, source_file, prov_mapping, base_redaction_m
     boundary_match = re.search(r"本院(?:经审理|经审查|审理)?认为", text)
     ctx.scan_text = text[: boundary_match.start()] if boundary_match else text
 
-    # Samples are optimization evidence only. Do not use add/modify/keep rows as
-    # runtime mappings, and never let delete samples suppress another document's
-    # detections.
-    ctx.sample_blacklist = set()
-    ctx.sample_mappings = []
-    ctx.trusted_org_short_names = set()
+    if pipeline.config.enable_sample_library:
+        ctx.sample_blacklist = set()
+        ctx.sample_mappings = [
+            mapping
+            for mapping in load_trusted_sample_mappings()
+            if mapping.original in text and _candidate_allowed(mapping.type, profile)
+        ]
+    else:
+        ctx.sample_blacklist = set()
+        ctx.sample_mappings = []
+
+    ctx.trusted_org_short_names = _trusted_organization_short_names(ctx.sample_mappings)
     ctx.base_mappings = list(base_redaction_map.mappings) if base_redaction_map else []
     return ctx
 
@@ -585,7 +592,7 @@ def _linear_run_sentence_extraction(pipeline, ctx, text):
         auditor = LegalEntityAuditor(pipeline.config.local_llm)
         ctx.analysis = auditor.extract_sentence_entities(
             ctx.scan_text,
-            enable_samples=False,
+            enable_samples=pipeline.config.enable_sample_library,
         )
         if ctx.analysis.get("error"):
             ctx.llm_extraction_failed = True
@@ -597,6 +604,11 @@ def _linear_run_sentence_extraction(pipeline, ctx, text):
                 seen_originals: set[str] = set()
                 for mapping in ctx.base_mappings:
                     if mapping.original in seen_originals:
+                        continue
+                    seen_originals.add(mapping.original)
+                    unique_mappings.append(mapping)
+                for mapping in sorted(ctx.sample_mappings, key=lambda item: len(item.original), reverse=True):
+                    if mapping.original in seen_originals or mapping.original in ctx.sample_blacklist:
                         continue
                     seen_originals.add(mapping.original)
                     unique_mappings.append(mapping)
@@ -719,7 +731,7 @@ def _linear_run_engine(pipeline, ctx) -> None:
             ctx.analysis = auditor.audit_and_verify(
                 ctx.scan_text,
                 verify_list,
-                enable_samples=False,
+                enable_samples=pipeline.config.enable_sample_library,
             )
             if ctx.analysis.get("error"):
                 ctx.warnings.append(str(ctx.analysis["error"]))
@@ -744,6 +756,11 @@ def _linear_finalize(pipeline, ctx, text) -> RedactionResult:
     seen_originals: set[str] = set()
     for mapping in ctx.base_mappings:
         if mapping.original in seen_originals:
+            continue
+        seen_originals.add(mapping.original)
+        unique_mappings.append(mapping)
+    for mapping in sorted(ctx.sample_mappings, key=lambda item: len(item.original), reverse=True):
+        if mapping.original in seen_originals or mapping.original in ctx.sample_blacklist:
             continue
         seen_originals.add(mapping.original)
         unique_mappings.append(mapping)

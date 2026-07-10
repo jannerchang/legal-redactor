@@ -192,14 +192,12 @@ def _reverse_time_key(e: dict) -> str:
 
 
 def _compact_entries(entries: list[dict]) -> list[dict]:
-    """整理条目：仅保留带人工说明的有效条目并去重。"""
+    """整理条目：过滤空值、重复。"""
     seen = set()
     result = []
     for e in entries:
         orig = _entry_original(e)
         if not orig:
-            continue
-        if not str(e.get("reason") or "").strip():
             continue
         action = e.get("action", "")
         # delete 条目不需要 masked

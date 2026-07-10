@@ -28,9 +28,9 @@ def mock_samples(tmp_path):
     """创建临时样本库用于测试。"""
     # 模拟 entries
     entries = [
-        # 被拉黑的词（仅供优化，不参与运行时脱敏）
-        {"action": "delete", "type": "organization", "original": "来我去公司", "reason": "不是机构"},
-        # 精确修改的词（仅供样本 API/优化使用）
+        # 被拉黑的词（应被豁免，不进行脱敏）
+        {"action": "delete", "type": "organization", "original": "来我去公司"},
+        # 精确修改的词（应使用精准脱敏掩码）
         {
             "action": "modify",
             "type": "person",
@@ -38,10 +38,9 @@ def mock_samples(tmp_path):
             "new_original": "张小明",
             "old_masked": "张某1",
             "new_masked": "【小明特制掩码】",
-            "reason": "掩码校正",
         },
-        # 新增的词（仅供样本 API/优化使用）
-        {"action": "add", "type": "manual", "original": "绝密代号", "masked": "【代号X】", "reason": "漏识别"},
+        # 新增的词（直接脱敏）
+        {"action": "add", "type": "manual", "original": "绝密代号", "masked": "【代号X】"},
     ]
 
     # 保存临时样本库
@@ -51,32 +50,22 @@ def mock_samples(tmp_path):
     return tmp_path, filepath
 
 
-def test_pipeline_does_not_reuse_sample_mappings_at_runtime(mock_samples, monkeypatch):
-    """Samples stay loadable for optimization, but redact() ignores their mappings."""
-    tmp_path, _filepath = mock_samples
+def test_pipeline_reuses_modify_samples_without_delete_blacklist(mock_samples, monkeypatch):
+    tmp_path, filepath = mock_samples
 
     import legal_redactor._samples
     monkeypatch.setattr(legal_redactor._samples, "DEFAULT_SAMPLES_DIR", tmp_path)
 
-    lookup, blacklist = load_all_samples(samples_dir=tmp_path)
-    trusted = load_trusted_sample_mappings(samples_dir=tmp_path)
-    trusted_by_original = {mapping.original: mapping for mapping in trusted}
+    config = PipelineConfig.offline_without_llm()
+    pipeline = RedactionPipeline(config=config)
+    test_text = "原告：张小明。被告：来我去公司。案件涉及绝密代号。"
 
-    assert lookup["张小明"] == "【小明特制掩码】"
-    assert "来我去公司" in blacklist
-    assert trusted_by_original["张小明"].masked == "【小明特制掩码】"
+    result = pipeline.redact(test_text, mode="standard")
 
-    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
-    result = pipeline.redact("原告：张小明。被告：来我去公司。案件涉及绝密代号。", mode="standard")
-
-    # Sample-specific masks and add-only phrases must not drive runtime redaction.
-    assert "【小明特制掩码】" not in result.redacted_text
-    assert "【代号X】" not in result.redacted_text
+    assert "张小明" not in result.redacted_text
+    assert "【小明特制掩码】" in result.redacted_text
     assert "绝密代号" in result.redacted_text
-    assert all(
-        not str(mapping.source or "").startswith("sample_library:")
-        for mapping in result.redaction_map.mappings
-    )
+    assert "【代号X】" not in result.redacted_text
 
 
 def test_delete_samples_remain_for_optimization(mock_samples, monkeypatch):
@@ -95,7 +84,7 @@ def test_delete_blacklist_does_not_block_party_org_redaction(tmp_path, monkeypat
     import legal_redactor._samples as samples_module
 
     save_sample_auto(
-        [{"action": "delete", "type": "organization", "original": "华北制药股份有限公司", "reason": "另案误删样本"}],
+        [{"action": "delete", "type": "organization", "original": "华北制药股份有限公司"}],
         samples_dir=tmp_path,
     )
     monkeypatch.setattr(samples_module, "DEFAULT_SAMPLES_DIR", tmp_path)
@@ -137,7 +126,6 @@ def test_modify_sample_with_company_mask_is_treated_as_organization(tmp_path):
                 "new_original": "兴代",
                 "old_masked": "兴某甲",
                 "new_masked": "丁公司",
-                "reason": "公司简称",
             },
             {
                 "action": "modify",
@@ -146,7 +134,6 @@ def test_modify_sample_with_company_mask_is_treated_as_organization(tmp_path):
                 "new_original": "兴代公司",
                 "old_masked": "乙省乙装饰工程公司",
                 "new_masked": "乙省丁公司",
-                "reason": "公司掩码校正",
             },
         ],
         samples_dir=tmp_path,
@@ -163,11 +150,11 @@ def test_modify_sample_with_company_mask_is_treated_as_organization(tmp_path):
 def test_trusted_added_company_samples_are_reused_narrowly(tmp_path):
     save_sample_auto(
         [
-            {"action": "add", "type": "manual", "original": "胖哥公司", "masked": "乙公司", "reason": "漏识别机构"},
-            {"action": "add", "type": "manual", "original": "唐山", "masked": "己市", "reason": "漏识别地名"},
-            {"action": "add", "type": "manual", "original": "曹永现", "masked": "曹某甲", "reason": "漏识别人名"},
-            {"action": "add", "type": "manual", "original": "冀", "masked": "新", "reason": "案号简称不应全局复用"},
-            {"action": "add", "type": "manual", "original": "绝密代号", "masked": "【代号X】", "reason": "非实体样本"},
+            {"action": "add", "type": "manual", "original": "胖哥公司", "masked": "乙公司"},
+            {"action": "add", "type": "manual", "original": "唐山", "masked": "己市"},
+            {"action": "add", "type": "manual", "original": "曹永现", "masked": "曹某甲"},
+            {"action": "add", "type": "manual", "original": "冀", "masked": "新"},
+            {"action": "add", "type": "manual", "original": "绝密代号", "masked": "【代号X】"},
         ],
         source="today",
         samples_dir=tmp_path,
@@ -185,9 +172,9 @@ def test_trusted_added_company_samples_are_reused_narrowly(tmp_path):
 def test_short_person_delete_samples_do_not_pollute_global_blacklist(tmp_path):
     save_sample_auto(
         [
-            {"action": "delete", "type": "person", "original": "王五", "reason": "短人名误删保护"},
-            {"action": "delete", "type": "person", "original": "张小明", "reason": "短人名误删保护"},
-            {"action": "delete", "type": "organization", "original": "来我去公司", "reason": "不是机构"},
+            {"action": "delete", "type": "person", "original": "王五"},
+            {"action": "delete", "type": "person", "original": "张小明"},
+            {"action": "delete", "type": "organization", "original": "来我去公司"},
         ],
         source="today",
         samples_dir=tmp_path,
@@ -214,7 +201,6 @@ def test_modify_old_short_person_name_does_not_pollute_blacklist(tmp_path):
                 "new_original": "王五明",
                 "old_masked": "王某1",
                 "new_masked": "王某2",
-                "reason": "人名边界校正",
             }
         ],
         source="today",
@@ -227,81 +213,55 @@ def test_modify_old_short_person_name_does_not_pollute_blacklist(tmp_path):
     assert lookup["王五明"] == "王某2"
 
 
-def test_pipeline_does_not_reuse_trusted_added_company_sample(tmp_path, monkeypatch):
+def test_pipeline_reuses_trusted_added_company_sample(tmp_path, monkeypatch):
     import legal_redactor._samples
 
-    text = "胖哥公司与起航小镇签订合同。"
-    baseline = RedactionPipeline(config=PipelineConfig.offline_without_llm()).redact(text)
-
     save_sample_auto(
-        [{"action": "add", "type": "manual", "original": "胖哥公司", "masked": "乙公司", "reason": "漏识别机构"}],
+        [{"action": "add", "type": "manual", "original": "胖哥公司", "masked": "乙公司"}],
         source="today",
         samples_dir=tmp_path,
     )
     monkeypatch.setattr(legal_redactor._samples, "DEFAULT_SAMPLES_DIR", tmp_path)
 
-    trusted = load_trusted_sample_mappings(samples_dir=tmp_path)
-    assert any(mapping.original == "胖哥公司" and mapping.masked == "乙公司" for mapping in trusted)
+    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
+    result = pipeline.redact("胖哥公司与起航小镇签订合同。")
 
-    result = RedactionPipeline(config=PipelineConfig.offline_without_llm()).redact(text)
-
-    # Sample API still exposes the entry, but redact output is identical to a no-sample run.
-    assert "乙公司" not in result.redacted_text
-    assert result.redacted_text == baseline.redacted_text
-    assert [(m.type, m.original, m.masked) for m in result.redaction_map.mappings] == [
-        (m.type, m.original, m.masked) for m in baseline.redaction_map.mappings
-    ]
-    assert all(
-        not str(mapping.source or "").startswith("sample_library:")
-        for mapping in result.redaction_map.mappings
-    )
+    assert "胖哥公司" not in result.redacted_text
+    assert "乙公司" in result.redacted_text
 
 
-def test_pipeline_does_not_reuse_location_samples_case_abbr_still_ignored(tmp_path, monkeypatch):
+def test_pipeline_reuses_trusted_added_locations_and_ignores_case_abbr(tmp_path, monkeypatch):
     import legal_redactor._samples
-
-    text = "河北唐山迁安市、井陉县，案号（2025）冀01民终123号。"
 
     save_sample_auto(
         [
-            {"action": "add", "type": "manual", "original": "河北", "masked": "甲省", "reason": "漏识别地名"},
-            {"action": "add", "type": "manual", "original": "唐山", "masked": "己市", "reason": "漏识别地名"},
-            {"action": "add", "type": "manual", "original": "迁安市", "masked": "戊市", "reason": "漏识别地名"},
-            {"action": "add", "type": "manual", "original": "井陉县", "masked": "丁县", "reason": "漏识别地名"},
-            {"action": "add", "type": "manual", "original": "冀", "masked": "新", "reason": "案号简称不应全局复用"},
+            {"action": "add", "type": "manual", "original": "河北", "masked": "甲省"},
+            {"action": "add", "type": "manual", "original": "唐山", "masked": "己市"},
+            {"action": "add", "type": "manual", "original": "迁安市", "masked": "戊市"},
+            {"action": "add", "type": "manual", "original": "井陉县", "masked": "丁县"},
+            {"action": "add", "type": "manual", "original": "冀", "masked": "新"},
         ],
         source="today",
         samples_dir=tmp_path,
     )
     monkeypatch.setattr(legal_redactor._samples, "DEFAULT_SAMPLES_DIR", tmp_path)
 
-    trusted = {
-        mapping.original: mapping.masked
-        for mapping in load_trusted_sample_mappings(samples_dir=tmp_path)
-    }
-    assert trusted["河北"] == "甲省"
-    assert trusted["唐山"] == "己市"
-    assert "冀" not in trusted
+    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
+    result = pipeline.redact("河北唐山迁安市、井陉县，案号（2025）冀01民终123号。")
 
-    result = RedactionPipeline(config=PipelineConfig.offline_without_llm()).redact(text)
-
-    # Sample API keeps location rows, but runtime does not inject their masks or
-    # treat the case-number province abbreviation as a standalone entity.
-    # 己市 is distinctive to the sample for 唐山; rules use a different counter.
-    assert "己市" not in result.redacted_text
+    assert "河北" not in result.redacted_text
+    assert "唐山" not in result.redacted_text
+    assert "迁安市" not in result.redacted_text
+    assert "井陉县" not in result.redacted_text
+    assert "甲省" in result.redacted_text
+    assert "己市" in result.redacted_text
+    assert "戊市" in result.redacted_text
+    assert "丁县" in result.redacted_text
     assert all(mapping.original != "冀" for mapping in result.redaction_map.mappings)
-    assert all(mapping.masked != "己市" for mapping in result.redaction_map.mappings)
-    assert all(
-        not str(mapping.source or "").startswith("sample_library:")
-        for mapping in result.redaction_map.mappings
-    )
 
 
-def test_pipeline_does_not_apply_sample_company_location_corrections(tmp_path, monkeypatch):
+def test_pipeline_reuses_today_company_and_location_corrections(tmp_path, monkeypatch):
     import legal_redactor._samples
-
-    text = "石家庄裕华精密铸造有限公司与鹿泉市裕华精密铸造有限公司相关，裕华公司位于鹿泉。石药集团提交说明。"
-    baseline = RedactionPipeline(config=PipelineConfig.offline_without_llm()).redact(text)
 
     save_sample_auto(
         [
@@ -312,7 +272,6 @@ def test_pipeline_does_not_apply_sample_company_location_corrections(tmp_path, m
                 "new_original": "石家庄裕华精密铸造有限公司",
                 "old_masked": "丙公司",
                 "new_masked": "甲公司",
-                "reason": "公司掩码校正",
             },
             {
                 "action": "modify",
@@ -321,21 +280,18 @@ def test_pipeline_does_not_apply_sample_company_location_corrections(tmp_path, m
                 "new_original": "鹿泉市裕华精密铸造有限公司",
                 "old_masked": "乙公司",
                 "new_masked": "甲公司",
-                "reason": "公司掩码校正",
             },
             {
                 "action": "add",
                 "type": "manual",
                 "original": "裕华公司",
                 "masked": "甲公司",
-                "reason": "公司简称",
             },
             {
                 "action": "add",
                 "type": "manual",
                 "original": "石药集团",
                 "masked": "乙集团",
-                "reason": "漏识别机构",
             },
             {
                 "action": "modify",
@@ -344,7 +300,6 @@ def test_pipeline_does_not_apply_sample_company_location_corrections(tmp_path, m
                 "new_original": "鹿泉",
                 "old_masked": "某区",
                 "new_masked": "丙区",
-                "reason": "地名掩码校正",
             },
         ],
         source="today",
@@ -352,33 +307,16 @@ def test_pipeline_does_not_apply_sample_company_location_corrections(tmp_path, m
     )
     monkeypatch.setattr(legal_redactor._samples, "DEFAULT_SAMPLES_DIR", tmp_path)
 
-    trusted = {
-        mapping.original: mapping.masked
-        for mapping in load_trusted_sample_mappings(samples_dir=tmp_path)
-    }
-    assert trusted["石家庄裕华精密铸造有限公司"] == "甲公司"
-    assert trusted["石药集团"] == "乙集团"
-    assert trusted["鹿泉"] == "丙区"
-
-    result = RedactionPipeline(config=PipelineConfig.offline_without_llm()).redact(text)
-
-    # Correction samples remain available to the sample API, but do not alter runtime redaction.
-    assert "丙区" not in result.redacted_text
-    assert result.redacted_text == baseline.redacted_text
-    assert [(m.type, m.original, m.masked) for m in result.redaction_map.mappings] == [
-        (m.type, m.original, m.masked) for m in baseline.redaction_map.mappings
-    ]
-    assert all(
-        not str(mapping.source or "").startswith("sample_library:")
-        for mapping in result.redaction_map.mappings
+    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
+    result = pipeline.redact(
+        "石家庄裕华精密铸造有限公司与鹿泉市裕华精密铸造有限公司相关，裕华公司位于鹿泉。石药集团提交说明。"
     )
 
+    assert result.redacted_text == "甲公司与甲公司相关，甲公司位于丙区。乙集团提交说明。"
 
-def test_pipeline_does_not_import_trusted_company_sample_mapping(tmp_path, monkeypatch):
+
+def test_pipeline_drops_rule_fragments_inside_trusted_company_sample(tmp_path, monkeypatch):
     import legal_redactor._samples
-
-    text = "诺亚人力资源发展集团有限公司提交了证据。"
-    baseline = RedactionPipeline(config=PipelineConfig.offline_without_llm()).redact(text)
 
     save_sample_auto(
         [
@@ -387,7 +325,6 @@ def test_pipeline_does_not_import_trusted_company_sample_mapping(tmp_path, monke
                 "type": "manual",
                 "original": "诺亚人力资源发展集团有限公司",
                 "masked": "乙人力资源发展集团有限公司",
-                "reason": "漏识别机构",
             }
         ],
         source="today",
@@ -395,29 +332,16 @@ def test_pipeline_does_not_import_trusted_company_sample_mapping(tmp_path, monke
     )
     monkeypatch.setattr(legal_redactor._samples, "DEFAULT_SAMPLES_DIR", tmp_path)
 
-    trusted = load_trusted_sample_mappings(samples_dir=tmp_path)
-    assert any(
-        mapping.original == "诺亚人力资源发展集团有限公司"
-        and mapping.masked == "乙人力资源发展集团有限公司"
-        for mapping in trusted
-    )
+    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
+    result = pipeline.redact("诺亚人力资源发展集团有限公司提交了证据。")
 
-    result = RedactionPipeline(config=PipelineConfig.offline_without_llm()).redact(text)
-
-    assert "乙人力资源发展集团有限公司" not in result.redacted_text
-    assert result.redacted_text == baseline.redacted_text
-    assert [(m.type, m.original, m.masked) for m in result.redaction_map.mappings] == [
-        (m.type, m.original, m.masked) for m in baseline.redaction_map.mappings
-    ]
-    assert all(
-        not str(mapping.source or "").startswith("sample_library:")
-        for mapping in result.redaction_map.mappings
-    )
+    assert result.redacted_text == "乙人力资源发展集团有限公司提交了证据。"
+    assert [m.original for m in result.redaction_map.mappings] == ["诺亚人力资源发展集团有限公司"]
 
 
 def test_sample_entries_are_timestamped_and_recent_errors_sorted(tmp_path):
     save_sample_auto(
-        [{"action": "delete", "type": "location", "original": "旧错误", "reason": "不是地名"}],
+        [{"action": "delete", "type": "location", "original": "旧错误"}],
         source="first",
         samples_dir=tmp_path,
     )
@@ -431,7 +355,7 @@ def test_sample_entries_are_timestamped_and_recent_errors_sorted(tmp_path):
     created_at = first_entry["created_at"]
 
     save_sample_auto(
-        [{"action": "delete", "type": "organization", "original": "新错误", "reason": "不是机构"}],
+        [{"action": "delete", "type": "organization", "original": "新错误"}],
         source="second",
         samples_dir=tmp_path,
     )
@@ -442,7 +366,7 @@ def test_sample_entries_are_timestamped_and_recent_errors_sorted(tmp_path):
         if entry.get("original") == "新错误"
     }["新错误"]
     save_sample_auto(
-        [{"action": "delete", "type": "location", "original": "旧错误", "reason": "不是地名"}],
+        [{"action": "delete", "type": "location", "original": "旧错误"}],
         source="again",
         samples_dir=tmp_path,
     )
@@ -844,7 +768,7 @@ def test_fallback_person_missed_names_are_detected():
 
 def test_clean_organization_and_validate_llm_person():
     """测试组织机构清洗优化以及 LLM 人名提取校验的正确性。"""
-    from legal_redactor.filters import clean_organization_text as _clean_organization_text, is_false_org as _is_false_org
+    from legal_redactor.detectors import _clean_organization_text, _is_false_org
 
     # 1. 组织清洗只做格式归一化，不再凭动作词猜实体边界
     c1 = _clean_organization_text("是由郝亚雄去跟天津市慕尚园林绿化工程有限公司")
@@ -952,9 +876,7 @@ def test_clean_organization_and_validate_llm_person():
 
 def test_advanced_rules_optimization():
     """测试识别规则深度优化路线图各项工作的正确性。"""
-    from legal_redactor.detectors import ORG_RE, detect_fallback_person_candidates
-    from legal_redactor.filters import clean_organization_text as _clean_organization_text
-    from legal_redactor.lexicon import FALSE_PERSON_WORDS
+    from legal_redactor.detectors import ORG_RE, detect_fallback_person_candidates, _FALSE_PERSON_WORDS
 
     # 1. 验证 ORG_RE 行政区划前置长度限制由 10 缩减为 5 字
     # "郝亚雄去跟天津市" 前置有 5 个非行政区字 + 天津(2字)，总长度 7，因此匹配范围绝不能以“郝”开始！
@@ -962,6 +884,7 @@ def test_advanced_rules_optimization():
     text_org = "郝亚雄去跟天津市慕尚园林绿化工程有限公司"
     match = ORG_RE.search(text_org)
     assert match is not None
+    from legal_redactor.detectors import _clean_organization_text
     cleaned = _clean_organization_text(match.group(0))
     # 组织清洗不再凭动作词裁剪实体边界；该类边界由候选生成或 LLM 校准负责。
     assert cleaned == match.group(0)
@@ -981,9 +904,10 @@ def test_advanced_rules_optimization():
     assert any(c.text == "陶玉静" for c in candidates_4)
     assert any(c.text == "陈戊靖" for c in candidates_5)
     assert any(c.text == "陶玉静" for c in candidates_6)
-    # 3. 验证 FALSE_PERSON_WORDS 排除词库的扩充
-    assert "案情" in FALSE_PERSON_WORDS
-    assert "起诉状" in FALSE_PERSON_WORDS
-    assert "答辩状" in FALSE_PERSON_WORDS
-    assert "委托书" in FALSE_PERSON_WORDS
-    assert "代理词" in FALSE_PERSON_WORDS
+
+    # 3. 验证 _FALSE_PERSON_WORDS 排除词库的扩充
+    assert "案情" in _FALSE_PERSON_WORDS
+    assert "起诉状" in _FALSE_PERSON_WORDS
+    assert "答辩状" in _FALSE_PERSON_WORDS
+    assert "委托书" in _FALSE_PERSON_WORDS
+    assert "代理词" in _FALSE_PERSON_WORDS
