@@ -47,7 +47,8 @@ from .local_config import config_value, load_json_config
 from .models import MappingEntry, RedactedDocument, RedactionMap, sort_mapping_entries
 from .org_masking import derived_organization_alias_cores
 from .llm import is_noise_entity_text
-from .pipeline import RedactionPipeline, _filter_noise_entity_mappings
+from .pipeline import RedactionPipeline
+from .postprocess import _filter_noise_entity_mappings
 from .restore import preview_restore, restore_docx
 from .status import build_status_payload, ensure_mlx_server_ready
 from .web_templates import (
