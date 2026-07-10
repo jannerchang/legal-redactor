@@ -1,9 +1,9 @@
-"""Linear, human-style rule discovery for legal document redaction.
+"""Linear, human-style candidate acceptance for legal document redaction.
 
-The engine reads discoveries in source order. Once an entity is confirmed, it
-expands that entity into deterministic full-text replacement rules. The source
-text is kept unchanged during discovery so generated masks cannot interfere
-with later recognition.
+The engine accepts ordered discoveries in source order. Once an entity is
+confirmed, it expands that entity into deterministic full-text replacement
+rules. The source text is kept unchanged during acceptance so generated masks
+cannot interfere with later recognition.
 """
 
 from __future__ import annotations
@@ -13,26 +13,13 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
 from .candidate_resolution import is_noisy_org_capture, resolve_candidate_overlaps
-from .china_admin_rules import detect_china_admin_rule_candidates
+from .filters import clean_organization_text as _clean_organization_text
 from .config import RedactionProfile
+from .filters import is_false_org as _is_false_org
 from .counters import TypeCounters
-from .detectors import (
-    _clean_organization_text,
-    _is_false_person,
-    _is_false_org,
-    _looks_like_false_location,
-    detect_fallback_person_candidates,
-    detect_inline_party_person_list_candidates,
-    detect_party_candidates,
-    detect_title_candidates,
-)
-from .lexicon import (
-    BARE_COMPANY_ALIAS_RE,
-    FACT_SECTION_BOUNDARY_RE,
-    INSTITUTION_SUFFIXES,
-    LEGAL_SUFFIXES,
-    ORG_FULL_RE,
-)
+from .filters import is_false_person as _is_false_person
+from .filters import looks_like_false_location as _looks_like_false_location
+from .lexicon import FACT_SECTION_BOUNDARY_RE, INSTITUTION_SUFFIXES, LEGAL_SUFFIXES
 from .location_utils import (
     ADMIN_SUFFIXES,
     get_location_core,
@@ -40,7 +27,7 @@ from .location_utils import (
     location_suffix,
     mask_admin_cascade_path,
 )
-from .llm import is_noise_entity_text, is_noise_project_text, _is_valid_company_variant
+from .llm import is_noise_entity_text, is_noise_project_text
 from .models import Candidate, MappingEntry
 from .org_masking import (
     CompanyMaskPlan,
@@ -58,12 +45,6 @@ from .org_masking import (
     simple_legal_suffix,
 )
 
-# Backward-compatible re-exports for pipeline/tests.
-_derived_organization_alias_cores = derived_organization_alias_cores
-_has_explicit_bare_brand_alias = has_explicit_bare_brand_alias
-_explicit_organization_aliases = explicit_organization_aliases
-
-SENTENCE_SPLIT_RE = re.compile(r"[^\n。！？；;，,、]+[。！？；;，,、]?")
 
 
 @dataclass
@@ -79,17 +60,13 @@ class LinearRuleEngine:
     known_organizations: set[str] = field(default_factory=set)
     seen_originals: set[str] = field(default_factory=set)
     source_text: str = ""
-    use_semantic_rules: bool = True
-    llm_primary_discovery: bool = False
-    use_china_admin_rules: bool = True
     _alias_cores_cache: dict[str, frozenset[str]] = field(default_factory=dict, repr=False)
     _organization_plans: dict[str, CompanyMaskPlan] = field(default_factory=dict, repr=False)
-    _known_brand_masks: dict[str, str] = field(default_factory=dict, repr=False)
 
     def discover(
         self,
         text: str,
-        admin_candidates: Iterable[Candidate] = (),
+        candidates: Iterable[Candidate] = (),
         llm_analysis: dict | None = None,
         *,
         respect_fact_section_boundary: bool = True,
@@ -101,13 +78,12 @@ class LinearRuleEngine:
                 scan_text = text[: boundary_match.start()]
 
         self.source_text = scan_text
-        candidates = self.collect_candidates(scan_text, admin_candidates, llm_analysis or {})
-        candidates = self._apply_llm_verdicts(candidates, scan_text, llm_analysis or {})
-        candidates = resolve_candidate_overlaps(candidates)
+        accepted_candidates = self._apply_llm_verdicts(list(candidates), scan_text, llm_analysis or {})
+        accepted_candidates = resolve_candidate_overlaps(accepted_candidates)
 
         for candidate in sorted(
-            candidates,
-            key=lambda item: (-len(item.text), item.start, -item.confidence),
+            accepted_candidates,
+            key=lambda item: (item.start, -len(item.text), -item.confidence),
         ):
             if candidate.text in self.sample_blacklist:
                 continue
@@ -123,122 +99,6 @@ class LinearRuleEngine:
         self._expand_discovered_aliases()
         return self.mappings
 
-    def collect_candidates(
-        self,
-        text: str,
-        admin_candidates: Iterable[Candidate],
-        analysis: dict,
-    ) -> list[Candidate]:
-        candidates = list(admin_candidates)
-        if self.llm_primary_discovery:
-            candidates.extend(self._llm_candidates(text, analysis))
-            return self._deduplicate_candidates(candidates)
-
-        has_local_org_ner = any(
-            candidate.type == "organization" and candidate.source.startswith("hanlp_ner")
-            for candidate in candidates
-        )
-        candidates.extend(detect_title_candidates(text))
-        candidates.extend(detect_inline_party_person_list_candidates(text))
-        party_candidates: list[Candidate] = []
-        fallback_people: list[Candidate] = []
-        local_orgs: list[Candidate] = []
-        for segment, offset in self._sentence_spans(text):
-            segment_party, _ = detect_party_candidates(segment)
-            party_candidates.extend(self._offset_candidates(segment_party, offset))
-            if self.use_semantic_rules:
-                fallback_people.extend(
-                    self._offset_candidates(
-                        detect_fallback_person_candidates(segment),
-                        offset,
-                    )
-                )
-                if not has_local_org_ner:
-                    local_orgs.extend(self._organization_candidates(segment, offset))
-        candidates.extend(party_candidates)
-
-        if self.use_semantic_rules:
-            candidates.extend(fallback_people)
-            if self.use_china_admin_rules:
-                candidates.extend(detect_china_admin_rule_candidates(text))
-
-            candidates.extend(local_orgs)
-
-        candidates.extend(self._llm_candidates(text, analysis))
-        return self._deduplicate_candidates(candidates)
-
-    @staticmethod
-    def _sentence_spans(text: str) -> list[tuple[str, int]]:
-        spans = [
-            (match.group(0), match.start())
-            for match in SENTENCE_SPLIT_RE.finditer(text)
-            if match.group(0).strip()
-        ]
-        return spans or [(text, 0)]
-
-    @staticmethod
-    def _offset_candidates(candidates: Iterable[Candidate], offset: int) -> list[Candidate]:
-        if offset == 0:
-            return list(candidates)
-        return [
-            Candidate(
-                type=candidate.type,
-                text=candidate.text,
-                start=candidate.start + offset,
-                end=candidate.end + offset,
-                source=candidate.source,
-                confidence=candidate.confidence,
-                risk_level=candidate.risk_level,
-                auto_redact=candidate.auto_redact,
-                role=candidate.role,
-                reason=candidate.reason,
-                suggested_mask_type=candidate.suggested_mask_type,
-                needs_review=candidate.needs_review,
-                metadata=candidate.metadata,
-            )
-            for candidate in candidates
-        ]
-
-    @staticmethod
-    def _organization_candidates(text: str, offset: int = 0) -> list[Candidate]:
-        candidates: list[Candidate] = []
-        for match in ORG_FULL_RE.finditer(text):
-            value = _clean_organization_text(match.group(0))
-            if "与" in value:
-                value = value.rsplit("与", 1)[-1]
-            if value and _is_false_org(value):
-                continue
-            if value:
-                start = offset + match.start() + match.group(0).find(value)
-                candidates.append(
-                    Candidate(
-                        type="organization",
-                        text=value,
-                        start=start,
-                        end=start + len(value),
-                        source="linear_full_org",
-                        confidence=0.9,
-                        risk_level="medium",
-                        auto_redact=True,
-                    )
-                )
-        for match in BARE_COMPANY_ALIAS_RE.finditer(text):
-            value = _clean_organization_text(match.group("alias"))
-            if value and not _is_false_org(value):
-                start = offset + match.start("alias")
-                candidates.append(
-                    Candidate(
-                        type="organization",
-                        text=value,
-                        start=start,
-                        end=start + len(value),
-                        source="linear_bare_org_alias",
-                        confidence=0.91,
-                        risk_level="medium",
-                        auto_redact=True,
-                    )
-                )
-        return candidates
 
     @staticmethod
     def _apply_llm_verdicts(
@@ -285,119 +145,6 @@ class LinearRuleEngine:
             reviewed.append(candidate)
         return reviewed
 
-    def _llm_candidates(self, text: str, analysis: dict) -> list[Candidate]:
-
-        candidates: list[Candidate] = []
-        windows = analysis.get("_sentence_windows", [])
-        window_by_id = {
-            item.get("id"): item
-            for item in windows
-            if isinstance(item, dict) and isinstance(item.get("id"), str)
-        } if isinstance(windows, list) else {}
-        for item in analysis.get("locations", []):
-            for value in self._entity_values(item, "full", "name", "text"):
-                self._append_exact_candidate(candidates, text, value, "location", item, window_by_id)
-        for item in analysis.get("persons", []):
-            for value in self._entity_values(item, "name", "text"):
-                self._append_exact_candidate(candidates, text, value, "person", item, window_by_id)
-        for item in analysis.get("companies", []):
-            for value in self._entity_values(item, "name", "full", "brand", "text"):
-                self._append_exact_candidate(candidates, text, value, "organization", item, window_by_id)
-            variants = item.get("variants", [])
-            if isinstance(variants, list):
-                for value in variants:
-                    self._append_exact_candidate(candidates, text, value, "organization", item, window_by_id)
-        for item in analysis.get("projects", []):
-            for value in self._entity_values(item, "name", "full", "text"):
-                self._append_exact_candidate(candidates, text, value, "project", item, window_by_id)
-        return candidates
-
-    @staticmethod
-    def _entity_values(item: dict, *keys: str) -> list[str]:
-        values: list[str] = []
-        if not isinstance(item, dict):
-            return values
-        for key in keys:
-            value = item.get(key)
-            if isinstance(value, str) and value.strip() and value not in values:
-                values.append(value)
-        return values
-
-    @staticmethod
-    def _append_exact_candidate(
-        candidates: list[Candidate],
-        text: str,
-        value: object,
-        entity_type: str,
-        item: dict | None = None,
-        window_by_id: dict[str, dict] | None = None,
-    ) -> None:
-
-        if not isinstance(value, str) or len(value) < 2:
-            return
-        if is_noise_entity_text(value):
-            return
-        if entity_type == "organization":
-
-            if not _is_valid_company_variant(value):
-                return
-        start = -1
-        had_window = False
-        if item and window_by_id:
-            window_id = item.get("window")
-            if isinstance(window_id, str):
-                window = window_by_id.get(window_id)
-                if window:
-                    try:
-                        span_start = int(window.get("start", 0))
-                        span_end = int(window.get("end", 0))
-                    except (TypeError, ValueError):
-                        span_start = 0
-                        span_end = 0
-                    if span_end > span_start:
-                        had_window = True
-                        start = text.find(value, span_start, span_end)
-        if start < 0 and had_window:
-            occurrences = [match.start() for match in re.finditer(re.escape(value), text)]
-            is_complete_organization = (
-                entity_type == "organization"
-                and any(
-                    value.endswith(suffix)
-                    for suffix in LEGAL_SUFFIXES + INSTITUTION_SUFFIXES
-                    if suffix not in {"公司", "集团"}
-                )
-            )
-            if len(occurrences) == 1 and (
-                entity_type in {"person", "location", "project"}
-                or is_complete_organization
-            ):
-                start = occurrences[0]
-        elif start < 0 and not had_window:
-            start = text.find(value)
-        if start < 0:
-            return
-        candidates.append(
-            Candidate(
-                type=entity_type,
-                text=value,
-                start=start,
-                end=start + len(value),
-                source="linear_llm_exact",
-                confidence=0.95,
-                risk_level="medium",
-                auto_redact=True,
-            )
-        )
-
-    @staticmethod
-    def _deduplicate_candidates(candidates: list[Candidate]) -> list[Candidate]:
-        best: dict[tuple[str, str, int], Candidate] = {}
-        for candidate in candidates:
-            key = (candidate.type, candidate.text, candidate.start)
-            previous = best.get(key)
-            if previous is None or candidate.confidence > previous.confidence:
-                best[key] = candidate
-        return list(best.values())
 
     def accept_location(self, candidate: Candidate) -> None:
         if not self.profile.redact_locations:
@@ -500,8 +247,6 @@ class LinearRuleEngine:
             source_text=self.source_text,
         )
         if related_plan is not None:
-            if related_plan.brand:
-                self._known_brand_masks[related_plan.brand] = related_plan.brand_mask
             location_updates: tuple[tuple[str, str], ...] = ()
             if is_short_company_surface(value, brand=related_plan.brand):
                 masked = organization_mask_for_surface(value, related_plan)
@@ -613,13 +358,6 @@ class LinearRuleEngine:
                     ),
                 )
 
-    def _brand_mask_for(self, brand: str) -> str:
-        cleaned = brand.strip()
-        if not cleaned:
-            return self.counters.next("group_prefix")
-        if cleaned not in self._known_brand_masks:
-            self._known_brand_masks[cleaned] = self.counters.next("group_prefix")
-        return self._known_brand_masks[cleaned]
 
     def accept_project(self, candidate: Candidate) -> None:
         if not self.profile.redact_projects:

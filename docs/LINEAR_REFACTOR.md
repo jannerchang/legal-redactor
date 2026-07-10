@@ -18,13 +18,19 @@
 旧架构先在全文制造大量疑似候选，再通过清洗、黑名单和 LLM 排除误识别。
 候选正则容易吞入实体前后的动作词，样本库因此积累了大量删除记录。
 
-新架构以 `LinearRuleEngine` 为中心：
+新架构以 `CandidateCollector` + `LinearRuleEngine` 分工为中心：
 
-- 候选按原文位置处理；
-- 当事人栏、标题、行政区划库和完整机构名称属于高可信发现；
-- 每个已确认实体立即扩展为确定性映射；
+- `CandidateCollector` 负责候选发现、句子分段、局部 offset 回写、候选排序来源拼接、LLM 精确候选物化和候选去重；
+- `RedactionPipeline` 负责扫描范围、固定正则/样本/行政区划库预处理、LLM review 编排、映射应用和结果组装；
+- `LinearRuleEngine` 只接收已收集候选，先应用 LLM reject/calibrate verdict，再做 span 冲突消解、确认实体并扩展确定性映射；
 - LLM 只补充原文中真实存在的精确实体；
-- 旧流水线仍可通过 `PipelineConfig(strategy="legacy")` 使用。
+
+### 稳定接口与内部 seam
+
+- 生产调用只通过 `CandidateCollector.collect(context)` 进入候选发现模块。句子切分、offset 重写、机构正则和 LLM 精确定位均为内部实现，不应被 pipeline 或其他模块直接调用。
+- 非主 LLM 路径先收集一次规则候选用于 review；审核完成后通过 `CandidateCollectionResult.with_llm_analysis(...)` 仅追加审计产生的精确候选，避免再次执行全文 detector 扫描。
+- `LinearRuleEngine.discover(...)` 的顺序不变量是 `reject/calibrate -> span overlap -> document-order acceptance -> alias expansion`。改变顺序属于产品行为变更，必须先补 characterization test。
+- 行政区划数据库仍由 pipeline 预接受并形成 span gate；全国行政区划规则的双来源行为暂时保留，后续只有在 parity 证据充分时才能统一。
 
 ## 替换规则
 
@@ -80,13 +86,14 @@
 
 ## 模块职责
 
-- `linear_engine.py`：按原文顺序确认实体并扩展替换规则。
+- `candidate_collector.py`：候选发现深模块，负责 detector 调用、句子分段、offset 回写、HanLP/规则/LLM 精确候选拼接、去重和 review eligibility 谓词。
+- `linear_engine.py`：接收已收集候选，应用 LLM verdict、消解重叠 span、按原文顺序确认实体并扩展替换规则。
+- `pipeline.py`：处理敏感编号、扫描范围、样本/base 映射、行政区划库预接受映射、LLM review 编排、映射应用和泄漏检查。
 - `location_utils.py`：`linear_engine` 与 `pipeline` 共用的地名 core、后缀与机构前缀剥离逻辑。
 - `lexicon.py`：法律后缀、省份、行业词与机构正则等共享词表。
 - `org_masking.py`：机构解析、别名推导与假名生成。
 - `candidate_resolution.py`：候选 span 冲突消解，优先保留高可信来源。
-- `pipeline.py`：处理敏感编号、扫描范围、LLM 可选补充、映射应用和泄漏检查。
-- `detectors.py`：提供局部、高可信的实体发现能力。
+- `detectors.py`：提供局部、高可信的实体发现函数；不暴露 registry/plugin seam。
 - `admin_division.py`：SQLite 行政区划库通用检测器。
 - `china_admin_rules.py`：全国省/市/区县三级路径规则与省级校验。
 - `hebei_admin.py`：河北省详细行政区划及基层组织识别（街道/村居级）。
