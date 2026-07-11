@@ -1537,6 +1537,37 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertIn('data-workflow-state="bound_thread"', html)
         self.assertIn("案件流程状态", html)
 
+    def test_redaction_result_waits_long_enough_for_slow_hermes_thread_creation(self) -> None:
+        redaction_map = RedactionMap.create(
+            [
+                MappingEntry(
+                    type="person",
+                    original="张三",
+                    masked="【PERSON_001】",
+                    role=None,
+                    source="test",
+                    confidence=1.0,
+                    restore_by_default=True,
+                )
+            ]
+        )
+
+        page_html = _render_redaction_result(
+            "脱敏结果",
+            "张三",
+            "【PERSON_001】",
+            redaction_map,
+            [],
+            [],
+            [],
+            case_root="/Volumes/SANDISK/案件资料",
+            case_folder="2026 4343",
+            source_dir="/Volumes/SANDISK/案件资料/2026 4343",
+        )
+
+        self.assertIn("var maxAttempts = 200;", page_html)
+        self.assertIn("await discordWait(3000);", page_html)
+
     def test_redaction_result_renders_m5_mapping_filters_and_summary_panel(self) -> None:
         redaction_map = RedactionMap.create(
             [

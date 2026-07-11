@@ -555,7 +555,7 @@ def _page(title: str, body: str) -> str:
 	      }}
 
 	      async function waitForBoundDiscordThread(buttonEl, payload, statusEl, linkEl, origText) {{
-	        var maxAttempts = 40;
+	        var maxAttempts = 200;
 	        for (var attempt = 1; attempt <= maxAttempts; attempt++) {{
 	          var bound = await attachBoundDiscordThread(buttonEl, payload, statusEl, linkEl);
 	          if (!bound.attached) {{
