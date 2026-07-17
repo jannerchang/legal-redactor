@@ -30,14 +30,14 @@ risk: medium
 
 ## 二、目标(为什么做)
 
-用户在 Office Mac 本地脱敏案件材料后，可以把脱敏材料发到 Discord 帖子给 Hermes 分析并起草判决；当用户在 Discord 中说“还原”时，Hermes 通过 Home Mac 本地 MCP adapter 调用 Office Mac，Office Mac 根据 Discord thread 找到本地案件 manifest 和映射表，自动还原判决稿并保存到对应案件目录。
+律师在本地脱敏客户或项目材料后，可以把已获授权的脱敏材料发送到受控协作帖子，供 Hermes 辅助整理事实、生成摘要并起草诉状、答辩状、代理意见等法律文书；需要恢复委托人或当事人真实信息时，Hermes 通过本地 MCP adapter 调用工作站，工作站根据 thread 找到本地 manifest 和映射表，自动还原法律文书草稿并保存到对应项目目录。AI 草稿必须由律师独立复核，不构成法律意见或裁判结论。
 
 完成定义:
 
 - 案件 manifest 能绑定 `case_folder` 与 `discord_thread_id`。
-- Office Mac 能根据 `discord_thread_id` 定位唯一案件并使用本地映射表还原文本判决稿。
-- Home Mac MCP adapter 提供 `restore_judgment_from_thread` 和 `get_case_status_by_thread`。
-- 映射表、原文材料和还原后正文默认不离开 Office Mac。
+- 本地工作站能根据 `discord_thread_id` 定位唯一项目并使用本地映射表还原法律文书草稿。
+- Home Mac MCP adapter 提供现有的 `restore_judgment_from_thread` 兼容工具和 `get_case_status_by_thread`；前者在公开说明中泛指法律文书草稿还原。
+- 映射表、原始材料和还原后正文默认不离开本地工作站。
 - 路径穿越、重复 thread 绑定、缺映射表和未知占位符都有测试覆盖。
 
 ---
@@ -56,7 +56,7 @@ risk: medium
 ### 3.2 Out of Scope
 
 - 自动把脱敏文件发到 Discord 帖子，留给 `M3-discord-auto-posting`，除非用户先提供 bot token 并要求合并。
-- 自动把还原后判决发回 Discord，默认只保存到 Office Mac。
+- 自动把还原后的法律文书发回 Discord，默认只保存在本地工作站。
 - PDF 原格式还原。
 - 自动识别案号作为主键。案号识别只能作为建议，主键仍由用户手填。
 - Hermes/Discord bot 主体改造。M2 只提供本地 MCP adapter 和 API 契约。
@@ -143,9 +143,9 @@ M2-discord-hermes-restore-workflow
 |---|---|---|
 | 绑定错 Discord thread | 还原用错映射表 | manifest 唯一 thread 检查 + Web UI 显示绑定摘要 |
 | Office Mac 离线 | Hermes 无法还原 | MCP 返回明确 `office_unreachable`，用户稍后重试 |
-| 未知占位符 | 判决稿局部无法还原 | 返回 `unresolved_placeholders`，保存结果并标注 |
-| 路径穿越 | 写出 case root | folder validator + tempfile case root 测试 |
-| 还原正文泄露到 Discord | 隐私风险 | D-05 默认只保存 Office Mac，不自动回传 |
+| 未知占位符 | 法律文书草稿局部无法还原 | 返回 `unresolved_placeholders`，保存结果并标注 |
+| 路径穿越 | 写出项目根目录 | folder validator + tempfile project root 测试 |
+| 还原正文泄露到 Discord | 隐私风险 | D-05 默认只保存在本地工作站，不自动回传 |
 
 ---
 

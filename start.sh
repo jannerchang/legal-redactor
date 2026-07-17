@@ -34,8 +34,11 @@ except ImportError as exc:
 PY
 
 if [[ "${LEGAL_REDACTOR_SKIP_MLX:-0}" != "1" ]]; then
-  bash scripts/start_mlx9b_server.sh
+  bash scripts/start_model_manager.sh
+else
+  echo "已跳过本地模型 API；Web 将使用纯规则模式。"
 fi
+
 
 free_port_if_unhealthy() {
   local port="$1"
@@ -46,13 +49,6 @@ free_port_if_unhealthy() {
   for _ in 1 2 3; do
     if curl -fsS -m 2 "http://$HOST:$port/health" >/dev/null 2>&1; then
       echo "Web 服务已在 http://$HOST:$port 运行。"
-      if [[ "${LEGAL_REDACTOR_SKIP_MLX:-0}" != "1" ]]; then
-        if curl -fsS -m 2 "http://${LEGAL_REDACTOR_MLX_HOST:-127.0.0.1}:${LEGAL_REDACTOR_MLX_PORT:-18080}/v1/models" >/dev/null 2>&1; then
-          echo "MLX 服务已在 http://${LEGAL_REDACTOR_MLX_HOST:-127.0.0.1}:${LEGAL_REDACTOR_MLX_PORT:-18080} 运行。"
-        else
-          echo "警告：Web 已运行，但 MLX 未响应。上方已尝试启动 MLX；若仍失败请查看 .mlx9b-server.log" >&2
-        fi
-      fi
       exit 0
     fi
     sleep 1

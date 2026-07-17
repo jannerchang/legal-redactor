@@ -14,7 +14,9 @@ from legal_redactor.detectors import (
     detect_regex_candidates,
     detect_title_candidates,
     extract_organization_entities,
+    _clean_org_simple,
 )
+from legal_redactor.filters import clean_organization_text
 
 
 def test_party_role_name_action_boundary_recall() -> None:
@@ -69,6 +71,14 @@ def test_org_bank_branch_and_law_reference_guards() -> None:
     assert "天津市慕尚园林绿化工程有限公司" in noisy_orgs
     assert not any(text.startswith("郝亚雄") for text in noisy_orgs)
 
+    agricultural_bank = "中国农业银行股份有限公司石家庄广安支行"
+    agricultural_bank_orgs = [
+        c.text
+        for c in detect_heuristic_ner_candidates(agricultural_bank)
+        if c.type == "organization"
+    ]
+    assert agricultural_bank in agricultural_bank_orgs
+
     law_texts = [
         "根据公司法相关规定，应当依法办理。",
         "根据《中华人民共和国公司法》第五条之规定",
@@ -81,6 +91,46 @@ def test_org_bank_branch_and_law_reference_guards() -> None:
         assert extract_organization_entities(text) == [], text
 
 
+def test_named_party_person_and_bank_branch_are_recalled_together() -> None:
+    """角色+人名+与+银行支行：分别召回人名与完整支行，不合成单一机构。"""
+    text = "上诉人李书玲与中国农业银行股份有限公司石家庄广安支行发生争议。"
+    bank = "中国农业银行股份有限公司石家庄广安支行"
+
+    parties, _ = detect_party_candidates(text)
+    organizations = [
+        candidate.text
+        for candidate in detect_heuristic_ner_candidates(text)
+        if candidate.type == "organization"
+    ]
+    extracted = [name for name, _start, _end in extract_organization_entities(text)]
+
+    assert any(candidate.type == "person" and candidate.text == "李书玲" for candidate in parties)
+    assert not any("李书玲与" in candidate.text for candidate in parties)
+    assert bank in organizations
+    assert bank in extracted
+    assert not any("李书玲" in name for name in organizations)
+    assert not any("李书玲" in name for name in extracted)
+
+
+def test_org_narrative_prefixes_are_stripped() -> None:
+    """机构边界清洗剥离明确叙述前缀，保留合法机构本体。"""
+    cases = {
+        "到中国二十二冶集团有限公司": "中国二十二冶集团有限公司",
+        "原沈阳银球钢结构工程有限公司": "沈阳银球钢结构工程有限公司",
+        "设立的河北二十冶工程技术有限公司": "河北二十冶工程技术有限公司",
+    }
+    for raw, expected in cases.items():
+        assert clean_organization_text(raw) == expected, raw
+        assert _clean_org_simple(raw) == expected, raw
+        orgs = [
+            candidate.text
+            for candidate in detect_heuristic_ner_candidates(raw)
+            if candidate.type == "organization"
+        ]
+        assert expected in orgs, (raw, orgs)
+        assert raw not in orgs, raw
+
+
 def test_title_dispute_case_without_judgment_keyword() -> None:
     """标题行仅有“纠纷一案”而无“判决书”时，仍应解析双方当事人。"""
     text = "张三与李四民间借贷纠纷一案"
@@ -91,3 +141,12 @@ def test_title_dispute_case_without_judgment_keyword() -> None:
 
     law = "本院认为，根据《中华人民共和国民法典》第五百七十七条之规定，应予支持。"
     assert detect_title_candidates(law) == []
+
+
+def test_llm_company_boundary_validation_rejects_outer_brackets_and_keeps_inner_registered_brackets():
+    from legal_redactor.llm import _is_valid_company_variant
+
+    assert not _is_valid_company_variant("（河北光大工程造价咨询有限责任公司")
+    assert not _is_valid_company_variant("河北光大工程造价咨询有限责任公司）")
+    assert _is_valid_company_variant("河北光大工程造价咨询有限责任公司")
+    assert _is_valid_company_variant("中建二局（集团）有限公司")

@@ -113,6 +113,20 @@ ADDRESS_PREFIX_MARKERS = (
 )
 
 
+_LEADING_ADMIN_CONNECTORS = frozenset("由从向在至到及与和后前")
+_ADDRESS_CITY_PREFIX_RE = re.compile(r"^(?:住|住所|户籍)(?P<city>[\u4e00-\u9fa5]{2,12}市)$")
+_LEADING_ADMIN_NARRATIVE_RE = re.compile(r"^(?:(?:原告|被告)[\u4e00-\u9fa5·]{0,4})?(?:后)?(?:搬至|迁至|住)")
+_PROVINCE_OR_MUNICIPALITY_PREFIX_RE = re.compile(
+    r"^(?:" + "|".join(
+        sorted(
+            (re.escape(name) for name in (*PROVINCE_FULL_NAMES, *PROVINCE_SHORT_NAMES)),
+            key=len,
+            reverse=True,
+        )
+    ) + r")"
+)
+
+
 def normalize_province_name(value: str) -> str | None:
     text = value.strip()
     if text in PROVINCE_FULL_NAMES:
@@ -203,7 +217,7 @@ def detect_china_admin_rule_candidates(text: str) -> list[Candidate]:
         if normalized is None:
             continue
         fragment, start, end = normalized
-        parts = decompose_admin_path(fragment)
+        parts = decompose_admin_path(_strip_admin_connectors(fragment))
         if not parts and not normalize_province_name(fragment):
             continue
         if parts.get("prov") and not normalize_province_name(parts["prov"]):
@@ -269,7 +283,7 @@ def _append_rule_candidates(
     confidence: float,
     reason: str,
 ) -> None:
-    payloads: list[tuple[str, int, int, dict[str, str]]] = [(fragment, start, end, parts)]
+    payloads: list[tuple[str, int, int, dict[str, str]]] = []
     cursor = start
     for key in ("prov", "city", "county"):
         value = parts.get(key)
@@ -291,8 +305,6 @@ def _append_rule_candidates(
     for value, value_start, value_end, metadata_parts in payloads:
         key = (value_start, value_end, value)
         if key in seen_spans:
-            continue
-        if any(not (value_end <= used_start or value_start >= used_end) for used_start, used_end, _ in seen_spans):
             continue
         seen_spans.add(key)
         candidates.append(
@@ -327,8 +339,26 @@ def _split_county_suffix(rest: str) -> tuple[str, str | None]:
     return rest, None
 
 
+def _strip_admin_connectors(fragment: str) -> str:
+    return re.sub(
+        r"(省|自治区|特别行政区|市|自治州|地区|盟|区|县|旗)[与和及至到向在由从]+",
+        r"\1",
+        fragment,
+    )
+
+
 def _normalize_rule_fragment(text: str, start: int, end: int) -> tuple[str, int, int] | None:
     fragment = text[start:end]
+    address_city_match = _ADDRESS_CITY_PREFIX_RE.match(fragment)
+    if address_city_match:
+        city = address_city_match.group("city")
+        return city, start + address_city_match.start("city"), end
+    narrative_match = _LEADING_ADMIN_NARRATIVE_RE.match(fragment)
+    if narrative_match:
+        fragment = fragment[narrative_match.end() :]
+        start += narrative_match.end()
+        if len(fragment) < 2:
+            return None
     for marker in ADDRESS_PREFIX_MARKERS:
         if not fragment.startswith(marker):
             continue
@@ -336,14 +366,37 @@ def _normalize_rule_fragment(text: str, start: int, end: int) -> tuple[str, int,
         if len(trimmed) < 2:
             return None
         return trimmed, start + len(marker), end
+    connector_match = re.match(r"^(?:与|和|及|至|到|向|在|由|从|迁至|搬至)", fragment)
+    if connector_match:
+        fragment = fragment[connector_match.end() :]
+        start += connector_match.end()
+        if len(fragment) < 2:
+            return None
     known_start = _known_admin_start(fragment)
+    is_hierarchical_path = any(
+        suffix in fragment for suffix in ("区", "县", "旗", "街道", "镇", "乡")
+    )
+    if (
+        fragment.endswith(("省", "自治区", "特别行政区", "市"))
+        and not is_hierarchical_path
+        and not _PROVINCE_OR_MUNICIPALITY_PREFIX_RE.match(fragment)
+    ):
+        return None
     if known_start > 0:
+        prefix = fragment[:known_start]
+        if any(char not in _LEADING_ADMIN_CONNECTORS for char in prefix):
+            return None
         fragment = fragment[known_start:]
         start += known_start
+    elif is_hierarchical_path and not _PROVINCE_OR_MUNICIPALITY_PREFIX_RE.match(fragment):
+        address_match = re.search(r"住(?P<path>[\u4e00-\u9fa5]+(?:省|市).+)$", fragment)
+        if not address_match:
+            return None
+        fragment = address_match.group("path")
+        start += address_match.start("path")
     if any(fragment.startswith(marker) for marker in FALSE_LOCATION_TERMS):
         return None
     return fragment, start, end
-
 
 def _known_admin_start(fragment: str) -> int:
     matches = [

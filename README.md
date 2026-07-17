@@ -1,16 +1,21 @@
 # legal-redactor
 
-完全本地运行的中文法律文书脱敏工具。系统按照人工处理文书的方式，
-从前向后阅读，读到明确实体后生成全文替换规则。
+面向律师、律所及其他获得授权的法律服务人员，完全本地运行的中文法律文书脱敏工具。
+系统按照人工处理文书的方式，从前向后阅读，读到明确实体后生成全文替换规则，
+便于在不暴露原始身份信息的前提下开展材料整理、检索、摘要和法律文书辅助起草。
 
 这是一个纯 vibe 项目，适合交给 AI agent 按文档部署、检查和维护：
-使用者不需要会写代码或读代码，只要描述目标和确认结果；代码、案件材料、映射表
+使用者不需要会写代码或读代码，只要描述目标和确认结果；代码、原始材料、映射表
 和还原结果都留在本机或私网机器上，agent 负责按文档配置服务、检查连通性、
-绑定 Discord thread，并通过 MCP 调用受控还原工具。推荐让 agent 直接执行部署步骤，
-尤其是 Home Mac 上的 Hermes MCP 配置、Office Mac 私网 API、Tailscale ACL 和本地
-JSON 配置，避免手动复制 token/IP 到仓库文件。
+绑定协作 thread，并通过 MCP 调用受控还原工具。推荐让 agent 直接执行部署步骤，
+尤其是本地 MCP、私网 API、访问控制和本地 JSON 配置，避免手动复制 token/IP 到仓库文件。
 
 详细设计见 [线性阅读重构说明](docs/LINEAR_REFACTOR.md)。
+
+> **用途边界**：本项目是面向律师工作场景的文书去标识化与辅助处理工具，不代表任何法院、
+> 司法机关或任职单位。AI 输出仅供法律专业人员复核，不构成法律意见或裁判结论，不能替代
+> 律师的专业判断，也不得用于未经授权的案件材料。未公开材料不得发送到公共 AI 或未经批准的
+> 第三方服务；使用者应自行遵守保密、数据安全、个人信息保护及所在机构的内部制度。
 
 ## v0.1.2 架构更新
 
@@ -65,8 +70,7 @@ JSON 配置，避免手动复制 token/IP 到仓库文件。
 
 ## 脱敏策略
 
-系统只采用一套统一标准，不需要选择档位。它覆盖人名、地名、机构/公司/项目、
-身份证号、手机号、银行账号、信用代码、邮箱地址和案号省份简称映射。
+默认自动范围是人名、机构/公司名、行政区划的省/市/区县、身份证号、手机号和案号省份简称映射。街道及以下地点、详细地址、项目/工程/楼盘、银行账号、统一社会信用代码和邮箱保留原文；需要处理时在映射审核页手动选取添加。
 
 ### 法院名与案号的特殊过滤规则
 
@@ -75,25 +79,21 @@ JSON 配置，避免手动复制 token/IP 到仓库文件。
    * **最高人民法院案号**：原样保留（如：`〔2024〕最高法民终...`）。
    * **其他地区法院案号**：为了保留文书的司法特征（如审级和年份），案号的结构予以保留，但将其中的**省份简称进行随机且一致的映射替换**。例如：原文中多处出现的 `（2025）豫01民终...` 中的 `豫` 字会被随机且在全文中一致地替换为其他省份简称（如 `粤`、`苏` 等）。
 
-## 实测运行环境
+## 参考测试环境
 
-当前生产使用环境如下，供复现部署时参考：
+以下是一个已验证的本地部署环境，仅供复现参考：
 
 - 设备：Mac mini，Apple M4 Pro
 - CPU：12 核（8 个性能核心、4 个能效核心）
 - 内存：24 GB
 - 系统：macOS 26.5.1
 - Python：3.13.2（项目 `.venv`）
-- MLX 运行时：`mlx_lm.server`
-- 固定本地审核模型：`mlx-community/Qwen3.5-9B-MLX-4bit`（约 5.6 GB）
-- MLX 模型缓存：`~/.cache/huggingface`
-- MLX 服务端口：`127.0.0.1:18080`
+- 本地模型 API：`model-manager`，默认 `127.0.0.1:18080`
+- 逻辑模型 ID：`bonsai-27b`（展示名：Ternary Bonsai 27B（MLX 2-bit））
 - 默认 Web 端口：`127.0.0.1:7860`
-- Office 私网还原 API 端口：建议 `127.0.0.1:8787` 或 Tailscale 私网地址绑定
+- Office 私网还原 API：建议绑定 `127.0.0.1:8787`，通过 SSH 反向隧道暴露到 Home Mac 的 `127.0.0.1:18787`
 
-实际使用中，Web 端固定调用 MLX Qwen3.5 9B 做整句语义识别和候选审核；
-该模型服务不可用或调用失败时，
-系统降级为纯规则模式，仍可完成基础脱敏、映射保存、MCP 还原和 Discord 发帖流程。
+应用和 Web 表单只向本地 `model-manager` 发送逻辑 ID `bonsai-27b`。管理器把该 ID 映射到本机权重，并以 OpenAI-compatible `POST /v1/chat/completions` 代理给内部 MLX worker；权重路径不会出现在应用请求、Web 页面或管理器公开响应中。模型 API 不可用时，系统明确提示并降级为纯规则模式，仍可完成基础脱敏、映射保存、MCP 还原和 Discord 发帖流程。
 
 ## 安装与启动
 
@@ -109,23 +109,19 @@ cd legal-redactor
 # 浏览器打开 http://127.0.0.1:7860
 ```
 
-`start.sh` 会创建/复用 `.venv`，检查 Web 依赖，启动或复用
-`127.0.0.1:18080` 上的 MLX Qwen3.5 9B 服务，然后启动 WebUI。启动脚本会通过
-`/v1/models` 确认端口上响应的是目标 Qwen 模型；如果端口被其他服务占用会直接报错。
-如果只想临时跳过 MLX，可设置 `LEGAL_REDACTOR_SKIP_MLX=1 ./start.sh`。
+`start.sh` 会创建/复用 `.venv`、检查 Web 依赖、复用或启动本地模型管理器，然后启动 WebUI。管理器只在首次推理请求时启动内部 MLX worker；设置 `LEGAL_REDACTOR_SKIP_MLX=1` 会跳过模型 API，并让 Web 使用纯规则模式。
 
 首页会显示一个只读系统状态区，也可直接访问机器接口：
 
 ```bash
 curl http://127.0.0.1:7860/health
 curl http://127.0.0.1:7860/api/status
+curl http://127.0.0.1:7860/api/model-status
+curl http://127.0.0.1:18080/health
 curl http://127.0.0.1:18080/v1/models
 ```
 
-`/api/status` 检查 Web 运行配置、固定 MLX 模型、`mlx_lm.server`、`HF_HOME`
-本地缓存、案件库目录、Office API、Hermes MCP 和 Discord 指令通道。状态读取
-不会启动模型、清理缓存、发送 Discord 消息或写入案件文件；响应只返回是否配置
-和下一步动作，不返回 token、原文、样本、映射表或还原全文。
+`/api/status` 检查 Web 运行配置、本地模型 API、案件库目录、Office API、Hermes MCP 和 Discord 指令通道；`/api/model-status` 只返回本地模型 API 状态。状态读取不会启动 worker、清理缓存、发送 Discord 消息或写入案件文件；响应只返回是否配置和下一步动作，不返回 token、原文、样本、映射表、权重路径或还原全文。
 
 Web 支持粘贴文本、拖拽 txt/md、上传 txt/md/doc/docx/pdf、多文件批量处理
 （统一映射表）。脱敏时可以选填或自动识别案件文件夹；填写或绑定 Discord
@@ -182,16 +178,16 @@ Web 支持粘贴文本、拖拽 txt/md、上传 txt/md/doc/docx/pdf、多文件�
 该方式会直接在 Word 文档内部替换占位符，覆盖正文、表格、页眉和页脚。
 如果 Word 将一个占位符拆成多个格式片段，还原文字会沿用占位符起始片段的格式。
 
-### Hermes / Discord 远程还原
+### 私有协作与远程还原
 
-本功能用于 Home Mac 上的 Hermes/Discord 和 Office Mac 上的本地脱敏系统协作：
+本功能用于律师在受控协作空间中处理脱敏材料，并由本地脱敏系统保存和还原文书草稿：
 
-- Web 脱敏时可绑定案件文件夹和 Discord 帖子链接，生成 `manifest.json`。
-- Web 脱敏后也可以填写案由，一键请求 Hermes 新建 Discord 案件帖。
-- Hermes 写回帖子链接后，Web 可自动把脱敏附件发送到绑定帖子。
-- Office Mac 只在本地保存原始材料、脱敏文件和加密映射表。
-- Home Mac 的 Hermes 通过 MCP adapter 调用 Office 私网 API。
-- 还原结果写回 Office Mac 的案件目录 `restored/`，MCP 响应不返回映射表或还原全文。
+- Web 脱敏时可绑定项目文件夹和协作帖子链接，生成 `manifest.json`。
+- Web 脱敏后也可以填写项目标题，一键请求协作 agent 新建工作帖。
+- agent 写回帖子链接后，Web 可自动把脱敏附件发送到绑定帖子。
+- 工作站只在本地保存原始材料、脱敏文件和加密映射表。
+- 协作 agent 通过 MCP adapter 调用私网 API。
+- 还原结果写回本地项目目录 `restored/`，MCP 响应不返回映射表或还原全文。
 - Office API / MCP 返回 `ok`、`code`、`case`、`restore`、`next_action` 结构；
   `restore` 只包含 `restored_filename`、`restored_relative_path`、替换数量、
   `unresolved_placeholder_count` 和时间元数据，不返回占位符数组、绝对路径或全文。
@@ -214,48 +210,49 @@ Home Mac 上的 Hermes 可通过本地 MCP adapter 调用：
 
 ```bash
 cp config/mcp.example.json ~/.config/legal-redactor/mcp.local.json
-# 编辑 ~/.config/legal-redactor/mcp.local.json，填入 Office API 私网地址和 token。
+# 编辑 ~/.config/legal-redactor/mcp.local.json，填入 Home Mac 上的反向隧道地址（默认 http://127.0.0.1:18787）和 token。
 LEGAL_REDACTOR_MCP_CONFIG=~/.config/legal-redactor/mcp.local.json \
   .venv/bin/python -m legal_redactor.mcp_adapter
 ```
 
-Hermes 工具调用只传 Discord thread id 和判决稿；Office Mac 根据本地
-`manifest.json` 找到案件映射表并保存还原结果。详细部署见
+Hermes 工具调用只传协作 thread id 和法律文书草稿；本地工作站根据
+`manifest.json` 找到项目映射表并保存还原结果。详细部署见
 [`docs/deploy/hermes-office-restore.md`](docs/deploy/hermes-office-restore.md)。
 
-## 本地 LLM
+## 本地模型管理器
 
-Web 启动脚本固定使用 MLX Qwen3.5 9B，不再在页面提供模型选择。首次部署需安装
-`mlx-lm`，默认模型缓存位于本机 `~/.cache/huggingface`；如需临时改位置可设置
-`HF_HOME`：
+唯一的对外模型端点是 `model-manager`，默认 `http://127.0.0.1:18080`。它公开 OpenAI-compatible `GET /v1/models` 和 `POST /v1/chat/completions`，当前注册表只包含逻辑模型 ID `bonsai-27b`。Web 和 CLI 固定使用该可信配置；浏览器和命令行不接受任意权重路径或模型 ID。
+
+管理器本身通过 `scripts/start_model_manager.sh` 启动或复用。内部 MLX worker 默认仅监听 `127.0.0.1:18081`，由管理器按请求惰性拥有和关闭；不要直接启动 worker。可通过以下环境变量分别覆盖本机监听地址：
 
 ```bash
-uv tool install mlx-lm --python /opt/homebrew/bin/python3.11
-bash scripts/start_mlx9b_server.sh
+LEGAL_REDACTOR_MODEL_MANAGER_HOST=127.0.0.1
+LEGAL_REDACTOR_MODEL_MANAGER_PORT=18080
+LEGAL_REDACTOR_MLX_WORKER_HOST=127.0.0.1
+LEGAL_REDACTOR_MLX_WORKER_PORT=18081
 ```
 
-默认由 MLX Qwen3.5 9B 处理整句实体识别和低置信候选审核；模型服务不可用时
-自动降级为纯规则模式。启动脚本会用 `/v1/models` 做模型级探活，避免误把其他
-占用同端口的进程当作 MLX 服务。LLM 不负责控制全文替换。
+例如，管理器协议始终使用逻辑 ID：
 
-当前 Web 端固定使用这一个模型，不再提供 9B/27B 或自定义模型选择。旧的
-Ollama 模型不参与默认流程。
+```bash
+curl -fsS http://127.0.0.1:18080/v1/models
+curl -fsS http://127.0.0.1:18080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"bonsai-27b","messages":[{"role":"user","content":"Return exactly {}"}],"stream":false,"temperature":0,"max_tokens":16}'
+```
 
+管理器或模型不可用时，应用显式使用纯规则模式；不会尝试 Ollama、Open WebUI 或其他后端。LLM 只负责整句实体识别和低置信候选审核，不负责控制全文替换。
 ## HanLP 本地 NER
 
-Web 脱敏页可启用 HanLP 本地 NER 作为高速候选生成器。HanLP 只负责补充
-人名、地名、机构名候选，候选仍会进入现有线性规则、样本黑名单和 LLM
-校验流程；不会直接绕过映射规则。
+Web 脱敏页可启用 HanLP 本地 NER 作为候选生成器。HanLP 只负责补充人名、地名、机构名候选；候选仍会进入现有线性规则、候选消解和 LLM 校验流程，不会直接绕过映射规则。它默认关闭；尚无项目法律文书的配对 gold A/B 证据证明启用后能提升最终 precision、recall 或 F1。
 
-HanLP 是可选依赖，未安装时系统会跳过并继续使用现有规则。当前 HanLP
-兼容 `transformers<5`，项目的可选依赖已固定该约束：
+HanLP 是可选依赖，未安装时系统会跳过并继续使用现有规则。当前 HanLP 兼容 `transformers<5`，项目的可选依赖已固定该约束：
 
 ```bash
 .venv/bin/pip install '.[hanlp]'
 ```
 
-默认模型名为 `MSRA_NER_ELECTRA_SMALL_ZH`。首次启用时 HanLP 会下载本地模型，
-因此需要预留磁盘空间和网络时间。
+默认模型名为 `MSRA_NER_ELECTRA_SMALL_ZH`。首次启用时 HanLP 会下载本地模型，因此需要预留磁盘空间和网络时间。模型的公开 MSRA F1 不能外推到本项目；完整结论和受控 A/B 协议见 [`docs/research/hanlp-ner-evaluation.md`](docs/research/hanlp-ner-evaluation.md)。
 
 ## 识别率评估与调试
 
@@ -394,6 +391,8 @@ Web 结果页编辑映射表后点「保存为样本」，自动追加到 `sampl
 - 脱敏映射表默认采用 AES-128-GCM 加密存储，密钥自动生成保存在 `~/.config/legal-redactor/key`
 - 映射表可用于受控恢复，是否恢复由调用方明确决定
 - 远程还原 API 必须通过私网和 bearer token 访问；API/MCP 响应不返回映射表内容
+- 本项目定位于律师法律服务中的辅助处理；AI 结果必须由具备相应职责的专业人员独立复核
+- 不处理国家秘密、审判执行工作秘密或其他依法、依约不得交由该系统处理的材料
 
 ## 支持格式
 

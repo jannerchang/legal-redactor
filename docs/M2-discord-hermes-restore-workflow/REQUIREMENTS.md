@@ -2,25 +2,31 @@
 
 ## Goal
 
-Build a case-centered workflow that lets the Office Mac remain the authority for
-source materials, encrypted redaction maps, and restoration, while Hermes on the
-Home Mac can request restoration from a Discord case thread after drafting a
-judgment from redacted materials.
+Build a matter-centered workflow for lawyers and authorized legal-service teams.
+The local workstation remains authoritative for client materials, encrypted redaction
+maps, and restoration, while Hermes may assist with fact organization, summaries,
+and legal-document drafts created from redacted materials.
 
 The system should support this practical flow:
 
-1. The user keeps legal materials in a local Office Mac folder.
-2. During redaction, the user manually provides a case folder name such as
-   `2025 8765` and a Discord thread URL.
-3. The Office Mac redaction system redacts selected materials, stores redacted
-   outputs and the mapping table under the named case folder, and posts the
-   redacted files into the Discord thread.
-4. Hermes analyzes the redacted files in that thread and drafts a judgment.
-5. When the user says "还原" in the Discord thread, Hermes sends the draft back
-   through a tool call.
-6. The Office Mac resolves the Discord thread to the local case folder, loads the
-   corresponding mapping table, restores the judgment, and saves the restored
-   result locally.
+1. A lawyer keeps authorized client or matter materials in a local workstation folder.
+2. During redaction, the lawyer provides a matter folder name and a controlled
+   collaboration thread URL.
+3. The local redaction system redacts selected materials, stores outputs and the
+   mapping table under the matter folder, and may post only the redacted files to
+   the controlled thread.
+4. Hermes may organize facts, summarize materials, and draft pleadings, briefs,
+   memoranda, or other lawyer work product from those redacted files.
+5. When the lawyer requests restoration, Hermes sends the draft back through a
+   local tool call.
+6. The workstation resolves the thread to the local matter folder, loads the
+   corresponding mapping table, restores the legal-document draft, and saves the
+   result locally for lawyer review.
+
+All AI output is assistive only. A lawyer must independently review the facts,
+authorities, reasoning, confidentiality, and final wording. The workflow does not
+produce judicial decisions and must not be used with materials the operator is not
+authorized to process.
 
 ## Users And Jobs
 
@@ -31,8 +37,8 @@ The system should support this practical flow:
   table.
 - As the user, I want redacted files to be posted to the right Discord thread
   automatically, so I do not manually upload the wrong file or miss files.
-- As the user, I want Hermes to restore a drafted judgment by saying "还原" in
-  the thread, so I do not copy drafts between machines.
+- As a lawyer, I want Hermes to restore an authorized legal-document draft when I
+  request restoration in the thread, so I do not copy drafts between machines.
 - As the system owner, I want mapping tables and original materials to remain on
   the Office Mac, so Hermes and Discord never receive the restoration map.
 
@@ -51,19 +57,20 @@ The system should support this practical flow:
 
 ### Office Mac
 
-The Office Mac is the source of truth for case state:
+The local workstation is the source of truth for matter state:
 
-- local source material folder
-- case folder name
-- Discord thread binding
+- local source-material folder
+- matter folder name
+- collaboration thread binding
 - redacted files
 - encrypted mapping table
-- restored judgment outputs
+- restored legal-document outputs
 - operational logs without original text
 
-The Office Mac should expose a small authenticated API for trusted callers on the
-private network. The API is not responsible for legal analysis; it only performs
-case lookup, redaction workflow operations, Discord upload, and restoration.
+The workstation should expose a small authenticated API for trusted callers on the
+private network. The API is not responsible for legal advice or professional judgment;
+it only performs matter lookup, redaction workflow operations, controlled upload, and
+restoration.
 
 ### Home Mac / Hermes
 
@@ -174,13 +181,13 @@ Example:
 
 ### Restore From Discord Thread
 
-- Hermes invokes a local MCP tool when the user says "还原" in a Discord thread.
-- The tool sends the current `discord_thread_id` and the draft judgment text or
-  file to the Office Mac API.
-- Office Mac resolves `discord_thread_id` to exactly one case manifest.
-- Office Mac loads the case mapping table locally and restores the draft.
+- Hermes invokes a local MCP tool when the lawyer requests restoration in a collaboration thread.
+- The tool sends the current `discord_thread_id` and the legal-document draft text or
+  file to the local API.
+- The workstation resolves `discord_thread_id` to exactly one matter manifest.
+- The workstation loads the matter mapping table locally and restores the draft.
 - Restored output is saved under `restored/` with a non-overwriting timestamped
-  filename.
+  filename for lawyer review.
 - The API returns:
   - success/failure
   - saved local path
@@ -189,11 +196,12 @@ Example:
 
 ### MCP Adapter
 
-Expose the smallest useful MCP surface to Hermes:
+Expose the smallest useful MCP surface to Hermes. The existing tool name is retained
+for API compatibility, but its documented use is restoration of lawyer-reviewed legal drafts:
 
 - `restore_judgment_from_thread`
   - input: `discord_thread_id`, `draft_text` or `draft_file`
-  - output: restore status and Office Mac saved path
+  - output: restore status and local saved path
 - `get_case_status_by_thread`
   - input: `discord_thread_id`
   - output: case folder, redacted file count, mapping presence, latest restored

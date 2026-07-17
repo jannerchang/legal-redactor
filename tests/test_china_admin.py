@@ -33,15 +33,18 @@ class ChinaAdminRulesTests(unittest.TestCase):
         text = "北京市海淀区中关村大街发生争议。"
         candidates = detect_china_admin_rule_candidates(text)
         texts = {candidate.text for candidate in candidates}
-        self.assertTrue("北京市" in texts or "北京市海淀区" in texts)
-        self.assertTrue(any("海淀" in value for value in texts))
+        self.assertIn("北京市", texts)
+        self.assertIn("海淀区", texts)
+        self.assertNotIn("北京市海淀区", texts)
         self.assertEqual(decompose_admin_path("北京市海淀区"), {"prov": "北京市", "county": "海淀区"})
 
     def test_detect_china_admin_rule_trims_leading_context_before_municipality(self) -> None:
         text = "原告后搬至北京市海淀区。"
         candidates = detect_china_admin_rule_candidates(text)
         texts = {candidate.text for candidate in candidates}
-        self.assertIn("北京市海淀区", texts)
+        self.assertIn("北京市", texts)
+        self.assertIn("海淀区", texts)
+        self.assertNotIn("北京市海淀区", texts)
         self.assertNotIn("后搬至北京市海淀区", texts)
 
     def test_detect_city_after_address_marker(self) -> None:
@@ -50,6 +53,15 @@ class ChinaAdminRulesTests(unittest.TestCase):
         texts = {candidate.text for candidate in candidates}
         self.assertIn("宁波市", texts)
         self.assertNotIn("住宁波市", texts)
+
+    def test_rule_candidates_reject_prose_before_known_city(self) -> None:
+        text = "其后由石家庄市供水公司施工。"
+        candidates = detect_china_admin_rule_candidates(text)
+
+        assert all(candidate.text != "其后由石家庄市" for candidate in candidates)
+
+        result = RedactionPipeline(config=PipelineConfig.offline_without_llm()).redact(text)
+        assert "其后由石家庄市" not in {entry.original for entry in result.redaction_map.mappings}
 
     def test_decompose_compact_hebei_path(self) -> None:
         parts = decompose_admin_path("河北唐山迁安市")
@@ -75,7 +87,9 @@ class ChinaAdminRulesTests(unittest.TestCase):
         self.assertNotIn("深圳市", result.redacted_text)
         self.assertNotIn("南山区", result.redacted_text)
         originals = {entry.original for entry in result.redaction_map.mappings}
-        self.assertTrue({"广东省", "深圳市", "南山区", "广东省深圳市南山区"} & originals)
+        self.assertEqual({"广东省", "深圳市", "南山区"}, originals & {"广东省", "深圳市", "南山区", "广东省深圳市", "广东省深圳市南山区"})
+        self.assertNotIn("广东省深圳市", originals)
+        self.assertNotIn("广东省深圳市南山区", originals)
 
     def test_nationwide_pipeline_masks_municipality_without_china_db(self) -> None:
         config = replace(
@@ -95,7 +109,21 @@ class ChinaAdminRulesTests(unittest.TestCase):
         self.assertNotIn("北京市", result.redacted_text)
         self.assertNotIn("海淀区", result.redacted_text)
         originals = {entry.original for entry in result.redaction_map.mappings}
-        self.assertIn("北京市海淀区", originals)
+        self.assertTrue({"广东省", "深圳市", "南山区", "北京市", "海淀区"}.issubset(originals))
+        self.assertNotIn("广东省深圳市南山区", originals)
+        self.assertNotIn("北京市海淀区", originals)
+
+    def test_pipeline_keeps_admin_components_not_overlapping_paths(self) -> None:
+        pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
+        text = "北京市通州区、河北省石家庄市藁城区均有项目。"
+
+        result = pipeline.redact(text)
+        originals = {entry.original for entry in result.redaction_map.mappings}
+
+        assert {"北京市", "通州区", "河北省", "石家庄市", "藁城区"} <= originals
+        assert "北京市通州区" not in originals
+        assert "河北省石家庄市" not in originals
+        assert "河北省石家庄市藁城区" not in originals
 
 
 def _write_sample_china_db(path: Path) -> None:

@@ -50,13 +50,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--llm",
         choices=("max-effect", "balanced", "off"),
         default="max-effect",
-        help="本地 LLM 模式；默认固定使用 MLX Qwen3.5 9B",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help="兼容旧命令，当前已忽略，固定使用 MLX Qwen3.5 9B",
+        help="本地模型模式；默认固定使用 model-manager 管理的 bonsai-27b",
     )
     parser.add_argument(
         "--output-dir", "-o",
@@ -223,7 +217,7 @@ def main(argv: list[str] | None = None) -> None:
 
 def _do_redact(args: argparse.Namespace) -> None:
     input_paths = [Path(p) for p in args.inputs]
-    config = PipelineConfig.from_llm_mode(args.llm, profile_name="standard", model=args.model)
+    config = PipelineConfig.from_llm_mode(args.llm, profile_name="standard")
     pipeline = RedactionPipeline(config=config)
     output_dir = Path(args.output_dir)
 
@@ -309,7 +303,7 @@ def _print_warnings_and_leaks(warnings: list[str], leaks: list) -> None:
 def _do_eval(args: argparse.Namespace) -> None:
     from .evaluation import evaluate_gold_file, evaluation_report_to_json
 
-    config = PipelineConfig.from_llm_mode(args.llm, profile_name="standard", model=args.model)
+    config = PipelineConfig.from_llm_mode(args.llm, profile_name="standard")
     eval_started = time.monotonic()
     try:
         report = evaluate_gold_file(args.eval_gold, config=config)

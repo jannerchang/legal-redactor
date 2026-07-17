@@ -294,6 +294,7 @@ def _organization_alias_profile(
     place_prefixes: set[str],
 ) -> dict[str, set[str] | str]:
     from .lexicon import INDUSTRY_TERMS, LEGAL_SUFFIXES
+    from .org_masking import _split_leading_place_prefix
     from .org_masking import derived_organization_alias_cores as _derived_organization_alias_cores
 
     cleaned = _clean_organization_text(mapping.original) or mapping.original.strip()
@@ -328,11 +329,32 @@ def _organization_alias_profile(
     from .org_masking import organization_brand_key as _organization_brand_key
 
     brand_key = _organization_brand_key(cleaned)
-    alias_candidates = {body_without_place, *_organization_number_aliases(body_without_place)}
-    if compact_body == brand_key:
-        alias_candidates.add(compact_body)
-    if _usable_organization_alias_key(brand_key, place_prefixes) and 2 <= len(brand_key) <= 4:
+    alias_candidates = {
+        body_without_place,
+        compact_body,
+        brand_key,
+        *_organization_number_aliases(body_without_place),
+    }
+    leading_place, _ = _split_leading_place_prefix(body)
+    if leading_place not in place_prefixes:
+        leading_place = ""
+    if _usable_organization_alias_key(brand_key, place_prefixes) and len(brand_key) <= 6:
         alias_candidates.add(brand_key)
+    if leading_place:
+        alias_candidates.discard(leading_place)
+    compact_prefixes = {
+        token
+        for token in tokens
+        if 2 <= len(token) <= 6
+        and token != body
+        and token != _strip_organization_place_prefix(body, place_prefixes)
+        and token not in place_prefixes
+        and (body_without_place.startswith(token) or compact_body.startswith(token))
+    }
+    if leading_place:
+        compact_prefixes.discard(leading_place)
+        compact_prefixes.discard(f"{leading_place}省")
+        compact_prefixes.discard(f"{leading_place}市")
     party_alias_candidates: set[str] = set()
     if _mapping_has_party_anchor(mapping):
         for core in raw_cores:
@@ -345,9 +367,10 @@ def _organization_alias_profile(
         alias_key = alias_key.strip(" ：:，,。；;、（）()")
         if (
             _usable_organization_alias_key(alias_key, place_prefixes)
-            and len(alias_key) <= 4
+            and len(alias_key) <= 6
             and (
                 alias_key == body_without_place
+                or alias_key == compact_body
                 or alias_key == brand_key
                 or alias_key in party_alias_candidates
                 or legal_suffix in {"公司", "集团", ""}
@@ -355,6 +378,13 @@ def _organization_alias_profile(
             )
         ):
             exact_alias_keys.add(alias_key)
+    for token in tokens:
+        if not (2 <= len(token) <= 4):
+            continue
+        if token in place_prefixes:
+            continue
+        if brand_key.startswith(token) or body_without_place.startswith(token):
+            exact_alias_keys.add(token)
 
     return {
         "cleaned": cleaned,
@@ -363,25 +393,54 @@ def _organization_alias_profile(
     }
 
 
+_MASK_ORDINAL = r"(?:1[1-9]|[2-9]\d*|[甲乙丙丁戊己庚辛壬癸])"
+
+
 _ORG_MERGE_BRAND_MASK_RE = re.compile(
-    r"^(?:(?P<loc>[\u4e00-\u9fa5]{1,8}省))?(?P<brand>[甲乙丙丁戊己庚辛壬癸])(?P<rest>.+?)(?P<suffix>公司|集团)$"
+    rf"^(?:(?P<loc>{_MASK_ORDINAL}省))?(?P<brand>{_MASK_ORDINAL})(?P<rest>.+?)(?P<suffix>公司|集团)$"
 )
 
 
+def _company_mask_parts(masked: str) -> tuple[str, str, str, str] | None:
+    value = masked.strip()
+    province_match = re.match(rf"(?P<loc>{_MASK_ORDINAL}省)", value)
+    match = None
+    if province_match:
+        remainder = value[province_match.end() :]
+        tail = re.fullmatch(
+            rf"(?P<brand>{_MASK_ORDINAL})(?P<rest>.*?)(?P<suffix>公司|集团)",
+            remainder,
+        )
+        if tail:
+            return province_match.group("loc"), tail.group("brand"), tail.group("rest"), tail.group("suffix")
+    match = _ORG_MERGE_BRAND_MASK_RE.fullmatch(value)
+    if not match:
+        return None
+    return (
+        str(match.groupdict().get("loc") or ""),
+        match.group("brand"),
+        match.group("rest"),
+        match.group("suffix"),
+    )
+
 def _short_company_mask_from_full_masked(masked: str) -> str | None:
-    match = _ORG_MERGE_BRAND_MASK_RE.fullmatch(masked.strip())
-    if match:
-        return f"{match.group('brand')}{match.group('suffix')}"
+    parts = _company_mask_parts(masked)
+    if parts is not None:
+        _location, brand, _rest, suffix = parts
+        return f"{brand}{suffix}"
     if masked.endswith(("公司", "集团")) and len(masked) <= 4:
         return masked
     return None
 
 
 def _full_company_mask_parts(masked: str) -> tuple[str, str, str] | None:
-    match = _ORG_MERGE_BRAND_MASK_RE.fullmatch(masked.strip())
-    if not match or not match.group("loc"):
+    parts = _company_mask_parts(masked)
+    if parts is None:
         return None
-    return match.group("brand"), match.group("rest"), match.group("suffix")
+    location, brand, rest, suffix = parts
+    if not location:
+        return None
+    return brand, rest, suffix
 
 
 def _organization_location_anchor(original: str, place_prefixes: set[str]) -> str:
@@ -393,7 +452,7 @@ def _organization_location_anchor(original: str, place_prefixes: set[str]) -> st
     legal_suffix = next((suffix for suffix in LEGAL_SUFFIXES if cleaned.endswith(suffix)), "")
     body = cleaned[: -len(legal_suffix)] if legal_suffix else cleaned
     place, _ = _split_leading_place_prefix(body)
-    if place and (place in place_prefixes or f"{place}省" in place_prefixes):
+    if place and place in place_prefixes:
         return place
     for place in sorted(place_prefixes, key=len, reverse=True):
         if cleaned.startswith(place) and len(cleaned) > len(place) + 1:
@@ -421,12 +480,36 @@ def _organization_profiles_same_subject(
     shared_keys = left_keys & right_keys
     if not shared_keys:
         return False
+    from .org_masking import organization_brand_key
+
+    left_brand = organization_brand_key(left_mapping.original)
+    right_brand = organization_brand_key(right_mapping.original)
+    brand_related = (
+        left_brand == right_brand
+        or (len(left_brand) >= 2 and right_brand.startswith(left_brand))
+        or (len(right_brand) >= 2 and left_brand.startswith(right_brand))
+    )
+    shared_key_related = any(
+        key == left_brand
+        or key == right_brand
+        or left_brand.startswith(key)
+        or right_brand.startswith(key)
+        for key in shared_keys
+        if len(key) >= 2
+    )
+    if left_brand != right_brand:
+        if not (_mapping_has_party_anchor(left_mapping) or _mapping_has_party_anchor(right_mapping)):
+            return False
+    if not brand_related and not shared_key_related and not (
+        _mapping_has_party_anchor(left_mapping) or _mapping_has_party_anchor(right_mapping)
+    ):
+        return False
 
     left_anchor = _organization_location_anchor(left_mapping.original, place_prefixes)
     right_anchor = _organization_location_anchor(right_mapping.original, place_prefixes)
     if left_anchor and right_anchor and left_anchor != right_anchor:
         return False
-    if left_anchor != right_anchor and not (
+    if left_anchor != right_anchor and left_brand != right_brand and not (
         _mapping_has_party_anchor(left_mapping) or _mapping_has_party_anchor(right_mapping)
     ):
         return False
@@ -490,6 +573,7 @@ def _organization_canonical_score(mapping: MappingEntry) -> tuple[int, int, str]
 def _merge_organization_alias_mappings(mappings: list[MappingEntry]) -> list[MappingEntry]:
     """Make same-subject organization variants share one mask inside a batch map."""
     from .lexicon import PROVINCE_NAMES
+    from ._registry import _ADMIN_SHORT_MAP
 
     org_indices = [index for index, mapping in enumerate(mappings) if mapping.type == "organization"]
     if len(org_indices) < 2:
@@ -499,6 +583,8 @@ def _merge_organization_alias_mappings(mappings: list[MappingEntry]) -> list[Map
     for province in PROVINCE_NAMES:
         place_prefixes.add(province)
         place_prefixes.add(f"{province}省")
+    place_prefixes.update(_ADMIN_SHORT_MAP)
+    place_prefixes.update(_ADMIN_SHORT_MAP.values())
     for mapping in mappings:
         if mapping.type not in {"location", "grassroots_org"}:
             continue

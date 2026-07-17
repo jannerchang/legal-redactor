@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
+from .model_manager import BONSAI_MODEL_ID
+
 
 
 HIGH_RISK_TYPES = {
@@ -17,12 +20,10 @@ HIGH_RISK_TYPES = {
 
 @dataclass(frozen=True)
 class RedactionProfile:
-    """可量化的脱敏策略。
+    """默认只处理公开文书中的直接标识符与明确主体。
 
-    每个字段独立开关，用户可根据场景精确选择：
-      - 地名 + 人名（最小脱敏，适合快速去标识化）
-      - 地名 + 人名 + 机构 + 编号（标准脱敏）
-      - 全部（强脱敏，含金额、日期、地址等）
+    泛地点、详细地址、项目和其他敏感类别保持原文；用户可在映射审核页
+    手动选择补充脱敏。
     """
 
     name: str = "custom"
@@ -32,13 +33,13 @@ class RedactionProfile:
     """人名（当事人、代理人、证人等）"""
 
     redact_locations: bool = True
-    """地名（行政区划、村/社区、街道等）"""
+    """仅自动处理行政区划省/市/区县；街道、乡镇、村和社区保留人工选择。"""
 
     redact_organizations: bool = True
     """机构/公司/律所/村委会等"""
 
     redact_projects: bool = False
-    """项目/工程/楼盘名"""
+    """项目/工程/楼盘名默认保留，需由用户手动选择。"""
 
     # ── 敏感编号 ──
     redact_id_numbers: bool = True
@@ -47,14 +48,14 @@ class RedactionProfile:
     redact_phones: bool = True
     """手机/电话号码"""
 
-    redact_bank_accounts: bool = True
-    """银行账号"""
+    redact_bank_accounts: bool = False
+    """银行账号默认保留，需由用户手动选择。"""
 
-    redact_uscc: bool = True
-    """统一社会信用代码"""
+    redact_uscc: bool = False
+    """统一社会信用代码默认保留，需由用户手动选择。"""
 
-    redact_emails: bool = True
-    """邮箱地址"""
+    redact_emails: bool = False
+    """邮箱默认保留，需由用户手动选择。"""
 
     # ── 司法标识（默认不脱敏） ──
     redact_case_numbers: bool = False
@@ -63,9 +64,8 @@ class RedactionProfile:
     redact_court_names: bool = False
     """法院名称"""
 
-    # ── 扩展脱敏 ──
     redact_addresses: bool = False
-    """详细地址（门牌号等）"""
+    """详细地址默认保留，需由用户手动选择。"""
 
     # ── 行为控制 ──
     party_section_detail: bool = False
@@ -81,15 +81,11 @@ class RedactionProfile:
 
     @classmethod
     def minimal(cls) -> "RedactionProfile":
-        """最小脱敏：仅地名 + 人名 + 身份证号 + 手机号。
-
-        适合快速去标识化，当事人段不做结构化解析，
-        审判组织、案号、金额等一律保留。
-        """
+        """最小脱敏：仅人名、身份证号和手机号。"""
         return cls(
             name="minimal",
             redact_persons=True,
-            redact_locations=True,
+            redact_locations=False,
             redact_organizations=False,
             redact_projects=False,
             redact_id_numbers=True,
@@ -106,22 +102,23 @@ class RedactionProfile:
 
     @classmethod
     def standard(cls) -> "RedactionProfile":
-        """标准脱敏：最小 + 机构/公司/项目 + 敏感编号。
+        """公开文书默认脱敏：主体、行政省市区与直接标识符。
 
-        当事人段不做详细结构解析（简单提取人名/机构名即可），
-        审判组织不处理。
+        自动范围仅限人名、机构名称、行政区划省/市/区县、身份证号、手机号和案号。
+        街道及以下地点、项目、详细地址、邮箱、银行账号和统一社会信用代码
+        保持原文，用户可在映射审核页手动添加。
         """
         return cls(
             name="standard",
             redact_persons=True,
             redact_locations=True,
             redact_organizations=True,
-            redact_projects=True,
+            redact_projects=False,
             redact_id_numbers=True,
             redact_phones=True,
-            redact_bank_accounts=True,
-            redact_uscc=True,
-            redact_emails=True,
+            redact_bank_accounts=False,
+            redact_uscc=False,
+            redact_emails=False,
             redact_case_numbers=True,
             redact_court_names=False,
             redact_addresses=False,
@@ -166,30 +163,25 @@ class RedactionProfile:
             )
         return profile
 
-MAX_EFFECT_LLM_MODEL = "mlx-community/Qwen3.5-9B-MLX-4bit"
-MAX_EFFECT_FALLBACK_MODELS: tuple[str, ...] = ()
-BALANCED_LLM_MODEL = MAX_EFFECT_LLM_MODEL
-BALANCED_FALLBACK_MODELS: tuple[str, ...] = ()
+
+
+DEFAULT_MODEL_MANAGER_HOST = "127.0.0.1"
+DEFAULT_MODEL_MANAGER_PORT = 18080
 
 
 @dataclass(frozen=True)
-class LocalLLMConfig:
+class LLMAPIConfig:
     enabled: bool = True
     role: str = "candidate_review_only"
-    backend: str = "mlx"
-    backend_priority: tuple[str, ...] = ("mlx",)
     mode: str = "max-effect"
-    model: str = MAX_EFFECT_LLM_MODEL
-    fallback_models: tuple[str, ...] = MAX_EFFECT_FALLBACK_MODELS
+    model: str = BONSAI_MODEL_ID
     temperature: float = 0.0
     context_window: int = 32768
     output_format: str = "json"
     timeout_seconds: int = 120
     fail_open: bool = True
-    ollama_host: str = "127.0.0.1"
-    ollama_port: int = 11434
-    mlx_host: str = "127.0.0.1"
-    mlx_port: int = 18080
+    model_manager_host: str = field(default_factory=lambda: os.environ.get("LEGAL_REDACTOR_MODEL_MANAGER_HOST", DEFAULT_MODEL_MANAGER_HOST))
+    model_manager_port: int = field(default_factory=lambda: int(os.environ.get("LEGAL_REDACTOR_MODEL_MANAGER_PORT", str(DEFAULT_MODEL_MANAGER_PORT))))
 
 
 @dataclass(frozen=True)
@@ -205,8 +197,8 @@ class PipelineConfig:
     enable_hanlp_ner: bool = False
     hanlp_model: str = "MSRA_NER_ELECTRA_SMALL_ZH"
     hanlp_max_chars: int = 12000
-    enable_local_llm: bool = True
-    local_llm: LocalLLMConfig = field(default_factory=LocalLLMConfig)
+    enable_llm: bool = True
+    llm: LLMAPIConfig = field(default_factory=LLMAPIConfig)
     redaction_profile: RedactionProfile = field(default_factory=RedactionProfile.standard)
 
     @property
@@ -215,51 +207,49 @@ class PipelineConfig:
 
     @classmethod
     def offline_without_llm(cls, profile_name: str = "standard") -> "PipelineConfig":
-        llm = LocalLLMConfig(enabled=False)
+        llm = LLMAPIConfig(enabled=False)
         return cls(
-            enable_local_llm=False,
-            local_llm=llm,
+            enable_llm=False,
+            llm=llm,
             redaction_profile=RedactionProfile.from_preset(profile_name),
         )
 
     @classmethod
     def max_effect(cls, profile_name: str = "standard") -> "PipelineConfig":
-        llm = LocalLLMConfig(
+        llm = LLMAPIConfig(
+            enabled=True,
             role="sentence_entity_extraction",
             mode="max-effect",
-            model=MAX_EFFECT_LLM_MODEL,
-            fallback_models=MAX_EFFECT_FALLBACK_MODELS,
             context_window=8192,
             timeout_seconds=120,
             fail_open=True,
         )
         return cls(
             semantic_llm_first=True,
-            local_llm=llm,
+            enable_llm=True,
+            llm=llm,
             redaction_profile=RedactionProfile.from_preset(profile_name),
         )
 
     @classmethod
     def balanced_llm(cls, profile_name: str = "standard") -> "PipelineConfig":
-        llm = LocalLLMConfig(
+        llm = LLMAPIConfig(
+            enabled=True,
             role="sentence_entity_extraction",
             mode="balanced",
-            model=BALANCED_LLM_MODEL,
-            fallback_models=BALANCED_FALLBACK_MODELS,
             context_window=8192,
             timeout_seconds=180,
             fail_open=False,
         )
         return cls(
             semantic_llm_first=True,
-            local_llm=llm,
+            enable_llm=True,
+            llm=llm,
             redaction_profile=RedactionProfile.from_preset(profile_name),
         )
 
     @classmethod
-    def from_llm_mode(cls, llm_mode: str, profile_name: str = "standard", model: str | None = None) -> "PipelineConfig":
-        # model is kept for backward-compatible callers, but runtime selection is fixed.
-        _ = model
+    def from_llm_mode(cls, llm_mode: str, profile_name: str = "standard") -> "PipelineConfig":
         if llm_mode == "off":
             return cls.offline_without_llm(profile_name)
         if llm_mode == "balanced":

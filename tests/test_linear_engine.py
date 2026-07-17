@@ -118,6 +118,41 @@ def test_strip_leading_locations_removes_multiple_known_prefixes() -> None:
     assert body == "星河建设有限公司"
 
 
+def test_company_mask_omits_city_prefix_and_does_not_invent_country_place_prefix():
+    engine = _engine()
+    engine.source_text = (
+        "石家庄融创贵和房地产开发有限公司与"
+        "中国建筑第二工程局有限公司签订合同。"
+    )
+    for value in ("石家庄融创贵和房地产开发有限公司", "中国建筑第二工程局有限公司"):
+        engine.accept_organization(
+            Candidate(
+                type="organization",
+                text=value,
+                start=engine.source_text.index(value),
+                end=engine.source_text.index(value) + len(value),
+                source="linear_llm_exact",
+                confidence=0.95,
+                risk_level="medium",
+                auto_redact=True,
+            )
+        )
+
+    by_original = {mapping.original: mapping.masked for mapping in engine.mappings}
+
+    assert by_original["石家庄融创贵和房地产开发有限公司"] == "甲房地产开发公司"
+    assert by_original["中国建筑第二工程局有限公司"] == "乙公司"
+
+
+def test_llm_company_variants_trim_narrative_prefix_and_unbalanced_parenthesis():
+    from legal_redactor.llm import _company_variant_texts
+
+    assert _company_variant_texts("所属融创集团") == ["融创集团"]
+    assert _company_variant_texts(
+        "中建二局下游机电安装专业分包单位（河北文凯建筑工程有限公司"
+    ) == ["河北文凯建筑工程有限公司"]
+
+
 def test_derived_organization_alias_cores_includes_brand_and_number_aliases() -> None:
     cores = derived_organization_alias_cores("河北省电力建设第二工程公司")
     assert "电建" in cores
@@ -552,11 +587,158 @@ def test_sentence_windows_keep_one_sentence_per_target() -> None:
     assert windows[1]["next"] == "第三人王五未到庭？"
 
 
-def test_sentence_extraction_partial_batch_failure_keeps_successful_batches() -> None:
-    from legal_redactor.config import LocalLLMConfig
+def test_sentence_selection_defaults_to_mode_target_cap() -> None:
+    from legal_redactor.llm import (
+        _MAX_EFFECT_TARGET_WINDOWS,
+        build_sentence_windows,
+        select_entity_target_windows,
+    )
+
+    text = "".join(f"第{i}句原告张三提交证据。" for i in range(1, 51))
+    windows = build_sentence_windows(text)
+    selected = select_entity_target_windows(windows)
+
+    assert len(windows) == 50
+    assert len(selected) == _MAX_EFFECT_TARGET_WINDOWS == 48
+    assert selected[0]["id"] == "s1"
+    assert selected[-1]["id"] == "s48"
+
+
+def test_sentence_selection_respects_explicit_max_windows_override() -> None:
+    from legal_redactor.llm import build_sentence_windows, select_entity_target_windows
+
+    text = "".join(f"第{i}句原告张三提交证据。" for i in range(1, 51))
+    windows = build_sentence_windows(text)
+
+    selected_all = select_entity_target_windows(windows, max_windows=50)
+    selected_ten = select_entity_target_windows(windows, max_windows=10)
+    selected_balanced = select_entity_target_windows(windows, mode="balanced")
+
+    assert len(selected_all) == 50
+    assert selected_all[0]["id"] == "s1"
+    assert selected_all[-1]["id"] == "s50"
+    assert len(selected_ten) == 10
+    assert len(selected_balanced) == 24
+
+
+def test_max_effect_large_document_stays_within_six_batches() -> None:
+    from legal_redactor.llm import (
+        _sentence_extraction_batches,
+        build_sentence_windows,
+        select_entity_target_windows,
+    )
+
+    # Mirrors the live Web failure shape: hundreds of scored sentences must not
+    # expand into tens of sequential MLX batches under default max-effect.
+    text = "".join(f"第{i}句原告张三提交证据。" for i in range(1, 316))
+    windows = build_sentence_windows(text)
+    selected = select_entity_target_windows(windows, mode="max-effect")
+    batches = _sentence_extraction_batches(selected, mode="max-effect")
+
+    assert len(windows) == 315
+    assert len(selected) == 48
+    assert len(batches) == 6
+
+def test_extract_sentence_entities_max_effect_dispatches_six_batches() -> None:
+    from legal_redactor.config import LLMAPIConfig
     from legal_redactor.llm import LegalEntityAuditor
 
-    auditor = LegalEntityAuditor(LocalLLMConfig(mode="max-effect"))
+    auditor = LegalEntityAuditor(LLMAPIConfig(mode="max-effect"))
+    text = "".join(f"第{i}句原告张三提交证据。" for i in range(1, 316))
+    calls: list[str] = []
+
+    def fake_call(prompt, *, max_tokens):
+        calls.append(prompt)
+        return {
+            "locations": [],
+            "companies": [],
+            "persons": [],
+            "projects": [],
+            "reject": [],
+            "calibrate": {},
+        }
+
+    auditor._call_model_manager = fake_call  # type: ignore[method-assign]
+
+    result = auditor.extract_sentence_entities(text, enable_samples=False)
+
+    assert result["_target_sentence_count"] == 48
+    assert result["_batch_count"] == 6
+    assert len(calls) == 6
+
+
+
+def test_offline_llm_mode_uses_rules() -> None:
+    config = PipelineConfig.from_llm_mode("off")
+
+    assert config.enable_llm is False
+    assert config.llm.enabled is False
+
+def test_manager_transport_posts_logical_model_and_parses_completion(monkeypatch) -> None:
+    import json
+
+    from legal_redactor.config import LLMAPIConfig
+    from legal_redactor.llm import LegalEntityAuditor
+
+    requests: list[tuple[str, str, int, dict]] = []
+
+    class FakeResponse:
+        status = 200
+
+        @staticmethod
+        def read() -> bytes:
+            return json.dumps(
+                {"choices": [{"message": {"content": '{"locations":[]}'}}]}
+            ).encode("utf-8")
+
+    class FakeConnection:
+        def __init__(self, host: str, port: int, *, timeout: int) -> None:
+            requests.append(("connect", host, port, {"timeout": timeout}))
+
+        def request(self, method: str, path: str, *, body: bytes, headers: dict[str, str]) -> None:
+            requests.append((method, path, 0, {"body": json.loads(body), "headers": headers}))
+
+        @staticmethod
+        def getresponse() -> FakeResponse:
+            return FakeResponse()
+
+        @staticmethod
+        def close() -> None:
+            return None
+
+    monkeypatch.setattr("legal_redactor.llm.http.client.HTTPConnection", FakeConnection)
+    auditor = LegalEntityAuditor(
+        LLMAPIConfig(model="bonsai-27b", model_manager_host="manager.example.test", model_manager_port=18080, timeout_seconds=9)
+    )
+
+    payload = auditor._call_model_manager("return JSON", max_tokens=321)
+    assert payload["locations"] == []
+    assert requests == [
+        ("connect", "manager.example.test", 18080, {"timeout": 9}),
+        (
+            "POST",
+            "/v1/chat/completions",
+            0,
+            {
+                "body": {
+                    "model": "bonsai-27b",
+                    "messages": [{"role": "user", "content": "return JSON"}],
+                    "stream": False,
+                    "temperature": 0.0,
+                    "max_tokens": 321,
+                },
+                "headers": {"Content-Type": "application/json"},
+            },
+        ),
+    ]
+
+
+
+def test_sentence_extraction_partial_batch_failure_keeps_successful_batches() -> None:
+    from legal_redactor.config import LLMAPIConfig
+    from legal_redactor.llm import LegalEntityAuditor
+
+    auditor = LegalEntityAuditor(LLMAPIConfig(mode="max-effect"))
     text = "".join(f"第{i}句原告张三提交证据。" for i in range(1, 22))
     calls: list[str] = []
 
@@ -584,16 +766,15 @@ def test_sentence_extraction_partial_batch_failure_keeps_successful_batches() ->
 
 
 def test_sentence_batch_records_one_failure_after_retry() -> None:
-    from legal_redactor.config import LocalLLMConfig
+    from legal_redactor.config import LLMAPIConfig
     from legal_redactor.llm import LegalEntityAuditor
 
-    auditor = LegalEntityAuditor(LocalLLMConfig(mode="max-effect"))
+    auditor = LegalEntityAuditor(LLMAPIConfig(mode="max-effect"))
 
     def fail_call(prompt, *, max_tokens):
         raise RuntimeError("bad json")
 
-    auditor._call_local_model = fail_call  # type: ignore[method-assign]
-
+    auditor._call_model_manager = fail_call  # type: ignore[method-assign]
     payload, failures = auditor._extract_windows_batch(
         [{"id": "s1", "previous": "", "target": "原告张三。", "next": ""}],
         enable_samples=False,
@@ -602,6 +783,111 @@ def test_sentence_batch_records_one_failure_after_retry() -> None:
 
     assert payload is None
     assert failures == ["batch 1/1: bad json"]
+
+
+def test_parse_json_recovers_max_tokens_truncated_payload() -> None:
+    from legal_redactor.config import LLMAPIConfig
+    from legal_redactor.llm import LegalEntityAuditor
+
+    auditor = LegalEntityAuditor(LLMAPIConfig(mode="max-effect"))
+    # Model hit max_tokens mid-string after already emitting complete entities.
+    truncated = (
+        '{"locations":[{"window":"s1","full":"北京市海淀区"}],'
+        '"companies":[{"window":"s2","name":"石家庄裕华精密铸造有限公司"},'
+        '{"window":"s3","name":"裕华公'
+    )
+
+    payload = auditor._parse_json(truncated)
+
+    assert "error" not in payload
+    assert payload["locations"] == [{"window": "s1", "full": "北京市海淀区"}]
+    assert payload["companies"][0]["name"] == "石家庄裕华精密铸造有限公司"
+    # The trailing clipped entity is discarded; partial legal names must not
+    # enter the mapping table as valid entities.
+    assert len(payload["companies"]) == 1
+    assert payload["persons"] == []
+    assert payload["projects"] == []
+
+
+def test_parse_json_unrecoverable_error_is_shape_only_without_source_text() -> None:
+    from legal_redactor.config import LLMAPIConfig
+    from legal_redactor.llm import LegalEntityAuditor
+
+    auditor = LegalEntityAuditor(LLMAPIConfig(mode="max-effect"))
+    secret = "原告张三诉石家庄裕华精密铸造有限公司一案"
+
+    # Truncated before any complete key/value can be salvaged.
+    truncated_payload = auditor._parse_json('{"locations":[{"window":')
+    invalid_payload = auditor._parse_json(f"not-json-at-all::{secret}")
+
+    assert truncated_payload["error"] == "JSON decode failed (truncated)"
+    assert invalid_payload["error"] == "JSON decode failed (invalid)"
+    for payload in (truncated_payload, invalid_payload):
+        blob = str(payload)
+        assert secret not in blob
+        assert "张三" not in blob
+        assert "裕华" not in blob
+        assert "locations" in payload
+        assert payload["locations"] == []
+
+
+def test_extract_windows_batch_keeps_recoverable_truncated_json() -> None:
+    from legal_redactor.config import LLMAPIConfig
+    from legal_redactor.llm import LegalEntityAuditor
+
+    auditor = LegalEntityAuditor(LLMAPIConfig(mode="max-effect"))
+    calls: list[int] = []
+
+    def fake_call(prompt, *, max_tokens):
+        calls.append(max_tokens)
+        # Simulate a single max_tokens-truncated completion that repair can salvage.
+        return auditor._parse_json(
+            '{"locations":[],"companies":[],"persons":[{"window":"s1","name":"张三"}],'
+            '"projects":[{"window":"s1","name":"示例项'
+        )
+
+    auditor._call_model_manager = fake_call  # type: ignore[method-assign]
+    payload, failures = auditor._extract_windows_batch(
+        [{"id": "s1", "previous": "", "target": "原告张三参与示例项目。", "next": ""}],
+        enable_samples=False,
+        label="batch 1/1",
+    )
+
+    assert failures == []
+    assert payload is not None
+    assert payload["persons"] == [{"window": "s1", "name": "张三"}]
+    assert payload["projects"] == []
+    assert len(calls) == 1
+
+
+def test_extract_windows_batch_skips_unrecoverable_with_safe_diagnostic() -> None:
+    from legal_redactor.config import LLMAPIConfig
+    from legal_redactor.llm import LegalEntityAuditor
+
+    auditor = LegalEntityAuditor(LLMAPIConfig(mode="max-effect"))
+    secret = "文书原文不得出现在错误信息"
+    token_budgets: list[int] = []
+
+    def fake_call(prompt, *, max_tokens):
+        token_budgets.append(max_tokens)
+        # Unrecoverable truncation: open object/array with no complete value.
+        return auditor._parse_json('{"locations":[{"window":')
+
+    auditor._call_model_manager = fake_call  # type: ignore[method-assign]
+    payload, failures = auditor._extract_windows_batch(
+        [{"id": "s1", "previous": "", "target": secret + "。", "next": ""}],
+        enable_samples=False,
+        label="batch 2/3",
+    )
+
+    assert payload is None
+    assert len(failures) == 1
+    assert failures[0].startswith("batch 2/3: JSON decode failed (truncated)")
+    assert secret not in failures[0]
+    assert "不得出现" not in failures[0]
+    # Truncation retries raise the token ceiling without expanding concurrency.
+    assert len(token_budgets) == 3
+    assert token_budgets[0] < token_budgets[-1]
 
 
 def test_sentence_orchestration_keeps_company_names_from_llm_clause_output() -> None:
@@ -634,7 +920,6 @@ def test_sentence_orchestration_keeps_company_names_from_llm_clause_output() -> 
     assert "石家庄裕华精密铸造有限公司" in variants
     assert "鹿泉市裕华精密铸造有限公司" in variants
     assert "裕华公司" in variants
-
 
 def test_sentence_orchestration_strips_litigation_role_company_prefix() -> None:
     from legal_redactor.llm import orchestrate_sentence_extractions
@@ -951,13 +1236,9 @@ def test_accept_organization_reuses_brand_across_different_location_prefixes() -
         )
 
     by_original = {mapping.original: mapping.masked for mapping in engine.mappings}
-    jiangsu = by_original["江苏载道电力工程有限公司"]
-    huaian = by_original["淮安载道电力工程有限公司"]
-    assert jiangsu.endswith("电力工程公司")
-    assert huaian.endswith("电力工程公司")
-    assert jiangsu != huaian
-    assert jiangsu[2] == huaian[2] == by_original["载道公司"][0]
-    assert by_original["载道公司"] == f"{jiangsu[2]}公司"
+    assert by_original["江苏载道电力工程有限公司"] == "甲电力工程公司"
+    assert by_original["淮安载道电力工程有限公司"] == "甲电力工程公司"
+    assert by_original["载道公司"] == "甲公司"
 
 
 def test_accept_organization_reuses_brand_mask_for_short_and_full_names() -> None:
@@ -993,12 +1274,9 @@ def test_accept_organization_reuses_brand_mask_for_short_and_full_names() -> Non
     assert by_original["云厚公司"] == "甲公司"
     assert by_original["兴代公司"] == "乙公司"
     assert by_original["方卫公司"] == "丙公司"
-    assert by_original["河北云厚建筑装饰工程有限公司"].startswith("甲省甲")
-    assert by_original["河北兴代建筑安装工程有限公司"].startswith("甲省乙")
-    assert by_original["石家庄方卫信息系统技术有限公司"].startswith("乙省丙")
-    assert by_original["云厚公司"] == by_original["河北云厚建筑装饰工程有限公司"][2] + "公司"
-    assert by_original["兴代公司"] == by_original["河北兴代建筑安装工程有限公司"][2] + "公司"
-    assert by_original["方卫公司"] == by_original["石家庄方卫信息系统技术有限公司"][2] + "公司"
+    assert by_original["河北云厚建筑装饰工程有限公司"] == "甲装饰工程公司"
+    assert by_original["河北兴代建筑安装工程有限公司"] == "乙公司"
+    assert by_original["石家庄方卫信息系统技术有限公司"] == "丙公司"
 
 
 def test_accept_organization_keeps_different_company_short_names_separate() -> None:
@@ -1028,8 +1306,8 @@ def test_accept_organization_keeps_different_company_short_names_separate() -> N
 
     by_original = {mapping.original: mapping.masked for mapping in engine.mappings}
     assert by_original["星河建设公司"] != by_original["星河科技公司"]
-    assert by_original["星河建设公司"] == by_original["河北星河建设有限公司"][2] + "公司"
-    assert by_original["星河科技公司"] == by_original["北京星河科技有限公司"][2] + "公司"
+    assert by_original["星河建设公司"] == "甲公司"
+    assert by_original["星河科技公司"] == "乙公司"
 
 
 def test_merge_organization_alias_mappings_keeps_different_company_short_names_separate() -> None:

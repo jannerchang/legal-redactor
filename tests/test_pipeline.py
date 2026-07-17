@@ -2,7 +2,7 @@
 
 from dataclasses import replace
 from unittest.mock import patch
-from legal_redactor.config import PipelineConfig
+from legal_redactor.config import PipelineConfig, RedactionProfile
 from legal_redactor.pipeline import RedactionPipeline
 
 
@@ -25,11 +25,8 @@ def test_pipeline_without_llm(mock_load_samples):
     assert "张三" not in result.redacted_text
     # 身份证号应被脱敏
     assert "330106198501012345" not in result.redacted_text
-    # 统一社会信用代码应被脱敏
-    assert "91330106MA2ABCDEFG" not in result.redacted_text
-    # 公司名应被脱敏
-    assert "杭州某某科技有限公司" not in result.redacted_text
-    # 案号应当被保留或标记
+    # 统一社会信用代码不属于默认自动范围；案号仍应随机替换
+    assert "91330106MA2ABCDEFG" in result.redacted_text
     assert "（2024）浙0106民初1234号" not in result.redacted_text
 
     # 非敏感内容应保留
@@ -38,6 +35,100 @@ def test_pipeline_without_llm(mock_load_samples):
 
     # 应有映射表
     assert len(result.redaction_map.mappings) > 0
+
+
+@patch("legal_redactor._samples.load_all_samples", return_value=({}, set()))
+@patch("legal_redactor.hanlp_ner.detect_hanlp_ner_candidates")
+def test_hanlp_adds_unmatched_person_without_displacing_rule_organization(mock_hanlp, mock_load_samples):
+    from legal_redactor.models import Candidate
+
+    text = "经审理查明，李明华负责现场管理。中国农业银行股份有限公司石家庄广安支行提交证据。"
+    mock_hanlp.return_value = ([
+        Candidate(
+            type="person",
+            text="李明华",
+            start=text.index("李明华"),
+            end=text.index("李明华") + len("李明华"),
+            source="hanlp_ner",
+            confidence=0.88,
+            risk_level="medium",
+            auto_redact=True,
+        ),
+    ], None)
+
+    config = replace(PipelineConfig.offline_without_llm(), enable_hanlp_ner=True)
+    result = RedactionPipeline(config=config).redact(text, source_file="hanlp.txt")
+    originals = {mapping.original for mapping in result.redaction_map.mappings}
+
+    assert "李明华" in originals
+    assert "中国农业银行股份有限公司石家庄广安支行" in originals
+    mock_hanlp.assert_called_once()
+
+
+@patch("legal_redactor._samples.load_all_samples", return_value=({}, set()))
+@patch("legal_redactor.hanlp_ner.detect_hanlp_ner_candidates")
+def test_hanlp_does_not_auto_redact_street_level_location(mock_hanlp, mock_load_samples):
+    from legal_redactor.models import Candidate
+
+    text = "项目位于杭州市西湖区文三路。"
+    mock_hanlp.return_value = ([
+        Candidate(
+            type="location",
+            text="文三路",
+            start=text.index("文三路"),
+            end=text.index("文三路") + len("文三路"),
+            source="hanlp_ner",
+            confidence=0.88,
+            risk_level="medium",
+            auto_redact=True,
+        ),
+    ], None)
+
+    config = replace(PipelineConfig.offline_without_llm(), enable_hanlp_ner=True)
+    result = RedactionPipeline(config=config).redact(text, source_file="hanlp-location.txt")
+
+    assert "文三路" not in {mapping.original for mapping in result.redaction_map.mappings}
+    assert "文三路" in result.redacted_text
+    mock_hanlp.assert_called_once()
+
+
+@patch("legal_redactor._samples.load_all_samples", return_value=({}, set()))
+@patch("legal_redactor.hanlp_ner.detect_hanlp_ner_candidates")
+def test_hanlp_does_not_redact_court_personnel(mock_hanlp, mock_load_samples):
+    from legal_redactor.models import Candidate
+
+    text = "审判长陈志远、书记员周雅婷宣布开庭。"
+    mock_hanlp.return_value = ([
+        Candidate(
+            type="person",
+            text="陈志远",
+            start=text.index("陈志远"),
+            end=text.index("陈志远") + len("陈志远"),
+            source="hanlp_ner",
+            confidence=0.88,
+            risk_level="medium",
+            auto_redact=True,
+        ),
+        Candidate(
+            type="person",
+            text="周雅婷",
+            start=text.index("周雅婷"),
+            end=text.index("周雅婷") + len("周雅婷"),
+            source="hanlp_ner",
+            confidence=0.88,
+            risk_level="medium",
+            auto_redact=True,
+        ),
+    ], None)
+
+    config = replace(PipelineConfig.offline_without_llm(), enable_hanlp_ner=True)
+    result = RedactionPipeline(config=config).redact(text, source_file="hanlp-court.txt")
+
+    assert "陈志远" not in {mapping.original for mapping in result.redaction_map.mappings}
+    assert "周雅婷" not in {mapping.original for mapping in result.redaction_map.mappings}
+    assert "陈志远" in result.redacted_text
+    assert "周雅婷" in result.redacted_text
+    mock_hanlp.assert_called_once()
 
 
 def test_scan_high_risk_leaks():
@@ -200,6 +291,11 @@ def test_merge_organization_alias_mappings_unifies_batch_company_variants():
         org("电建二公司", "11公司", source="linear:linear_llm_exact"),
         org("二建公司", "癸公司"),
         org("河北二建", "12机构", source="linear:linear_llm_exact"),
+        org("河北二十冶建设有限公司", "乙省甲公司", source="linear:party_section", role="被告"),
+        org("二十冶建设公司", "丁公司"),
+        org("沈阳银球建筑工程集团有限公司", "甲公司", source="linear:party_section", role="被告"),
+        org("银球建筑公司", "己公司"),
+        org("沈阳银球钢结构工程有限公司", "戊公司", source="linear:party_section", role="被告"),
     ]
 
     merged = _merge_organization_alias_mappings(mappings)
@@ -225,6 +321,11 @@ def test_merge_organization_alias_mappings_unifies_batch_company_variants():
     assert masks["电建二公司"] == "甲公司"
     assert masks["二建公司"] == "甲公司"
     assert masks["河北二建"] == "甲省电力建设第二工程公司"
+    assert masks["河北二十冶建设有限公司"] == "乙省甲公司"
+    assert masks["二十冶建设公司"] == "甲公司"
+    assert masks["沈阳银球建筑工程集团有限公司"] == "甲公司"
+    assert masks["银球建筑公司"] == "甲公司"
+    assert masks["沈阳银球钢结构工程有限公司"] == "戊公司"
 
 
 def test_redact_with_existing_mapping():
@@ -327,6 +428,8 @@ def test_heuristic_optimization_rules():
     assert _looks_like_false_location("城一层国医馆区", 0, 7, "城一层国医馆区") is True
     assert _looks_like_false_location("起航小镇", 0, 4, "起航小镇") is False
     assert _looks_like_false_location("日照市", 0, 3, "日照市") is False
+    for false_location in ("周边小区", "案涉小", "案涉小区", "案涉小区市", "目前", "目前市"):
+        assert _looks_like_false_location(false_location, 0, len(false_location), false_location) is True
     
     # 4. Project/Address prefixes stripping
     assert _clean_location_text("项目地点井陉县") == "井陉县"
@@ -363,6 +466,12 @@ def test_heuristic_optimization_rules():
     assert _clean_organization_text("中粮可口可乐饮料（天津）有限公司") == "中粮可口可乐饮料（天津）有限公司"
     assert _clean_organization_text("中国建筑第二工程局有限公司") == "中国建筑第二工程局有限公司"
     assert _clean_organization_text("幸福树幼儿园") == "幸福树幼儿园"
+    assert _clean_organization_text("到中国二十二冶集团有限公司") == "中国二十二冶集团有限公司"
+    assert _clean_organization_text("原沈阳银球钢结构工程有限公司") == "沈阳银球钢结构工程有限公司"
+    assert _clean_organization_text("设立的河北二十冶工程技术有限公司") == "河北二十冶工程技术有限公司"
+    assert _clean_organization_text("李书玲与中国农业银行股份有限公司石家庄广安支行") == (
+        "中国农业银行股份有限公司石家庄广安支行"
+    )
     assert not [
         c for c in detect_heuristic_ner_candidates("融创集团区项目")
         if c.text == "融创集团" and c.type == "organization"
@@ -388,8 +497,8 @@ def test_pipeline_llm_calibration():
     # Set up config with LLM enabled
     config = PipelineConfig.offline_without_llm()
     # PipelineConfig is frozen, so use dataclasses.replace
-    llm_cfg = replace(config.local_llm, enabled=True)
-    config = replace(config, enable_local_llm=True, local_llm=llm_cfg)
+    llm_cfg = replace(config.llm, enabled=True)
+    config = replace(config, enable_llm=True, llm=llm_cfg)
 
     pipeline = RedactionPipeline(config=config)
 
@@ -447,8 +556,8 @@ def test_pipeline_llm_does_not_drop_unlisted_fallback_candidate():
     config = PipelineConfig.offline_without_llm()
     config = replace(
         config,
-        enable_local_llm=True,
-        local_llm=replace(config.local_llm, enabled=True),
+        enable_llm=True,
+        llm=replace(config.llm, enabled=True),
     )
     pipeline = RedactionPipeline(config=config)
     candidate = Candidate(
@@ -469,10 +578,11 @@ def test_pipeline_llm_does_not_drop_unlisted_fallback_candidate():
         "calibrate": {},
     }
 
-    with patch("legal_redactor.llm.LegalEntityAuditor.audit_and_verify", return_value=audit_result):
-        with patch("legal_redactor.pipeline.detect_heuristic_ner_candidates", return_value=[]):
-            with patch("legal_redactor.candidate_collector.detect_fallback_person_candidates", return_value=[candidate]):
-                result = pipeline.redact("经核实陈戊靖负责审计。", mode="normal")
+    with (
+        patch("legal_redactor.llm.LegalEntityAuditor.audit_and_verify", return_value=audit_result),
+        patch("legal_redactor.candidate_collector.detect_fallback_person_candidates", return_value=[candidate]),
+    ):
+        result = pipeline.redact("经核实陈戊靖负责审计。", mode="normal")
 
     assert "陈戊靖" not in result.redacted_text
 
@@ -486,8 +596,8 @@ def test_pipeline_ignores_calibration_not_found_near_candidate():
     config = PipelineConfig.offline_without_llm()
     config = replace(
         config,
-        enable_local_llm=True,
-        local_llm=replace(config.local_llm, enabled=True),
+        enable_llm=True,
+        llm=replace(config.llm, enabled=True),
     )
     pipeline = RedactionPipeline(config=config)
     candidate = Candidate(
@@ -533,6 +643,28 @@ def test_linear_pipeline_expands_locations_and_company_aliases():
     assert "甲省甲运输公司" in result.redacted_text
     assert "甲公司负责运输" in result.redacted_text
     assert result.redacted_text.count("甲省") == 3
+
+
+def test_redact_many_reuses_atomic_location_mappings_across_documents():
+    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
+
+    result = pipeline.redact_many(
+        [
+            ("first.txt", "住所地河北省石家庄市长安区。"),
+            ("second.txt", "河北省与石家庄市再次出现。"),
+        ]
+    )
+
+    masks = {
+        mapping.original: mapping.masked
+        for mapping in result.redaction_map.mappings
+        if mapping.type == "location"
+    }
+    assert masks["河北省"] == "甲省"
+    assert masks["石家庄市"] == "乙市"
+    assert masks["长安区"] == "丙区"
+    assert result.documents[0].redacted_text == "住所地甲省乙市丙区。"
+    assert result.documents[1].redacted_text == "甲省与乙市再次出现。"
 
 
 def test_linear_pipeline_does_not_add_bare_org_brand_without_alias_context():
@@ -588,6 +720,21 @@ def test_linear_pipeline_detects_short_company_and_group_names():
     assert "集团" in result.redacted_text
 
 
+def test_linear_pipeline_detects_complete_bank_branch_and_hospital_names():
+    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
+    bank = "中国农业银行股份有限公司石家庄广安支行"
+    hospital = "中国人民解放军白求恩国际和平医院"
+
+    result = pipeline.redact(f"原告{bank}与{hospital}提交证据。")
+
+    originals = {mapping.original for mapping in result.redaction_map.mappings}
+    assert bank in originals
+    assert hospital in originals
+    assert "中国农业银行" not in originals
+    assert bank not in result.redacted_text
+    assert hospital not in result.redacted_text
+
+
 def test_linear_pipeline_preserves_org_brand_boundary_characters():
     pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
     text = (
@@ -608,17 +755,53 @@ def test_linear_pipeline_preserves_org_brand_boundary_characters():
     assert "幸福树幼儿园" not in result.redacted_text
 
 
-def test_linear_pipeline_trims_person_address_prefix_before_location_check():
+def test_standard_profile_keeps_project_location_for_manual_selection():
     pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
     text = "张三住起航小镇，起航小镇项目发生争议。"
 
     result = pipeline.redact(text)
     originals = {mapping.original for mapping in result.redaction_map.mappings}
 
-    assert "起航小镇" not in result.redacted_text
-    assert "甲镇" in result.redacted_text
-    assert "起航小镇" in originals
+    assert "起航小镇" in result.redacted_text
+    assert "起航小镇" not in originals
     assert "起航小" not in originals
+
+
+def test_linear_pipeline_preserves_sample_derived_generic_entity_terms():
+    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
+    negatives = (
+        "01补鉴定意见书",
+        "41#地项目",
+        "分包单位",
+        "发包人",
+        "合同协议书",
+        "总包单位",
+        "本工程",
+        "监理",
+        "第三方",
+        "交叉施工项目",
+        "分包工程",
+        "本项目",
+        "案涉项目",
+        "涉案工程",
+    )
+
+    for text in negatives:
+        result = pipeline.redact(text)
+        assert result.redaction_map.mappings == [], text
+
+
+def test_linear_pipeline_does_not_fragment_institution_to_admin_division():
+    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
+    bank = "中国农业银行股份有限公司石家庄广安支行"
+    hospital = "中国人民解放军白求恩国际和平医院"
+
+    result = pipeline.redact(f"{bank}与{hospital}提交证据。")
+
+    originals = {mapping.original for mapping in result.redaction_map.mappings}
+    assert bank in originals
+    assert hospital in originals
+    assert "石家庄" not in originals
 
 
 def test_linear_pipeline_discovers_person_then_replaces_full_text():
@@ -715,8 +898,8 @@ def test_linear_pipeline_applies_llm_reject_and_calibration():
     config = PipelineConfig.offline_without_llm()
     config = replace(
         config,
-        enable_local_llm=True,
-        local_llm=replace(config.local_llm, enabled=True),
+        enable_llm=True,
+        llm=replace(config.llm, enabled=True),
     )
     pipeline = RedactionPipeline(config=config)
     analysis = {
@@ -766,21 +949,25 @@ def test_linear_pipeline_max_effect_uses_sentence_extraction():
         "_sentence_windows": build_sentence_windows(text),
     }
 
-    with patch(
-        "legal_redactor.llm.LegalEntityAuditor.extract_sentence_entities",
-        return_value=analysis,
-    ) as extract_sentence_entities:
-        with patch("legal_redactor.llm.LegalEntityAuditor.audit_and_verify") as audit_and_verify:
-            with patch("legal_redactor.pipeline.detect_heuristic_ner_candidates") as heuristic_ner:
-                result = pipeline.redact(text)
+    with (
+        patch(
+            "legal_redactor.llm.LegalEntityAuditor.extract_sentence_entities",
+            return_value=analysis,
+        ) as extract_sentence_entities,
+        patch("legal_redactor.llm.LegalEntityAuditor.audit_and_verify") as audit_and_verify,
+    ):
+        result = pipeline.redact(text)
 
     extract_sentence_entities.assert_called_once()
     audit_and_verify.assert_not_called()
-    heuristic_ner.assert_not_called()
     originals = {mapping.original for mapping in result.redaction_map.mappings}
-    assert {"张三", "祥云御福澜庭", "中建二局", "艺博华府"} <= originals
-    for original in ("张三", "祥云御福澜庭", "中建二局", "艺博华府"):
-        assert original not in result.redacted_text
+    assert {"张三", "中建二局"} <= originals
+    assert "祥云御福澜庭" not in originals
+    assert "艺博华府" not in originals
+    assert "张三" not in result.redacted_text
+    assert "中建二局" not in result.redacted_text
+    assert "祥云御福澜庭" in result.redacted_text
+    assert "艺博华府" in result.redacted_text
 
 
 def test_sentence_llm_exact_entities_ignore_optimization_blacklist():
@@ -887,6 +1074,68 @@ def test_linear_pipeline_max_effect_fallback_keeps_fixed_regex():
     assert "330106198501012345" not in result.redacted_text
     assert "（2024）浙0106民初1234号" not in result.redacted_text
     assert any("llm unavailable" in warning for warning in result.warnings)
+
+
+def test_standard_profile_limits_automatic_scope_to_people_companies_admin_and_direct_identifiers():
+    profile = RedactionProfile.standard()
+
+    assert profile.redact_persons is True
+    assert profile.redact_organizations is True
+    assert profile.redact_locations is True
+    assert profile.redact_id_numbers is True
+    assert profile.redact_phones is True
+    assert profile.redact_projects is False
+    assert profile.redact_addresses is False
+    assert profile.redact_bank_accounts is False
+    assert profile.redact_uscc is False
+    assert profile.redact_emails is False
+    assert profile.redact_case_numbers is True
+
+
+def test_standard_profile_keeps_street_project_and_other_non_scope_identifiers():
+    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
+    text = (
+        "张三在河北省石家庄市长安区建华大街88号承建起航小镇项目。"
+        "邮箱zhang@example.com，统一社会信用代码91110108MA0000000A，"
+        "银行账号6222020202020202020，案号（2024）冀0101民初123号。"
+        "联系电话：13800138000，身份证号11010519491231002X。"
+    )
+
+    result = pipeline.redact(text)
+    originals = {mapping.original for mapping in result.redaction_map.mappings}
+
+    assert "张三" in originals
+    assert "河北省" in originals
+    assert "石家庄市" in originals
+    assert "长安区" in originals
+    assert "13800138000" in originals
+    assert "身份证号11010519491231002X" in originals
+    assert "建华大街88号" not in originals
+    assert "起航小镇项目" not in originals
+    assert "zhang@example.com" not in originals
+    assert "91110108MA0000000A" not in originals
+    assert "6222020202020202020" not in originals
+    assert "（2024）冀0101民初123号" in originals
+    assert "建华大街88号" in result.redacted_text
+    assert "起航小镇项目" in result.redacted_text
+    assert "zhang@example.com" in result.redacted_text
+    assert "91110108MA0000000A" in result.redacted_text
+    assert "6222020202020202020" in result.redacted_text
+    assert "（2024）冀0101民初123号" not in result.redacted_text
+
+
+def test_standard_profile_keeps_township_and_village_locations_for_manual_selection():
+    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
+    text = "张三居住在河北省石家庄市长安区建华街道和平村。"
+
+    result = pipeline.redact(text)
+    originals = {mapping.original for mapping in result.redaction_map.mappings}
+
+    assert {"河北省", "石家庄市", "长安区"} <= originals
+    assert "建华街道" not in originals
+    assert "和平村" not in originals
+    assert "建华街道" in result.redacted_text
+    assert "和平村" in result.redacted_text
 
 
 def test_linear_pipeline_rejects_legal_phrases_as_people_or_locations():

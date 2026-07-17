@@ -12,7 +12,7 @@ from legal_redactor._samples import (
     load_trusted_sample_mappings,
     save_sample_auto,
 )
-from legal_redactor.config import LocalLLMConfig, PipelineConfig
+from legal_redactor.config import LLMAPIConfig, PipelineConfig
 from legal_redactor.llm import LegalEntityAuditor
 from legal_redactor.pipeline import RedactionPipeline
 from legal_redactor.web_app import _diagnose_sample_entry
@@ -292,7 +292,7 @@ def test_llm_prompt_builders_never_inject_sample_few_shot(tmp_path, monkeypatch)
     assert unique_negative in few_shot
     assert unique_positive in few_shot
 
-    auditor = LegalEntityAuditor(LocalLLMConfig(enabled=False))
+    auditor = LegalEntityAuditor(LLMAPIConfig(enabled=False))
     sentence_prompt = auditor._build_sentence_extraction_prompt(
         [{"id": "s1", "previous": "", "target": "原告胖哥公司。", "next": ""}],
         enable_samples=True,
@@ -484,14 +484,12 @@ async def test_save_sample_page_only_saves_diffs(tmp_path, monkeypatch):
         ]
     }
 
-    # 用户在前端编辑后的表格状态为：
-    # row 0: "张三" -> "张某1" (未修改，应该保持 Keep，不保存)
-    # row 1: "李四" -> "李某特制掩码" (修改，应该保存为 modify)
-    # row 2: "新增人名" -> "新某1" (新增，应该保存为 add)
-    # row 3: "删除人名" (勾选了删除，应该保存为 delete)
+    # 用户将“李四”的候选边界修正为“李四明”并改写掩码。
+    # 样本必须同时记录修改前原文，不能把这条记录误作手动新增。
     form_data = {
         "map_type": ["person", "person", "person", "person"],
-        "map_original": ["张三", "李四", "新增人名", "删除人名"],
+        "map_original": ["张三", "李四明", "新增人名", "删除人名"],
+        "map_original_before": ["张三", "李四", "", ""],
         "map_masked": ["张某1", "李某特制掩码", "新某1", "删除某1"],
         "map_role": ["", "", "", ""],
         "map_source": ["rule", "rule", "manual", "rule"],
@@ -518,7 +516,7 @@ async def test_save_sample_page_only_saves_diffs(tmp_path, monkeypatch):
     sample_data = json.loads(sample_file.read_text(encoding="utf-8"))
     entries = sample_data.get("entries", [])
 
-    # 期望只保留 3 条记录：李四 (modify)、新增人名 (add)、删除人名 (delete)
+    # 期望只保留 3 条记录：李四 -> 李四明 (modify)、新增人名 (add)、删除人名 (delete)
     # 而张三 (keep) 绝对不能保存！
     assert len(entries) == 3
 
@@ -532,7 +530,9 @@ async def test_save_sample_page_only_saves_diffs(tmp_path, monkeypatch):
         if e.get("action") == "keep":
             pytest.fail("Keep entries should not be saved!")
         elif e.get("action") == "modify":
-            assert e.get("new_original") == "李四"
+            assert e.get("old_original") == "李四"
+            assert e.get("new_original") == "李四明"
+            assert e.get("old_masked") == "李某1"
             assert e.get("new_masked") == "李某特制掩码"
             assert e.get("reason") == "应改为特制掩码"
         elif e.get("action") == "add":
@@ -560,7 +560,7 @@ async def test_save_sample_page_only_saves_diffs(tmp_path, monkeypatch):
     assert summary["manual_corrections"] == 3
     assert summary["false_positive_deletes"] == 1
     assert summary["missing_adds"] == 1
-    assert {item["original"] for item in summary["lookup_entries"]} == {"李四", "新增人名"}
+    assert {item["original"] for item in summary["lookup_entries"]} == {"李四明", "新增人名"}
     assert {item["original"] for item in summary["delete_blacklist_candidates"]} == {"删除人名"}
     delete_item = summary["delete_blacklist_candidates"][0]
     assert delete_item["reason_code"] == "delete_candidate"

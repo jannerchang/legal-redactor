@@ -11,11 +11,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 try:
-    from legal_redactor.cases import create_or_update_manifest, load_manifest, write_last_restore_metadata
+    from legal_redactor.cases import create_or_update_manifest, load_manifest, record_hermes_thread_request, write_last_restore_metadata
     from legal_redactor.io import redaction_map_to_json, save_redaction_map
     from legal_redactor.models import MappingEntry, RedactedDocument, RedactionMap, RedactionResult
     from legal_redactor.web_app import (
         _case_creation_command,
+        _find_discord_thread_for_case,
         _classify_mapping_review_row,
         _decode_text_bytes,
         _persist_optional_case_redaction,
@@ -92,36 +93,46 @@ class WebAppUploadTests(unittest.TestCase):
     def test_health_shape_stays_stable(self) -> None:
         self.assertEqual(health(), {"status": "ok", "bind_host": "127.0.0.1", "network": "offline"})
 
-    def test_status_endpoint_returns_machine_readable_components(self) -> None:
+    def test_status_endpoints_expose_manager_readiness(self) -> None:
         from fastapi.testclient import TestClient
 
         payload = {
             "status": "ok",
             "overall_state": "degraded",
-            "expected_model": "mlx-community/Qwen3.5-9B-MLX-4bit",
             "components": [
                 {
-                    "id": "mlx_server",
-                    "label": "MLX 本地模型",
-                    "state": "skipped",
-                    "message": "已跳过 MLX。",
-                    "action": "取消 LEGAL_REDACTOR_SKIP_MLX=1",
+                    "id": "model_manager",
+                    "label": "本地模型 API",
+                    "state": "missing",
+                    "message": "本地模型 API 未在配置地址响应。",
+                    "action": "启动本地模型管理器",
                 }
             ],
         }
-        with patch("legal_redactor.web_app._status_payload", return_value=payload):
-            response = TestClient(app).get("/api/status")
+        manager_status = {
+            "id": "model_manager",
+            "label": "本地模型 API",
+            "state": "missing",
+            "message": "本地模型 API 未在配置地址响应。",
+            "action": "启动本地模型管理器",
+        }
+        with (
+            patch("legal_redactor.web_app._status_payload", return_value=payload),
+            patch("legal_redactor.web_app.probe_model_manager", return_value=SimpleNamespace(to_dict=lambda: manager_status)),
+        ):
+            client = TestClient(app)
+            status = client.get("/api/status")
+            model_status = client.get("/api/model-status")
 
-        self.assertEqual(response.status_code, 200)
-        data = response.json()
-        self.assertEqual(data["status"], "ok")
-        self.assertEqual(data["components"][0]["id"], "mlx_server")
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["components"][0]["id"], "model_manager")
+        self.assertEqual(model_status.status_code, 200)
+        self.assertEqual(model_status.json(), manager_status)
 
-    def test_index_includes_status_panel_without_secret_values(self) -> None:
+    def test_index_includes_status_panel_and_fixed_manager_model(self) -> None:
         payload = {
             "status": "ok",
             "overall_state": "degraded",
-            "expected_model": "mlx-community/Qwen3.5-9B-MLX-4bit",
             "components": [
                 {
                     "id": "office_api",
@@ -146,10 +157,121 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertIn('id="source-directory-files"', page)
         self.assertIn('name="case_folder_files"', page)
         self.assertIn('id="upload-relative-paths-input"', page)
+        self.assertIn('id="upload-file-list"', page)
+        self.assertIn('id="upload-file-list-items"', page)
+        self.assertIn('id="upload-file-list-summary"', page)
+        self.assertIn("选择文件（可多选）", page)
+        self.assertIn("已选 0 个支持文件", page)
+        self.assertIn("function buildRedactFormData", page)
+        self.assertIn("function setUploadFromInput", page)
+        self.assertIn("function selectedUploadItems", page)
+        self.assertIn("uploadSelection.items[idx].checked=!!cb.checked", page)
+        self.assertIn("fd.append(fieldName,item.file,item.file.name||item.name||'document.txt')", page)
+        self.assertIn("toast('请先粘贴文本或勾选要上传的文件','warn')", page)
+        self.assertIn("isSupportedUpload", page)
+        self.assertIn("indexOf('._')!==0", page)
+        self.assertNotIn("body:new FormData(form)", page)
         self.assertIn('id="redact-form"', page)
         self.assertIn('id="redact-progress"', page)
+        self.assertIn("Ternary Bonsai 27B（MLX 2-bit）", page)
+        self.assertIn("/api/model-status", page)
         self.assertIn("已用时", page)
+        self.assertNotIn("API 模型（可选）", page)
+        self.assertNotIn("model-choice", page)
         self.assertNotIn("super-secret-token", page)
+
+
+    def test_index_inline_script_is_syntactically_valid(self) -> None:
+        """Homepage inline JS must parse; malformed braces break form submit binding."""
+        import re
+        import shutil
+
+        with (
+            patch(
+                "legal_redactor.web_app._status_payload",
+                return_value={
+                    "status": "ok",
+                    "overall_state": "ready",
+                    "expected_model_id": "bonsai-27b",
+                    "components": [],
+                },
+            ),
+            patch("legal_redactor._samples.load_all_samples", return_value=({}, set())),
+        ):
+            page = index()
+
+        match = re.search(r"<script>(.*?)</script>", page, re.S)
+        self.assertIsNotNone(match, "homepage must embed an inline script")
+        js = match.group(1)
+        self.assertIn("form.addEventListener('submit'", js)
+        self.assertIn("fetch('/redact'", js)
+        self.assertIn("buildRedactFormData(form)", js)
+        self.assertIn(".discord-send-button", js)
+        self.assertIn("Discord 发送失败：", js)
+
+        # Prefer Node syntax check when available; otherwise brace balance + Function parse via subprocess python is insufficient for JS.
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "node is required to validate homepage JS syntax")
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as handle:
+            handle.write(js)
+            path = handle.name
+        try:
+            result = subprocess.run(
+                [node, "--check", path],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        finally:
+            os.unlink(path)
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"homepage inline JS SyntaxError:\n{result.stderr or result.stdout}",
+        )
+
+
+    def test_index_upload_selection_js_builds_only_checked_files_formdata(self) -> None:
+        """Lock checklist selection: only checked files enter FormData; relative paths follow selection."""
+        with (
+            patch("legal_redactor.web_app._status_payload", return_value={"status": "ok", "overall_state": "ready", "expected_model_id": "bonsai-27b", "components": []}),
+            patch("legal_redactor._samples.load_all_samples", return_value=({}, set())),
+        ):
+            page = index()
+
+        # Checklist container and count summary are present for both file and folder picks.
+        self.assertIn('id="upload-file-list"', page)
+        self.assertIn('id="upload-file-list-summary"', page)
+        self.assertIn("已选 '+checked+' / '+total+' 个支持文件", page)
+
+        # Per-item uncheck updates selection state and relative paths.
+        self.assertIn("uploadSelection.items[idx].checked=!!cb.checked", page)
+        self.assertIn("syncRelativePaths()", page)
+        self.assertIn("relativeInput.value=JSON.stringify(paths)", page)
+
+        # FormData is built manually from checked items only — never new FormData(form).
+        self.assertIn("function buildRedactFormData(formEl)", page)
+        self.assertIn("if(el.id==='source-files'||el.id==='source-directory-files')return", page)
+        self.assertIn("selectedUploadItems().forEach(function(item)", page)
+        self.assertIn("fieldName=uploadSelection.source==='directory'?'case_folder_files':'files'", page)
+        self.assertNotIn("body:new FormData(form)", page)
+        self.assertIn("body:buildRedactFormData(form)", page)
+
+        # Unsupported / AppleDouble files are filtered out before listing or upload.
+        self.assertIn("function isSupportedUpload(name)", page)
+        self.assertIn("indexOf('._')!==0", page)
+        self.assertIn("all.filter(function(f)", page)
+
+        # Switching sources clears the other input; empty selection blocks submit without paste text.
+        self.assertIn("function clearOtherUploadSource(isDirectory)", page)
+        self.assertIn("plainInput.value=''", page)
+        self.assertIn("dirInput.value=''", page)
+        self.assertIn("请先粘贴文本或勾选要上传的文件", page)
+
+        # Case-location inference still uses selected relative paths / filenames.
+        self.assertIn("relative_paths:isDirectory?paths:[]", page)
+        self.assertIn("filenames:names", page)
+        self.assertIn("function suggestCaseFromSelection", page)
 
     def test_status_panel_renders_state_labels(self) -> None:
         html_text = _render_status_panel(
@@ -160,7 +282,7 @@ class WebAppUploadTests(unittest.TestCase):
                         "label": "识别模式",
                         "state": "degraded",
                         "message": "当前将退回规则识别。",
-                        "action": "修复 MLX",
+                        "action": "修复 LLM API 配置",
                     }
                 ]
             }
@@ -625,10 +747,7 @@ class WebAppUploadTests(unittest.TestCase):
             def redact(self, text, source_file=None, base_redaction_map=None):
                 raise RuntimeError("simulated failure")
 
-        with (
-            patch("legal_redactor.web_app.ensure_mlx_server_ready", return_value=SimpleNamespace(state="ready")),
-            patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
-        ):
+        with patch("legal_redactor.web_app.RedactionPipeline", FakePipeline):
             response = TestClient(app).post("/redact", data={"text": "张三"})
 
         self.assertEqual(response.status_code, 200)
@@ -656,10 +775,7 @@ class WebAppUploadTests(unittest.TestCase):
                     "locations": [],
                 }
 
-        with (
-            patch("legal_redactor.web_app.ensure_mlx_server_ready", return_value=SimpleNamespace(state="ready")),
-            patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
-        ):
+        with patch("legal_redactor.web_app.RedactionPipeline", FakePipeline):
             response = TestClient(app).post("/analyze", data={"text": "张三"})
 
         self.assertEqual(response.status_code, 200)
@@ -715,10 +831,9 @@ class WebAppUploadTests(unittest.TestCase):
             self.assertEqual(manifest.discord_thread_url, "")
             self.assertEqual(manifest.discord_thread_id, "")
 
-    def test_redact_route_falls_back_to_offline_rules_when_mlx_unavailable_and_saves_case(self) -> None:
+    def test_redact_route_falls_back_when_model_manager_is_unavailable_and_saves_case(self) -> None:
         from pathlib import Path
         from fastapi.testclient import TestClient
-        from legal_redactor.config import PipelineConfig
         from legal_redactor.cases import load_manifest
 
         configs = []
@@ -731,7 +846,7 @@ class WebAppUploadTests(unittest.TestCase):
             def redact(self, text, source_file=None, base_redaction_map=None):
                 assert text == "原告张三。"
                 assert base_redaction_map is None
-                assert self.config.enable_local_llm is False
+                assert self.config.enable_llm is False
                 return RedactionResult(
                     original_text=text,
                     redacted_text="原告张某1。",
@@ -755,11 +870,10 @@ class WebAppUploadTests(unittest.TestCase):
                     warnings=[],
                 )
 
-        unavailable = SimpleNamespace(state="error", message="mlx missing", action="start mlx")
+        unavailable = SimpleNamespace(state="missing")
         with tempfile.TemporaryDirectory() as tmpdir:
             with (
-                patch("legal_redactor.web_app.ensure_mlx_server_ready", return_value=unavailable),
-                patch("legal_redactor.web_app.PipelineConfig.from_llm_mode", side_effect=lambda *args, **kwargs: PipelineConfig.max_effect(*args[1:], **kwargs)),
+                patch("legal_redactor.web_app.probe_model_manager", return_value=unavailable),
                 patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
             ):
                 response = TestClient(app).post(
@@ -773,16 +887,15 @@ class WebAppUploadTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200)
             self.assertIn("原告张某1。", response.text)
+            self.assertIn("本地模型 API 未就绪", response.text)
             self.assertEqual(len(configs), 1)
-            self.assertFalse(configs[0].enable_local_llm)
+            self.assertFalse(configs[0].enable_llm)
             manifest = load_manifest(Path(tmpdir) / "2026 3624")
             self.assertEqual(manifest.case_folder, "2026 3624")
             self.assertTrue((Path(tmpdir) / "2026 3624" / "redacted" / "redacted.txt").exists())
             self.assertTrue((Path(tmpdir) / "2026 3624" / "mapping" / "redaction_map.enc").exists())
-
-    def test_redact_confirmed_falls_back_to_offline_rules_when_mlx_unavailable(self) -> None:
+    def test_redact_confirmed_falls_back_when_model_manager_is_unavailable(self) -> None:
         from fastapi.testclient import TestClient
-        from legal_redactor.config import PipelineConfig
 
         configs = []
 
@@ -798,10 +911,9 @@ class WebAppUploadTests(unittest.TestCase):
                 return []
 
             def analyze(self, text):
-                assert self.config.enable_local_llm is False
+                assert self.config.enable_llm is False
                 return {"entity_groups": [], "locations": [], "warnings": []}
 
-        unavailable = SimpleNamespace(state="error", message="mlx missing", action="start mlx")
         bundle = json.dumps([{"source_file": "a.txt", "text": "原告张三。"}], ensure_ascii=False)
         analysis = json.dumps(
             {
@@ -819,11 +931,7 @@ class WebAppUploadTests(unittest.TestCase):
             ensure_ascii=False,
         )
         with (
-            patch("legal_redactor.web_app.ensure_mlx_server_ready", return_value=unavailable),
-            patch(
-                "legal_redactor.web_app.PipelineConfig.from_llm_mode",
-                side_effect=lambda *args, **kwargs: PipelineConfig.max_effect(*args[1:], **kwargs),
-            ),
+            patch("legal_redactor.web_app.probe_model_manager", return_value=SimpleNamespace(state="missing")),
             patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
         ):
             response = TestClient(app).post(
@@ -840,9 +948,46 @@ class WebAppUploadTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        # first offline apply pipeline + second offline analyze pipeline
         self.assertGreaterEqual(len(configs), 2)
-        self.assertTrue(all(cfg.enable_local_llm is False for cfg in configs))
+        self.assertTrue(all(cfg.enable_llm is False for cfg in configs))
+
+    def test_redact_route_uses_fixed_manager_model_and_reports_duration(self) -> None:
+        from fastapi.testclient import TestClient
+
+        configs = []
+
+        class FakePipeline:
+            def __init__(self, config) -> None:
+                configs.append(config)
+
+            def redact(self, text, source_file=None, base_redaction_map=None):
+                return RedactionResult(
+                    original_text=text,
+                    redacted_text="原告张某1。",
+                    redaction_map=RedactionMap.create([]),
+                    candidates=[],
+                    review_candidates=[],
+                    leaks=[],
+                    mode="test",
+                    warnings=[],
+                )
+
+        with (
+            patch("legal_redactor.web_app.probe_model_manager", return_value=SimpleNamespace(state="ready")),
+            patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
+        ):
+            client = TestClient(app)
+            response = client.post("/redact", data={"text": "原告张三。"})
+            home = client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(home.status_code, 200)
+        self.assertEqual(len(configs), 1)
+        self.assertTrue(configs[0].enable_llm)
+        self.assertEqual(configs[0].llm.model, "bonsai-27b")
+        self.assertIn("本次脱敏模型：Ternary Bonsai 27B（MLX 2-bit）", response.text)
+        self.assertIn("服务端处理用时：", response.text)
+        self.assertNotIn("model-choice", home.text)
 
     def test_clear_samples_api_returns_delete_stats_and_rebuilds_auto_file(self) -> None:
         from pathlib import Path
@@ -1197,6 +1342,57 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertEqual(manifest.hermes_command_message_id, "m1")
         self.assertEqual(calls, [("1501248343823880345", _case_creation_command("2026 5987", "lr_test", "劳动争议纠纷"))])
 
+    def test_find_discord_thread_for_case_matches_case_number(self) -> None:
+        responses = [
+            {"guild_id": "1498679306967056394"},
+            {
+                "threads": [
+                    {"id": "111", "name": "【案件】劳动争议｜（2026）5987号"},
+                    {"id": "222", "name": "【案件】房屋买卖合同｜（2026）4343号"},
+                ]
+            },
+        ]
+
+        with patch("legal_redactor.web_app._discord_bot_token", return_value="token"):
+            with patch("legal_redactor.web_app._get_discord_json", side_effect=responses):
+                thread_url = _find_discord_thread_for_case("2026 4343", "房屋买卖合同纠纷")
+
+        self.assertEqual(thread_url, "https://discord.com/channels/1498679306967056394/222")
+
+    def test_create_discord_thread_recovers_existing_hermes_thread_without_mcp_callback(self) -> None:
+        import asyncio
+
+        thread_url = "https://discord.com/channels/1/2/1525400368069087332"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            record_hermes_thread_request(
+                tmpdir,
+                "2026 4343",
+                "lr_test",
+                source_dir=os.path.join(tmpdir, "2026 4343"),
+                command_message_id="m1",
+                command_channel_id="c1",
+            )
+            with patch("legal_redactor.web_app._find_discord_thread_for_case", return_value=thread_url):
+                response = asyncio.run(
+                    create_discord_thread(
+                        MockJsonRequest(
+                            {
+                                "case_root": tmpdir,
+                                "case_folder": "2026 4343",
+                                "case_cause": "房屋买卖合同纠纷",
+                                "source_dir": os.path.join(tmpdir, "2026 4343"),
+                            }
+                        )
+                    )
+                )
+            manifest = load_manifest(os.path.join(tmpdir, "2026 4343"))
+
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(data["status"], "bound")
+        self.assertEqual(data["thread_url"], thread_url)
+        self.assertEqual(manifest.discord_thread_url, thread_url)
+
     def test_create_discord_thread_reuses_pending_hermes_request(self) -> None:
         import asyncio
 
@@ -1209,30 +1405,31 @@ class WebAppUploadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch("legal_redactor.web_app._discord_command_channel_id", return_value="1501248343823880345"):
                 with patch("legal_redactor.web_app._post_discord_channel_message", side_effect=fake_post):
-                    first = asyncio.run(
-                        create_discord_thread(
-                            MockJsonRequest(
-                                {
-                                    "case_root": tmpdir,
-                                    "case_folder": "2026 5987",
-                                    "case_cause": "劳动争议纠纷",
-                                    "request_id": "lr_test",
-                                }
+                    with patch("legal_redactor.web_app._find_discord_thread_for_case", return_value=""):
+                        first = asyncio.run(
+                            create_discord_thread(
+                                MockJsonRequest(
+                                    {
+                                        "case_root": tmpdir,
+                                        "case_folder": "2026 5987",
+                                        "case_cause": "劳动争议纠纷",
+                                        "request_id": "lr_test",
+                                    }
+                                )
                             )
                         )
-                    )
-                    second = asyncio.run(
-                        create_discord_thread(
-                            MockJsonRequest(
-                                {
-                                    "case_root": tmpdir,
-                                    "case_folder": "2026 5987",
-                                    "case_cause": "劳动争议纠纷",
-                                    "request_id": "lr_second",
-                                }
+                        second = asyncio.run(
+                            create_discord_thread(
+                                MockJsonRequest(
+                                    {
+                                        "case_root": tmpdir,
+                                        "case_folder": "2026 5987",
+                                        "case_cause": "劳动争议纠纷",
+                                        "request_id": "lr_second",
+                                    }
+                                )
                             )
                         )
-                    )
 
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 200)
@@ -1848,6 +2045,20 @@ if __name__ == "__main__":
     unittest.main()
 
 
+
+
+def test_mapping_edit_rows_include_immutable_pre_edit_original():
+    from legal_redactor.models import MappingEntry
+    from legal_redactor.web_app import _render_mapping_edit_row, _render_blank_mapping_row
+
+    existing_row = _render_mapping_edit_row(
+        0,
+        MappingEntry("organization", "河北华鹏建筑安装工程有限公司", "甲公司", None, "rule", 1.0, True),
+    )
+    blank_row = _render_blank_mapping_row(1)
+
+    assert 'name="map_original_before" value="河北华鹏建筑安装工程有限公司"' in existing_row
+    assert 'name="map_original_before" value=""' in blank_row
 # ── Security: XSS prevention in _diagnose_sample_entry ──────────────────
 
 class TestDiagnoseSampleEntryXSS:

@@ -88,8 +88,21 @@ def _industry_and_brand_from_body(body: str) -> tuple[str, str]:
 _INDUSTRY_LEADING_MARKERS = ("建设", "建筑", "装饰", "安装", "工程", "电力", "新能源")
 
 
+def _place_mask(place: str, get_location_prefix: Callable[[str], str]) -> str:
+    """Keep a leading place inside an organization out of its organization mask.
+
+    Locations are independently recognized and masked. Repeating a place as an
+    organization prefix both leaks the entity relation and lets a city surface
+    drift into a province-shaped placeholder.
+    """
+    _ = place, get_location_prefix
+    return ""
+
+
 def _split_leading_place_prefix(body: str) -> tuple[str, str]:
     """Split a company body into a leading place prefix and the remaining brand body."""
+    if body.startswith(("中国", "中华", "全国")):
+        return "", body
     body = body.strip("（）() ")
     for province in PROVINCE_NAMES:
         if body.startswith(province) and len(body) > len(province) + 1:
@@ -202,9 +215,15 @@ def mask_institution(value: str, known_locations: dict[str, str]) -> str | None:
     masked = value
     for location in sorted(known_locations, key=len, reverse=True):
         masked = masked.replace(location, known_locations[location])
-    if masked == value:
-        return None
-    return masked
+    if masked != value:
+        return masked
+    for suffix in ("律师事务所", "会计师事务所", "医院", "学校"):
+        if value.endswith(suffix):
+            return f"{value[0]}某{suffix}"
+    for suffix in ("分行", "支行", "营业部"):
+        if "银行" in value and value.endswith(suffix):
+            return f"{value[0]}某{suffix}"
+    return None
 
 
 def build_company_mask_plan(
@@ -227,8 +246,7 @@ def build_company_mask_plan(
     if not location_mask:
         place, body = _split_leading_place_prefix(body)
         if place:
-            location_prefix = get_location_prefix(place)
-            location_mask = f"{location_prefix}省"
+            location_mask = _place_mask(place, get_location_prefix)
             location_updates.append((place, location_mask))
 
     industry, brand = _industry_and_brand_from_body(body)
@@ -326,8 +344,7 @@ def full_organization_mask_for_plan(
     if not location_mask:
         place, body = _split_leading_place_prefix(body)
         if place:
-            location_prefix = get_location_prefix(place)
-            location_mask = f"{location_prefix}省"
+            location_mask = _place_mask(place, get_location_prefix)
             location_updates.append((place, location_mask))
 
     industry, _ = _industry_and_brand_from_body(body)

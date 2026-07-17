@@ -10,8 +10,8 @@ milestone-id: M7-discord-hermes-restore-status
 # M7-discord-hermes-restore-status · discord-hermes-restore-status · POST_GA Observation(D+1/7/30/60)
 
 > **依据**:[README.md](README.md)(complex/high-risk milestone · POST_GA plan present at spec time)
-> **复杂度**:complex due private Office API, Home Mac MCP, local Web restore status, and cross-machine operator runbook
-> **风险档**:high due restored judgment privacy, bearer-token-protected API, local path exposure risk, and optional live credentials
+> **复杂度**:complex due private API, local MCP, local Web restore status, and cross-machine operator runbook
+> **风险档**:high due client-related legal-document privacy, bearer-token-protected API, local path exposure risk, and optional live credentials
 > **生命周期**:M7 Gate 2 PASS 后 24 小时内建档, D+60 关档
 > **版本**:v1.0 · 2026-06-29
 

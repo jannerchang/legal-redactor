@@ -42,14 +42,15 @@
   - one `.txt` or `.md` legal material
   - one `.docx` legal material if Word restore remains in first milestone
 - One Discord test thread URL where bot posting is safe.
-- One drafted judgment containing placeholders generated from the test mapping.
+- One drafted pleading, brief, memorandum, or other legal document containing
+  placeholders generated from the test mapping.
 - One negative test draft containing an unknown placeholder to verify
   `unresolved_placeholders`.
 
 ## Open Questions
 
-1. Should restored judgments ever be uploaded back to Discord automatically, or
-   should they stay on the Office Mac by default?
+1. Should restored legal-document drafts ever be uploaded back to Discord automatically,
+   or should they stay on the local workstation by default?
 2. Should the Office Mac copy original source files into the case folder, store
    symlinks, or only store the original source directory path?
 3. Should case creation be only through the existing Web UI, or should a local

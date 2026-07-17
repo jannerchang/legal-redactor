@@ -3,18 +3,15 @@ from __future__ import annotations
 import http.client
 import json
 import os
-import shutil
 import socket
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
 from .cases import default_case_root
+from .config import DEFAULT_MODEL_MANAGER_HOST, DEFAULT_MODEL_MANAGER_PORT
 from .local_config import JsonConfigDiagnostic, config_value, diagnose_json_config
-
-
-EXPECTED_MLX_MODEL = "mlx-community/Qwen3.5-9B-MLX-4bit"
+from .model_manager import BONSAI_MODEL_ID
 ALLOWED_STATES = {"ready", "degraded", "missing", "error", "skipped"}
 
 
@@ -47,7 +44,7 @@ def build_status_payload(
     environ: Mapping[str, str] | None = None,
     config_dir: str | Path | None = None,
     case_root: str | Path | None = None,
-    mlx_timeout: float = 0.6,
+    model_timeout: float = 0.6,
 ) -> dict[str, Any]:
     env = os.environ if environ is None else environ
     api_config = diagnose_json_config(
@@ -62,11 +59,10 @@ def build_status_payload(
         environ=env,
         config_dir=config_dir,
     )
-    mlx = probe_mlx_server(environ=env, timeout=mlx_timeout)
+    model_manager = probe_model_manager(environ=env, timeout=model_timeout)
     components = [
-        mlx,
-        probe_mlx_runtime(environ=env),
-        probe_recognition_mode(mlx),
+        model_manager,
+        probe_recognition_mode(model_manager),
         probe_json_config("api_config", "Office/API config", api_config),
         probe_case_root(case_root if case_root is not None else env.get("LEGAL_REDACTOR_CASE_ROOT")),
         probe_office_api_config(api_config, environ=env),
@@ -77,7 +73,7 @@ def build_status_payload(
     return {
         "status": "ok",
         "overall_state": _overall_state(public_components),
-        "expected_model": EXPECTED_MLX_MODEL,
+        "expected_model_id": BONSAI_MODEL_ID,
         "components": public_components,
     }
 
@@ -114,171 +110,107 @@ def probe_case_root(case_root: str | Path | None = None) -> StatusItem:
     return StatusItem("case_root", "案件库目录", "ready", "案件库目录存在且可写。", "无需处理", details)
 
 
-def probe_mlx_server(
-    *,
-    environ: Mapping[str, str] | None = None,
-    host: str | None = None,
-    port: int | None = None,
-    expected_model: str = EXPECTED_MLX_MODEL,
-    timeout: float = 0.6,
-) -> StatusItem:
-    env = os.environ if environ is None else environ
-    host = host or env.get("LEGAL_REDACTOR_MLX_HOST", "127.0.0.1")
-    if env.get("LEGAL_REDACTOR_SKIP_MLX") == "1":
-        return StatusItem(
-            "mlx_server",
-            "MLX 本地模型",
-            "skipped",
-            "已设置跳过 MLX，将以离线规则/HanLP 可用部分运行。",
-            "取消 LEGAL_REDACTOR_SKIP_MLX=1 后重新运行 ./start.sh",
-            {"host": host, "reason": "skip_env"},
-        )
+def _model_manager_endpoint(environ: Mapping[str, str]) -> tuple[str, int] | None:
+    host = environ.get("LEGAL_REDACTOR_MODEL_MANAGER_HOST", DEFAULT_MODEL_MANAGER_HOST).strip()
+    raw_port = environ.get("LEGAL_REDACTOR_MODEL_MANAGER_PORT", str(DEFAULT_MODEL_MANAGER_PORT)).strip()
+    if not host:
+        return None
     try:
-        port = port or int(env.get("LEGAL_REDACTOR_MLX_PORT", "18080"))
+        port = int(raw_port)
     except ValueError:
-        details = {"host": host, "port": env.get("LEGAL_REDACTOR_MLX_PORT"), "expected_model": expected_model}
-        return StatusItem(
-            "mlx_server",
-            "MLX 本地模型",
-            "error",
-            "LEGAL_REDACTOR_MLX_PORT 不是有效端口号。",
-            "改成数字端口，例如 18080",
-            details,
-        )
-    if not (1 <= port <= 65535):
-        details = {"host": host, "port": port, "expected_model": expected_model}
-        return StatusItem(
-            "mlx_server",
-            "MLX 本地模型",
-            "error",
-            "LEGAL_REDACTOR_MLX_PORT 超出有效端口范围。",
-            "改成 1-65535 之间的数字端口，例如 18080",
-            details,
-        )
-    details: dict[str, Any] = {"host": host, "port": port, "expected_model": expected_model}
-
-    try:
-        status_code, body = _http_get_models(host, port, timeout)
-    except socket.timeout:
-        details["reason"] = "timeout"
-        return StatusItem("mlx_server", "MLX 本地模型", "error", "探测 /v1/models 超时。", "检查 mlx_lm.server 日志或重启 MLX", details)
-    except OSError:
-        listening = _safe_port_is_listening(host, port, timeout=min(timeout, 0.25))
-        details["reason"] = "unreachable"
-        details["port_listening"] = listening
-        if listening:
-            return StatusItem(
-                "mlx_server",
-                "MLX 本地模型",
-                "error",
-                "端口有服务但 /v1/models 不可用。",
-                "停止占用端口的进程，或设置 LEGAL_REDACTOR_MLX_PORT",
-                details,
-            )
-        return StatusItem("mlx_server", "MLX 本地模型", "missing", "MLX 服务未在预期端口响应。", "运行 ./start.sh 或 scripts/start_mlx9b_server.sh", details)
-    except http.client.HTTPException:
-        details["reason"] = "http_exception"
-        return StatusItem("mlx_server", "MLX 本地模型", "error", "MLX HTTP 探测失败。", "检查端口占用和 MLX 日志", details)
-
-    details["http_status"] = status_code
-    if status_code >= 400:
-        details["reason"] = "http_error"
-        return StatusItem("mlx_server", "MLX 本地模型", "error", f"/v1/models 返回 HTTP {status_code}。", "检查 MLX 服务或端口占用", details)
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError:
-        details["reason"] = "invalid_json"
-        return StatusItem("mlx_server", "MLX 本地模型", "error", "/v1/models 未返回有效 JSON。", "确认 18080 不是其他服务", details)
-    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-        details["reason"] = "invalid_models_payload"
-        return StatusItem("mlx_server", "MLX 本地模型", "error", "/v1/models 返回结构不符合模型列表格式。", "确认 18080 不是其他服务", details)
-
-    model_ids = [
-        item.get("id")
-        for item in payload.get("data", [])
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
-    ]
-    details["model_ids"] = model_ids[:8]
-    if expected_model not in model_ids:
-        details["reason"] = "model_mismatch"
-        return StatusItem(
-            "mlx_server",
-            "MLX 本地模型",
-            "error",
-            "端口可用，但未返回当前项目固定模型。",
-            "停止错误服务，或用 scripts/start_mlx9b_server.sh 启动固定模型",
-            details,
-        )
-    details["reason"] = "model_ready"
-    return StatusItem("mlx_server", "MLX 本地模型", "ready", "固定 9B MLX 模型已就绪。", "无需处理", details)
+        return None
+    return (host, port) if 1 <= port <= 65535 else None
 
 
-def _mlx_start_script_path() -> Path:
-    return Path(__file__).resolve().parent.parent / "scripts" / "start_mlx9b_server.sh"
-
-
-def ensure_mlx_server_ready(
+def probe_model_manager(
     *,
     environ: Mapping[str, str] | None = None,
     timeout: float = 0.6,
-    start_timeout_seconds: int = 130,
 ) -> StatusItem:
-    """Probe MLX; if missing, attempt scripts/start_mlx9b_server.sh once."""
-    item = probe_mlx_server(environ=environ, timeout=timeout)
-    if item.state == "ready":
-        return item
     env = os.environ if environ is None else environ
     if env.get("LEGAL_REDACTOR_SKIP_MLX") == "1":
-        return item
-    script = _mlx_start_script_path()
-    if not script.is_file():
-        return item
-    try:
-        subprocess.run(
-            ["bash", str(script)],
-            check=True,
-            timeout=start_timeout_seconds,
-            capture_output=True,
-            text=True,
+        return StatusItem(
+            "model_manager",
+            "本地模型 API",
+            "skipped",
+            "本地模型 API 已由 LEGAL_REDACTOR_SKIP_MLX=1 跳过；将使用纯规则模式。",
+            "取消该环境变量后启动本地模型 API",
+            {"host": DEFAULT_MODEL_MANAGER_HOST, "port": DEFAULT_MODEL_MANAGER_PORT, "expected_model_id": BONSAI_MODEL_ID, "reason": "skip_requested"},
         )
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return probe_mlx_server(environ=environ, timeout=max(timeout, 2.0))
+    endpoint = _model_manager_endpoint(env)
+    if endpoint is None:
+        return StatusItem(
+            "model_manager",
+            "本地模型 API",
+            "error",
+            "本地模型 API 地址无效。",
+            "设置有效的 LEGAL_REDACTOR_MODEL_MANAGER_HOST 和 PORT",
+            {"expected_model_id": BONSAI_MODEL_ID, "reason": "invalid_endpoint"},
+        )
+    host, port = endpoint
+    details: dict[str, Any] = {"host": host, "port": port, "expected_model_id": BONSAI_MODEL_ID}
+    try:
+        health_status, health_body = _http_get(host, port, "/health", timeout)
+    except socket.timeout:
+        return StatusItem("model_manager", "本地模型 API", "error", "本地模型 API 健康检查超时。", "检查模型管理器后重试", details)
+    except OSError:
+        return StatusItem("model_manager", "本地模型 API", "missing", "本地模型 API 未在配置地址响应。", "启动本地模型管理器", details)
+    except http.client.HTTPException:
+        return StatusItem("model_manager", "本地模型 API", "error", "本地模型 API 健康检查失败。", "检查模型管理器后重试", details)
+    if health_status >= 400:
+        details["reason"] = f"health_http_{health_status}"
+        return StatusItem("model_manager", "本地模型 API", "error", f"本地模型 API /health 返回 HTTP {health_status}。", "检查模型管理器", details)
+    try:
+        health_payload = json.loads(health_body)
+    except json.JSONDecodeError:
+        return StatusItem("model_manager", "本地模型 API", "error", "本地模型 API /health 未返回有效 JSON。", "检查模型管理器", details)
+    if not isinstance(health_payload, dict) or health_payload.get("status") != "ok":
+        return StatusItem("model_manager", "本地模型 API", "error", "本地模型 API /health 返回结构不符合协议。", "检查模型管理器", details)
+    worker_state = health_payload.get("worker_state")
+    if worker_state in {"ready", "stopped", "starting", "error"}:
+        details["worker_state"] = worker_state
+    try:
+        models_status, models_body = _http_get(host, port, "/v1/models", timeout)
+    except socket.timeout:
+        return StatusItem("model_manager", "本地模型 API", "error", "本地模型 API 模型列表请求超时。", "检查模型管理器后重试", details)
+    except (OSError, http.client.HTTPException):
+        return StatusItem("model_manager", "本地模型 API", "error", "本地模型 API 模型列表请求失败。", "检查模型管理器后重试", details)
+    if models_status >= 400:
+        details["reason"] = f"models_http_{models_status}"
+        return StatusItem("model_manager", "本地模型 API", "error", f"本地模型 API /v1/models 返回 HTTP {models_status}。", "检查模型管理器", details)
+    try:
+        models_payload = json.loads(models_body)
+    except json.JSONDecodeError:
+        return StatusItem("model_manager", "本地模型 API", "error", "本地模型 API /v1/models 未返回有效 JSON。", "检查模型管理器", details)
+    if not isinstance(models_payload, dict) or not isinstance(models_payload.get("data"), list):
+        return StatusItem("model_manager", "本地模型 API", "error", "本地模型 API /v1/models 返回结构不符合模型列表格式。", "检查模型管理器", details)
+    model_ids = list(dict.fromkeys(
+        item["id"].strip()
+        for item in models_payload["data"]
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip()
+    ))
+    details["model_ids"] = model_ids[:8]
+    if BONSAI_MODEL_ID not in model_ids:
+        details["reason"] = "expected_model_not_registered"
+        return StatusItem("model_manager", "本地模型 API", "error", "本地模型 API 未注册预期模型。", "检查模型管理器的注册表", details)
+    return StatusItem("model_manager", "本地模型 API", "ready", "本地模型 API 已就绪。", "无需处理", details)
 
 
-def probe_mlx_runtime(*, environ: Mapping[str, str] | None = None, expected_model: str = EXPECTED_MLX_MODEL) -> StatusItem:
-    env = os.environ if environ is None else environ
-    cli_path = shutil.which("mlx_lm.server", path=env.get("PATH"))
-    hf_home = Path(env.get("HF_HOME", "~/.cache/huggingface")).expanduser()
-    model_cache = hf_home / "hub" / f"models--{expected_model.replace('/', '--')}"
-    sidecar_count = _appledouble_count(model_cache)
-    details = {
-        "mlx_lm_server_available": bool(cli_path),
-        "hf_home": str(hf_home),
-        "model_cache": str(model_cache),
-        "model_cache_exists": model_cache.exists(),
-        "appledouble_count": sidecar_count,
-    }
-    if not cli_path:
-        return StatusItem("mlx_runtime", "MLX 运行依赖", "missing", "未找到 mlx_lm.server。", "安装 mlx-lm 后再启动 MLX", details)
-    if sidecar_count:
-        return StatusItem("mlx_runtime", "MLX 运行依赖", "degraded", "模型缓存中存在 macOS AppleDouble 旁路文件。", "清理缓存旁路文件后再启动 MLX", details)
-    if not model_cache.exists():
-        return StatusItem("mlx_runtime", "MLX 运行依赖", "degraded", "尚未看到固定模型的本地缓存。", "首次启动会下载模型；建议保持 HF_HOME 在本机磁盘", details)
-    return StatusItem("mlx_runtime", "MLX 运行依赖", "ready", "MLX CLI 和本地模型缓存可见。", "无需处理", details)
-
-
-def probe_recognition_mode(mlx_item: StatusItem) -> StatusItem:
-    if mlx_item.state == "ready":
+def probe_recognition_mode(model_manager_item: StatusItem) -> StatusItem:
+    if model_manager_item.state == "ready":
         return StatusItem("recognition_mode", "识别模式", "ready", "LLM 辅助识别可用。", "无需处理")
     return StatusItem(
         "recognition_mode",
         "识别模式",
         "degraded",
-        "当前将退回规则/样本/HanLP 可用部分，识别支持低于 MLX 模式。",
-        "需要更高召回时先修复 MLX 状态",
-        {"mlx_state": mlx_item.state},
+        "当前将退回规则/HanLP 可用部分，识别支持低于 LLM 辅助模式。",
+        "需要更高召回时先修复本地模型 API 状态",
+        {"model_manager_state": model_manager_item.state},
     )
+
+
+
+
 
 
 def probe_office_api_config(
@@ -344,39 +276,16 @@ def probe_discord_config(
     return StatusItem("discord", "Discord 指令通道", "ready", "Discord 指令通道配置存在。", "无需处理")
 
 
-def _http_get_models(host: str, port: int, timeout: float) -> tuple[int, str]:
-    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+def _http_get(host: str, port: int, path: str, timeout: float) -> tuple[int, str]:
+    connection = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
-        conn.request("GET", "/v1/models")
-        response = conn.getresponse()
+        connection.request("GET", path)
+        response = connection.getresponse()
         return response.status, response.read().decode("utf-8", errors="replace")
     finally:
-        conn.close()
+        connection.close()
 
 
-def _port_is_listening(host: str, port: int, *, timeout: float) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(timeout)
-        return sock.connect_ex((host, port)) == 0
-
-
-def _safe_port_is_listening(host: str, port: int, *, timeout: float) -> bool:
-    try:
-        return _port_is_listening(host, port, timeout=timeout)
-    except OSError:
-        return False
-
-
-def _appledouble_count(path: Path) -> int:
-    if not path.exists():
-        return 0
-    count = 0
-    for item in path.rglob("._*"):
-        if item.is_file():
-            count += 1
-            if count >= 50:
-                break
-    return count
 
 
 def _configured_secret(value: str | None) -> bool:

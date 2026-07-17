@@ -151,17 +151,17 @@ class LinearRuleEngine:
             return
         value = candidate.text.strip()
         parts = candidate.metadata.get("parts") if isinstance(candidate.metadata, dict) else None
-        is_rule_admin_path = (
+        is_rule_admin_candidate = (
             candidate.source == "china_admin_rules"
             and isinstance(parts, dict)
-            and len(parts) >= 2
+            and bool(parts)
         )
         if (
-            not is_rule_admin_path
+            not is_rule_admin_candidate
             and _looks_like_false_location(self.source_text, candidate.start, candidate.end, value)
         ):
             return
-        if is_compound_admin_path(value) or is_rule_admin_path:
+        if is_compound_admin_path(value) or len(parts or {}) >= 2:
             masked = mask_admin_cascade_path(value, self.get_location_prefix)
             if masked != value:
                 self._add("location", value, masked, candidate)

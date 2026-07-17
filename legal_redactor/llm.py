@@ -10,7 +10,7 @@ from json import JSONDecodeError
 from typing import Any
 
 from ._logging import get_logger
-from .config import LocalLLMConfig
+from .config import LLMAPIConfig
 
 
 
@@ -69,6 +69,14 @@ _INVALID_COMPANY_VARIANT_RE = re.compile(
     r"|以下简称|下称|简称|原名称|曾用名|否认其"
     r")"
 )
+
+_DOCUMENT_OR_PROJECT_COMPANY_NOISE_RE = re.compile(
+    r"(?:"
+    r"^\d{1,4}(?:号|#)?(?:补)?(?:鉴定意见书|判决书|裁定书|调解书|起诉状|申请书|通知书)$"
+    r"|^[\u4e00-\u9fa5]{2,16}(?:价鉴|鉴定|评估|审计|检验|检测|勘验)字$"
+    r"|^\d{1,4}\s*#\s*[\u4e00-\u9fa5A-Za-z0-9]{1,20}(?:项目|工程|地块)$"
+    r")"
+)
 _CLAUSE_WRAPPED_ORG_RE = re.compile(
     r"(?:一审法院|二审法院|人民法院|上诉人|被上诉人|案外人|原告|被告|第三人|"
     r"答辩人|驳回|起诉|诉请|未厘清|仍然认|如果其|并未|代表|提交|告知|申请|"
@@ -97,6 +105,7 @@ _PROJECT_SUFFIXES = (
     "蓝庭",
     "公寓",
     "广场",
+
     "大厦",
     "产业园",
     "商业综合体",
@@ -104,6 +113,10 @@ _PROJECT_SUFFIXES = (
     "标段",
     "项目",
     "工程",
+)
+
+_DOCUMENT_SHAPED_PROJECT_RE = re.compile(
+    r"^\d{1,4}\s*#\s*[\u4e00-\u9fa5A-Za-z0-9]{1,20}(?:项目|工程|地块)$"
 )
 _PROJECT_DOCUMENT_NOISE_RE = re.compile(
     r"(?:合同|清单|报价单|报价|总款|价款|款项|费用|辅料费|采购单|发票|收据)"
@@ -194,8 +207,8 @@ def _merge_sentence_chunks(
 
 def build_sentence_windows(
     text: str,
-    max_chars: int | None = 6000,
-    max_windows: int | None = 40,
+    max_chars: int | None = None,
+    max_windows: int | None = None,
     *,
     chunk_chars: int = 800,
 ) -> list[dict[str, str]]:
@@ -257,7 +270,12 @@ def select_entity_target_windows(
     mode: str = "max-effect",
     max_windows: int | None = None,
 ) -> list[dict[str, str]]:
-    """Pick complete sentence windows for LLM extraction; never slice inside a sentence."""
+    """Pick complete sentence windows for LLM extraction; never slice inside a sentence.
+
+    Defaults keep score-ranked high-value windows bounded by mode so local MLX
+    batching stays interactive. Pass ``max_windows`` explicitly to override the
+    mode default (including a larger budget for controlled deep scans).
+    """
     if not windows:
         return []
     limit = max_windows
@@ -499,6 +517,8 @@ def _is_noise_entity_text(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
         return True
+    if _DOCUMENT_OR_PROJECT_COMPANY_NOISE_RE.fullmatch(stripped):
+        return True
     if _is_clause_wrapped_org(stripped):
         return True
     if _ORG_ACTION_CLAUSE_RE.search(stripped):
@@ -527,6 +547,8 @@ def is_noise_project_text(text: str) -> bool:
         return True
     if not stripped.endswith(_PROJECT_SUFFIXES):
         return True
+    if _DOCUMENT_SHAPED_PROJECT_RE.fullmatch(stripped):
+        return True
     if stripped in {"建设工程", "工程", "项目", "施工工程", "装修工程", "装饰工程", "安装工程", "整体工程"}:
         return True
     if _GENERIC_PROJECT_RE.fullmatch(stripped):
@@ -546,11 +568,61 @@ def _core_matches_org_name(core: str, org_name: str) -> bool:
     return len(stem) >= 2 and stem in org_name
 
 
+
+_ENTITY_BOUNDARY_WRAPPERS = " \t\r\n：:，,。；;、\"'“”‘’（）()[]【】"
+
+
+def _normalize_company_variant(text: str) -> str:
+    """Remove only punctuation wrapping an LLM-proposed company surface.
+
+    Balanced parentheses inside an organization name are preserved because they
+    may be part of its registered surface, e.g. ``中建二局（集团）有限公司``.
+    """
+    return text.strip(_ENTITY_BOUNDARY_WRAPPERS)
+
+
+_LLM_ORG_NARRATIVE_PREFIX_RE = re.compile(r"^(?:所属|按照|根据|由|与|和|及|对|向)")
+
+_LLM_ORG_CLAUSE_PREFIX_RE = re.compile(r"^(?:本院委托|案涉工程续建由)")
+
+
+def _extract_complete_company_tail(text: str) -> str:
+    """Return the last complete organization surface in a model-proposed span."""
+    from .filters import clean_organization_text
+    from .lexicon import ORG_FULL_RE
+
+    candidates: list[str] = []
+    for fragment in (text, *re.split(r"[（(]", text)):
+        for match in ORG_FULL_RE.finditer(fragment):
+            value = clean_organization_text(match.group(0))
+            if value:
+                candidates.append(value)
+    return candidates[-1] if candidates else ""
+
+
+def _normalize_llm_company_surface(text: str) -> str:
+    """Extract a precise organization surface from an LLM-proposed span."""
+    stripped = _normalize_company_variant(text)
+    stripped = _LLM_ORG_NARRATIVE_PREFIX_RE.sub("", stripped).strip()
+    stripped = _LLM_ORG_CLAUSE_PREFIX_RE.sub("", stripped).strip()
+    tail = _extract_complete_company_tail(stripped)
+    return tail or stripped
+
+
+_GENERIC_ORGANIZATION_SURFACES = frozenset({"本工程", "本项目", "该工程", "该项目"})
+
+
 def _is_valid_company_variant(text: str) -> bool:
     stripped = text.strip()
-    if not stripped or _is_noise_entity_text(stripped):
+    if not stripped or stripped != _normalize_company_variant(stripped):
+        return False
+    if _is_noise_entity_text(stripped):
         return False
     if _COMPANY_ROLE_PREFIX_RE.match(stripped):
+        return False
+    if stripped in _GENERIC_ORGANIZATION_SURFACES:
+        return False
+    if _LLM_ORG_CLAUSE_PREFIX_RE.match(stripped):
         return False
     if _INVALID_COMPANY_VARIANT_RE.search(stripped):
         return False
@@ -562,6 +634,8 @@ def _is_valid_company_variant(text: str) -> bool:
         return _is_valid_org_capture(stripped)
 
     if any(stripped.endswith(suffix) for suffix in _COMPANY_LEGAL_SUFFIXES):
+        if "（" in stripped or "(" in stripped:
+            return _is_valid_org_capture(stripped)
         return len(stripped) <= 10
     if any(stripped.endswith(suffix) for suffix in _BANK_OR_FIRM_SUFFIXES):
         return len(stripped) <= 12
@@ -586,9 +660,9 @@ def _company_variant_texts(text: str) -> list[str]:
     variants: list[str] = []
     candidates = _dedupe_preserve_order(
         [
-            stripped,
-            _COMPANY_ROLE_PREFIX_RE.sub("", stripped).strip(),
-            _salvage_company_tail_from_clause(stripped),
+            _normalize_llm_company_surface(stripped),
+            _normalize_llm_company_surface(_COMPANY_ROLE_PREFIX_RE.sub("", stripped).strip()),
+            _normalize_llm_company_surface(_salvage_company_tail_from_clause(stripped)),
         ]
     )
 
@@ -598,7 +672,7 @@ def _company_variant_texts(text: str) -> list[str]:
         if _is_valid_company_variant(candidate):
             variants.append(candidate)
         for match in ORG_FULL_RE.finditer(candidate):
-            value = match.group(0).strip()
+            value = _normalize_llm_company_surface(match.group(0))
             if value and _is_valid_company_variant(value):
                 variants.append(value)
     return _dedupe_preserve_order(variants)
@@ -755,6 +829,37 @@ def _orchestrate_reject(analysis: dict[str, Any], source_text: str = "") -> list
     return _prune_substring_texts(rejects)
 
 
+
+def _normalize_company_surface(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return _normalize_company_variant(value.strip())
+
+
+def _normalize_company_records(items: object) -> list[dict[str, Any]]:
+    """Strip model-added outer punctuation before company orchestration."""
+    if not isinstance(items, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        record = dict(item)
+        for field in ("name", "full", "brand", "text"):
+            value = _normalize_company_surface(record.get(field))
+            if value:
+                record[field] = value
+            else:
+                record.pop(field, None)
+        variants = record.get("variants")
+        if isinstance(variants, list):
+            record["variants"] = _dedupe_preserve_order(
+                [value for item in variants if (value := _normalize_company_surface(item))]
+            )
+        normalized.append(record)
+    return normalized
+
+
 def orchestrate_sentence_extractions(
     analysis: dict[str, Any],
     *,
@@ -764,7 +869,7 @@ def orchestrate_sentence_extractions(
     companies = _filter_noise_company_records(
         _expand_companies_from_text(
             source_text,
-            _orchestrate_companies(analysis.get("companies", [])),
+            _orchestrate_companies(_normalize_company_records(analysis.get("companies", []))),
         )
     )
     persons = _filter_noise_named_items(
@@ -805,7 +910,7 @@ def orchestrate_sentence_extractions(
 
 @dataclass
 class LegalEntityAuditor:
-    config: LocalLLMConfig
+    config: LLMAPIConfig
 
     def audit_and_verify(self, text: str, candidates: list[dict], enable_samples: bool = False) -> dict[str, Any]:
         """合并审计提取与疑似候选词验证，单次调用 LLM。
@@ -821,9 +926,8 @@ class LegalEntityAuditor:
         # Candidate review only needs nearby evidence, not a full-document extraction.
         audit_text = get_context_paragraphs(text, max_chars=4000)
         prompt = self._build_merged_prompt(audit_text, candidates, enable_samples=enable_samples)
-
         try:
-            payload = self._call_local_model(prompt)
+            payload = self._call_model_manager(prompt)
             return self._normalize_candidate_review_payload(payload, candidates)
         except Exception as exc:
             _logger.warning("语义审计与验证联合调用失败：%s", exc)
@@ -881,7 +985,7 @@ class LegalEntityAuditor:
         if batch_failures:
             detail = "; ".join(batch_failures)
             _logger.warning("整句语义识别存在失败批次，已保留成功批次结果：%s", detail)
-            merged["_batch_failures"] = batch_failures
+        merged["_batch_failures"] = batch_failures
 
         merged["_sentence_windows"] = windows
         merged["_total_sentence_windows"] = len(all_windows)
@@ -952,17 +1056,22 @@ class LegalEntityAuditor:
         for attempt in range(_BATCH_ATTEMPTS):
             started_at = time.monotonic()
             try:
-                payload = self._call_local_model(
+                payload = self._call_model_manager(
                     prompt,
                     max_tokens=max_tokens,
                 )
             except Exception as exc:
-                payload = {"error": str(exc)}
+                # Keep diagnostics short and free of prompt/document text.
+                err_name = type(exc).__name__
+                err_text = str(exc).strip().splitlines()[0] if str(exc).strip() else err_name
+                if len(err_text) > 160:
+                    err_text = err_text[:157] + "..."
+                payload = {"error": err_text or err_name}
                 if attempt + 1 < _BATCH_ATTEMPTS:
                     backoff = _BATCH_RETRY_BACKOFF_SECONDS * (2 ** attempt)
                     _logger.warning(
                         "%s 调用失败（第 %d/%d 次），%.1fs 后重试：%s",
-                        label, attempt + 1, _BATCH_ATTEMPTS, backoff, exc,
+                        label, attempt + 1, _BATCH_ATTEMPTS, backoff, payload["error"],
                     )
                     time.sleep(backoff)
                     continue
@@ -975,12 +1084,51 @@ class LegalEntityAuditor:
                 )
                 return payload, failures
             if attempt + 1 < _BATCH_ATTEMPTS:
-                _logger.warning("%s JSON 解析失败，重试中…", label)
+                error_text = str(payload.get("error") or "")
+                if "truncated" in error_text:
+                    # Truncation is usually a budget issue; raise ceiling before retry.
+                    max_tokens = min(
+                        _AUDIT_MAX_TOKENS,
+                        max(
+                            max_tokens + _SENTENCE_EXTRACTION_BASE_TOKENS,
+                            int(max_tokens * 1.5),
+                        ),
+                    )
+                _logger.warning(
+                    "%s JSON 解析失败（%s），重试中… max_tokens=%d",
+                    label,
+                    error_text or "unknown",
+                    max_tokens,
+                )
+                continue
         if not payload.get("error"):
             return payload, failures
-        failures.append(f"{label}: {payload.get('error', 'unknown error')}")
+        if len(batch) > 1:
+            midpoint = len(batch) // 2
+            _logger.warning(
+                "%s JSON 解析连续失败，拆分为 %d + %d 句重试。",
+                label,
+                midpoint,
+                len(batch) - midpoint,
+            )
+            left, left_failures = self._extract_windows_batch(
+                batch[:midpoint],
+                enable_samples=enable_samples,
+                label=f"{label}/left",
+            )
+            right, right_failures = self._extract_windows_batch(
+                batch[midpoint:],
+                enable_samples=False,
+                label=f"{label}/right",
+            )
+            failures.extend([*left_failures, *right_failures])
+            if left is None and right is None:
+                return None, failures
+            return self._merge_sentence_extractions(left or {}, right or {}), failures
+        error_text = str(payload.get("error") or "unknown error")
+        failures.append(f"{label}: {error_text}")
         _logger.warning(
-            "%s JSON 解析失败，跳过该批次：%s", label, payload.get("error"),
+            "%s JSON 解析失败，跳过该批次：%s", label, error_text,
         )
         return None, failures
 
@@ -1006,18 +1154,10 @@ class LegalEntityAuditor:
                     calibrate[key] = value
         return merged
 
-    def _call_local_model(self, prompt: str, *, max_tokens: int = _AUDIT_MAX_TOKENS) -> dict[str, Any]:
-        if self.config.backend == "mlx":
-            return self._call_mlx(prompt, max_tokens=max_tokens)
-        return self._call_ollama(prompt)
-
-    def _call_mlx(self, prompt: str, *, max_tokens: int = _AUDIT_MAX_TOKENS) -> dict[str, Any]:
-        return self._call_mlx_model(prompt, self.config.model, max_tokens=max_tokens)
-
-    def _call_mlx_model(self, prompt: str, model: str, *, max_tokens: int = _AUDIT_MAX_TOKENS) -> dict[str, Any]:
+    def _call_model_manager(self, prompt: str, *, max_tokens: int = _AUDIT_MAX_TOKENS) -> dict[str, Any]:
         body = json.dumps(
             {
-                "model": model,
+                "model": self.config.model,
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
                 "temperature": self.config.temperature,
@@ -1025,99 +1165,54 @@ class LegalEntityAuditor:
             },
             ensure_ascii=False,
         ).encode("utf-8")
-        conn = http.client.HTTPConnection(
-            self.config.mlx_host,
-            self.config.mlx_port,
+        connection = http.client.HTTPConnection(
+            self.config.model_manager_host,
+            self.config.model_manager_port,
             timeout=self.config.timeout_seconds,
         )
         try:
-            conn.request(
+            connection.request(
                 "POST",
                 "/v1/chat/completions",
                 body=body,
                 headers={"Content-Type": "application/json"},
             )
-            response = conn.getresponse()
+            response = connection.getresponse()
             data = response.read().decode("utf-8", errors="replace")
         finally:
-            conn.close()
+            connection.close()
 
         if response.status >= 400:
-            raise RuntimeError(f"MLX HTTP {response.status}: {data[:200]}")
+            raise RuntimeError(f"Model manager HTTP {response.status}")
 
-        raw = json.loads(data)
-        choices = raw.get("choices", [])
+        try:
+            raw = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Model manager returned invalid JSON") from exc
+        choices = raw.get("choices", []) if isinstance(raw, dict) else []
         if not choices:
-            raise RuntimeError(f"MLX empty response: {data[:200]}")
+            raise RuntimeError("Model manager returned an empty response")
         message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
         response_text = message.get("content", "") if isinstance(message, dict) else ""
         return self._parse_json(response_text)
 
-    def _call_ollama(self, prompt: str) -> dict[str, Any]:
-        models = []
-        if self.config.model:
-            models.append(self.config.model)
-        for m in self.config.fallback_models:
-            if m not in models:
-                models.append(m)
-
-        errors = []
-        for model in models:
-            try:
-                return self._call_ollama_model(prompt, model)
-            except Exception as e:
-                errors.append(f"{model}: {e}")
-        raise RuntimeError("LLM 调用失败: " + "; ".join(errors))
-
-    def _call_ollama_model(self, prompt: str, model: str) -> dict[str, Any]:
-        body = json.dumps(
-            {
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-                "format": "json",
-                "think": False,
-                "keep_alive": "1m",
-                "options": {
-                    "temperature": self.config.temperature,
-                    "num_ctx": self.config.context_window,
-                },
-            },
-            ensure_ascii=False,
-        ).encode("utf-8")
-        conn = http.client.HTTPConnection(
-            self.config.ollama_host,
-            self.config.ollama_port,
-            timeout=self.config.timeout_seconds,
-        )
-        try:
-            conn.request(
-                "POST",
-                "/api/generate",
-                body=body,
-                headers={"Content-Type": "application/json"},
-            )
-            response = conn.getresponse()
-            data = response.read().decode("utf-8", errors="replace")
-        finally:
-            conn.close()
-
-        if response.status >= 400:
-            raise RuntimeError(f"HTTP {response.status}: {data[:200]}")
-
-        raw = json.loads(data)
-        response_text = raw.get("response", "") or raw.get("thinking", "")
-        return self._parse_json(response_text)
-
     @staticmethod
-    def _repair_json_text(value: str) -> str:
-        trimmed = value.rstrip()
-        while trimmed.endswith(","):
-            trimmed = trimmed[:-1].rstrip()
+    def _json_decode_failure_kind(value: str) -> str:
+        """Classify a failed JSON payload shape without echoing document text."""
+        text = value.strip()
+        if not text:
+            return "invalid"
+        if text.startswith("```"):
+            text = text.strip("`")
+            text = text.replace("json\n", "", 1).replace("JSON\n", "", 1).strip()
+        start = text.find("{")
+        if start < 0:
+            return "invalid"
+        fragment = text[start:]
         stack: list[str] = []
         in_string = False
         escape = False
-        for char in trimmed:
+        for char in fragment:
             if in_string:
                 if escape:
                     escape = False
@@ -1134,9 +1229,168 @@ class LegalEntityAuditor:
                 stack.append("]")
             elif char in "}]" and stack and stack[-1] == char:
                 stack.pop()
-        return trimmed + "".join(reversed(stack))
+        if in_string or stack or fragment.rstrip().endswith((",", ":", "[", "{")):
+            return "truncated"
+        return "invalid"
+
+    @staticmethod
+    def _repair_json_text(value: str) -> str:
+        """Best-effort repair for max_tokens-truncated model JSON.
+
+        Closes open strings with content, drops incomplete trailing keys/values,
+        then closes any remaining containers. Never invents entity text beyond
+        characters already present in the model output.
+        """
+        text = value.rstrip()
+        if not text:
+            return text
+
+        n = len(text)
+        stack: list[str] = []
+        in_string = False
+        escape = False
+        string_is_value = False
+        expecting_value = False
+        last_safe = 0
+        i = 0
+        while i < n:
+            char = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                    if string_is_value:
+                        expecting_value = False
+                        last_safe = i + 1
+                i += 1
+                continue
+            if char.isspace():
+                i += 1
+                continue
+            if char == '"':
+                in_string = True
+                if stack and stack[-1] == "]":
+                    string_is_value = True
+                else:
+                    string_is_value = expecting_value
+                i += 1
+                continue
+            if char in "tfn":
+                matched = False
+                for literal in ("true", "false", "null"):
+                    if text.startswith(literal, i):
+                        i += len(literal)
+                        expecting_value = False
+                        last_safe = i
+                        matched = True
+                        break
+                if not matched:
+                    i += 1
+                continue
+            if char == "-" or char.isdigit():
+                j = i + 1
+                while j < n and (text[j].isdigit() or text[j] in ".eE+-"):
+                    j += 1
+                i = j
+                expecting_value = False
+                last_safe = i
+                continue
+            if char == "{":
+                stack.append("}")
+                expecting_value = False
+                i += 1
+                continue
+            if char == "[":
+                stack.append("]")
+                expecting_value = True
+                i += 1
+                continue
+            if char == "}":
+                if stack and stack[-1] == "}":
+                    stack.pop()
+                    expecting_value = False
+                    last_safe = i + 1
+                i += 1
+                continue
+            if char == "]":
+                if stack and stack[-1] == "]":
+                    stack.pop()
+                    expecting_value = False
+                    last_safe = i + 1
+                i += 1
+                continue
+            if char == ":":
+                expecting_value = True
+                i += 1
+                continue
+            if char == ",":
+                expecting_value = bool(stack and stack[-1] == "]")
+                i += 1
+                continue
+            i += 1
+
+        if in_string and string_is_value:
+            # The last entity value is incomplete. Keep only the last complete
+            # JSON value; accepting a clipped name would create a false entity.
+            prefix = text[:last_safe].rstrip()
+            while prefix.endswith(","):
+                prefix = prefix[:-1].rstrip()
+        else:
+            if not in_string and not expecting_value and not stack:
+                prefix = text
+            else:
+                prefix = text[:last_safe].rstrip()
+            while prefix.endswith(","):
+                prefix = prefix[:-1].rstrip()
+            if prefix.endswith(":"):
+                stripped = prefix[:-1].rstrip()
+                if stripped.endswith('"'):
+                    key_end = len(stripped) - 1
+                    key_start = key_end - 1
+                    while key_start >= 0:
+                        if stripped[key_start] == '"':
+                            backslashes = 0
+                            cursor = key_start - 1
+                            while cursor >= 0 and stripped[cursor] == "\\":
+                                backslashes += 1
+                                cursor -= 1
+                            if backslashes % 2 == 0:
+                                stripped = stripped[:key_start].rstrip()
+                                if stripped.endswith(","):
+                                    stripped = stripped[:-1].rstrip()
+                                break
+                        key_start -= 1
+                prefix = stripped
+
+        stack = []
+        in_string = False
+        escape = False
+        for char in prefix:
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                stack.append("}")
+            elif char == "[":
+                stack.append("]")
+            elif char in "}]" and stack and stack[-1] == char:
+                stack.pop()
+        if in_string:
+            prefix += '"'
+        return prefix + "".join(reversed(stack))
 
     def _parse_json(self, value: str) -> dict[str, Any]:
+        original = value
         value = value.strip()
         if value.startswith("```"):
             value = value.strip("`")
@@ -1146,27 +1400,56 @@ class LegalEntityAuditor:
         end = fragment.rfind("}")
         candidates: list[str] = []
         if end >= 0:
-            candidates.append(fragment[: end + 1])
+            closed = fragment[: end + 1]
+            candidates.append(closed)
+            repaired_closed = self._repair_json_text(closed)
+            if repaired_closed not in candidates:
+                candidates.append(repaired_closed)
         repaired = self._repair_json_text(fragment)
         if repaired not in candidates:
             candidates.append(repaired)
         data: dict[str, Any] | None = None
+        best_score = -1
         for candidate in candidates:
+            if not candidate:
+                continue
             try:
                 parsed = json.loads(candidate)
             except JSONDecodeError:
                 continue
-            if isinstance(parsed, dict):
+            if not isinstance(parsed, dict):
+                continue
+            # Prefer the salvage that keeps the most entity rows; break ties by
+            # recovered text length so mid-string tails are not discarded when safe.
+            entity_rows = 0
+            for key in ("locations", "companies", "persons", "projects", "reject"):
+                items = parsed.get(key)
+                if isinstance(items, list):
+                    entity_rows += len(items)
+            score = entity_rows * 100_000 + len(candidate)
+            if score > best_score:
+                best_score = score
                 data = parsed
-                break
         try:
             if data is None:
-                raise JSONDecodeError("JSON decode failed", value, 0)
+                kind = self._json_decode_failure_kind(original)
+                raise JSONDecodeError(f"JSON decode failed ({kind})", original, 0)
             if not isinstance(data, dict):
                 data = {}
-            for key in ("locations", "companies", "persons", "projects"):
+            entity_text_keys = {
+                "locations": ("full", "name", "text", "location"),
+                "companies": ("name", "full", "text", "company"),
+                "persons": ("name", "full", "text", "person"),
+                "projects": ("name", "full", "text", "project"),
+            }
+            for key, text_keys in entity_text_keys.items():
                 items = data.get(key, [])
-                data[key] = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+                data[key] = [
+                    item
+                    for item in items
+                    if isinstance(item, dict)
+                    and any(isinstance(item.get(text_key), str) and item[text_key].strip() for text_key in text_keys)
+                ] if isinstance(items, list) else []
             reject = data.get("reject", [])
             data["reject"] = self._string_list(reject, include_numbers=False) if isinstance(reject, list) else []
             reject_ids = data.get("reject_ids", [])
@@ -1184,8 +1467,20 @@ class LegalEntityAuditor:
                 if isinstance(item, str)
             } if isinstance(calibrate_ids, dict) else {}
             return data
-        except JSONDecodeError:
-            return {"locations": [], "companies": [], "persons": [], "projects": [], "reject": [], "calibrate": {}, "error": "JSON decode failed"}
+        except JSONDecodeError as exc:
+            kind = self._json_decode_failure_kind(original)
+            message = f"JSON decode failed ({kind})"
+            # Never put model/document text into the diagnostic surface.
+            _ = exc
+            return {
+                "locations": [],
+                "companies": [],
+                "persons": [],
+                "projects": [],
+                "reject": [],
+                "calibrate": {},
+                "error": message,
+            }
 
     @staticmethod
     def _string_list(items: list[Any], *, include_numbers: bool) -> list[str]:
@@ -1271,10 +1566,11 @@ class LegalEntityAuditor:
             "上一句/下一句只提供批次边界上下文；上下文仅供理解，实体必须逐字来自【目标句】。\n\n"
             f"{few_shot_part}"
             "规则摘要：\n"
-            "- 机构优先完整名称；以下简称/简称/原名称/曾用名指向同一机构时，全称与简称都写入 companies。\n"
-            "- 机构名不要包含原告、被告、第三人、上诉人、案外人等诉讼地位前缀。\n"
+            "- 仅输出人名和机构：机构优先完整名称；以下简称/简称/原名称/曾用名指向同一机构时，全称与简称都写入 companies。\n"
+            "- 实体文本必须逐字来自目标句，且不得包含外围括号、引号、书名号、冒号或逗号；机构名内部成对括号可以保留。\n"
+            "- 不输出地点、地址、项目/工程/楼盘、案号、电话、身份证号或其他编号；这些内容由确定性规则或用户手动选择处理。\n"
             "- 2 字人名若是更长人名/机构名/案号片段，不要输出。\n"
-            "- reject 写目标句中像实体但实际不是的逐字子串：签约、银行流水、甲方、合同一/二/三、"
+            "- reject 写目标句中像人名或机构但实际不是的逐字子串：签约、银行流水、甲方、合同一/二/三、"
             "否认其与某公司系关联公司等程序性长句。\n"
             "- 无实体则返回空数组；JSON 尽量短，不要多余字段。\n\n"
             "输出格式：\n"

@@ -89,9 +89,9 @@ Completion definition for build:
 
 ### 3.2 Out of Scope
 
-- Do not send restored judgments back to Discord automatically. A restored-output
-  posting workflow requires a later explicit approval and separate permission
-  checks.
+- Do not send restored legal-document drafts back to Discord automatically. A
+  restored-output posting workflow requires later explicit approval and separate
+  permission checks.
 - Do not upload maps, originals, sample data, restored full text, or local
   Office paths to Discord, Hermes, webhooks, cloud storage, or review material.
 - Do not change recognition rules, prompts, sample-learning logic, model
@@ -299,10 +299,10 @@ canaries for each category.
 ## 五、七层硬门槛 / 选型
 
 M7 is complex because it spans private HTTP API, MCP adapter behavior, local Web
-status, file-system case metadata, cross-machine operator docs, and privacy
+status, file-system matter metadata, cross-machine operator docs, and privacy
 controls around restored legal text. Risk is high because the workflow touches
-restored judgments, bearer-token-protected API calls, and cross-machine
-responses. The project profile is `standard`; this spec upshifts the effective
+client-related legal-document drafts, bearer-token-protected API calls, and
+cross-machine responses. The project profile is `standard`; this spec upshifts the effective
 profile to `strict` for M7.
 
 七层条数预估:

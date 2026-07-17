@@ -270,6 +270,7 @@ def clean_organization_text(value: str) -> str:
         "",
         value,
     ).strip(" ：:，,。、；;\n\t")
+    value = _strip_org_narrative_prefixes(value)
     matched = next((sfx for sfx in sorted(_org_sfx, key=len, reverse=True) if value.endswith(sfx)), "")
     core = value[: -len(matched)] if matched else value
     if not core:
@@ -296,6 +297,62 @@ def _looks_like_standalone_branch_company(value: str) -> bool:
     return bool(re.fullmatch(r"[\u4e00-\u9fa5]{2,12}(?:市)?分公司", value))
 
 
+# 文书叙述前缀：明确不属于机构本体（“到…公司”“原…公司”“设立的…公司”）
+_ORG_NARRATIVE_PREFIX_RE = re.compile(
+    r"^(?:"
+    r"设立的|成立的|注册的|组建的|"
+    r"设立|成立|注册|"
+    r"到(?=[\u4e00-\u9fa5A-Za-z0-9()（）·]{4,}"
+    r"(?:有限责任公司|股份有限公司|集团有限公司|有限公司|集团))|"
+    r"原(?=[\u4e00-\u9fa5]{4,}"
+    r"(?:有限责任公司|股份有限公司|集团有限公司|有限公司))"
+    r")"
+)
+
+# “人名 + 与/和/及 + 机构”叙述：清洗时只保留机构本体
+_PERSON_WITH_ORG_RE = re.compile(
+    r"^(?P<person>[\u4e00-\u9fa5·]{2,4})(?:与|和|及)(?P<rest>.+)$"
+)
+_ORG_SURFACE_MARKERS = (
+    "有限责任公司",
+    "股份有限公司",
+    "集团有限公司",
+    "有限公司",
+    "律师事务所",
+    "会计师事务所",
+    "公司",
+    "集团",
+    "银行",
+    "分行",
+    "支行",
+)
+
+
+def _strip_org_narrative_prefixes(value: str) -> str:
+    """循环剥离机构表面形式左侧的明确叙述前缀与“人名与机构”连接。"""
+    changed = True
+    while value and changed:
+        changed = False
+        stripped = _ORG_NARRATIVE_PREFIX_RE.sub("", value, count=1).strip(" ：:，,。、；;\n\t")
+        if stripped != value:
+            value = stripped
+            changed = True
+            continue
+        person_org = _PERSON_WITH_ORG_RE.match(value)
+        if not person_org:
+            break
+        person = person_org.group("person")
+        rest = person_org.group("rest").strip(" ：:，,。、；;\n\t")
+        if (
+            rest
+            and not any(marker in person for marker in _ORG_SURFACE_MARKERS)
+            and any(marker in rest for marker in _ORG_SURFACE_MARKERS)
+        ):
+            value = rest
+            changed = True
+    return value
+
+
 # ── 地名误匹配过滤 ──────────────────────────────────────────────
 
 # 这些前缀字符表示后面的地名是通用指代而非具体地点
@@ -318,6 +375,40 @@ _NON_GEO_CHARS = frozenset(
 )
 
 _LOCATION_SUFFIXES = ("省", "自治区", "市", "自治州", "盟", "区", "县", "旗", "镇", "乡", "街道", "村", "社区")
+
+# 文书指代/程序性前缀：整段或以它们起头的“地名”不是真实行政区划
+# （如 案涉小区市、周边小区、目前市）。可维护扩展，避免单字特判。
+_FALSE_LOCATION_REFERENCE_PREFIXES = (
+    "案涉",
+    "周边",
+    "目前",
+    "本案",
+    "该案",
+    "上述",
+    "涉案",
+    "本市",
+    "本省",
+    "本区",
+    "本县",
+    "本村",
+)
+
+# 去掉行政区划后缀后仍属非地名词核（含残缺截断如“案涉小”）
+_FALSE_LOCATION_NON_PLACE_CORES = frozenset(
+    {
+        "周边",
+        "案涉",
+        "目前",
+        "案涉小",
+        "案涉小区",
+        "周边小区",
+        "本案",
+        "该案",
+        "上述",
+        "涉案",
+    }
+)
+
 
 
 def looks_like_false_location(text: str, start: int, end: int, raw: str) -> bool:
@@ -353,6 +444,12 @@ def looks_like_false_location(text: str, start: int, end: int, raw: str) -> bool
     )
     if raw_stripped.endswith(("村民委员会", "居民委员会", "村委会", "居委会")):
         return raw_stripped in {"村村民委员会", "村村委会", "社区居民委员会", "社区居委会"}
+    if raw in _FALSE_LOCATION_NON_PLACE_CORES or raw_stripped in _FALSE_LOCATION_NON_PLACE_CORES:
+        return True
+    if any(raw.startswith(prefix) for prefix in _FALSE_LOCATION_REFERENCE_PREFIXES):
+        return True
+    if any(raw_stripped.startswith(prefix) for prefix in _FALSE_LOCATION_REFERENCE_PREFIXES):
+        return True
     if raw_stripped in {
         "省", "市", "区", "县", "镇", "乡", "村", "街道", "社区", "自治区", "自治州",
         "市甲", "省丙", "其他村", "我村村", "城中村", "安置区", "生活区",
@@ -360,7 +457,6 @@ def looks_like_false_location(text: str, start: int, end: int, raw: str) -> bool
         "大部分地区", "建设村", "政府农村", "政府报县", "接单区", "逐级报乡",
     }:
         return True
-
     false_raw_prefixes = (
         "主方", "之后", "乎", "事处", "人石家庄", "代大马", "件规定及", "公司及",
         "三个", "扰乱", "范围内", "国家", "维持", "驳回", "反映一定地",
@@ -388,6 +484,10 @@ def looks_like_false_location(text: str, start: int, end: int, raw: str) -> bool
         if body.endswith(suffix):
             body = body[:-len(suffix)]
             break
+    if body in _FALSE_LOCATION_NON_PLACE_CORES:
+        return True
+    if body and any(body.startswith(prefix) for prefix in _FALSE_LOCATION_REFERENCE_PREFIXES):
+        return True
     if body and any(c in _NON_GEO_CHARS for c in body):
         return True
 

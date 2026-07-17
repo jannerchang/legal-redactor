@@ -1,4 +1,5 @@
 .venv/
+models/
 .DS_Store
 __pycache__/
 *.py[cod]
@@ -31,6 +32,9 @@ tests/*
 !tests/test_china_admin.py
 !tests/test_postprocess.py
 !tests/test_detectors.py
+!tests/test_model_manager.py
+!tests/test_llm_config.py
+!tests/test_start_model_manager.py
 test_new_rules.py
 scratch_test_samples.py
 .ff-state/

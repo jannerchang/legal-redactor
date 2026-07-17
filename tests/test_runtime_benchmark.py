@@ -13,7 +13,6 @@ from legal_redactor.runtime_benchmark import (
     build_runtime_benchmark_report,
     summarize_models_probe,
 )
-from legal_redactor.status import EXPECTED_MLX_MODEL
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -287,13 +286,14 @@ def test_privacy_boundary_rejects_embedded_absolute_paths(unsafe_value: str) -> 
         )
 
 
-def test_models_probe_summary_uses_identity_metadata_without_prompt_or_body() -> None:
-    ready = summarize_models_probe({"data": [{"id": EXPECTED_MLX_MODEL}]}, expected_model=EXPECTED_MLX_MODEL)
-    wrong = summarize_models_probe({"data": [{"id": "other-model"}]}, expected_model=EXPECTED_MLX_MODEL)
+def test_models_probe_summary_uses_logical_identity_without_prompt_or_body() -> None:
+    selected_model = "bonsai-27b"
+    ready = summarize_models_probe({"data": [{"id": selected_model}]}, expected_model=selected_model)
+    wrong = summarize_models_probe({"data": [{"id": "other-model"}]}, expected_model=selected_model)
 
     assert ready == {
         "model_match": True,
-        "expected_model": EXPECTED_MLX_MODEL,
+        "expected_model": selected_model,
         "observed_model_count": 1,
         "status": "ready",
     }

@@ -75,52 +75,17 @@ def _request(method: str, path: str, payload: dict[str, Any] | None = None) -> d
 
 
 def run_stdio() -> None:
-    if _run_fastmcp_stdio():
-        return
+    """Serve MCP JSON-RPC messages over the Gateway's newline-delimited stdio transport."""
+
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
     while True:
-        message = _read_framed_message(stdin)
+        message = _read_json_line(stdin)
         if message is None:
-            break
+            return
         response = _handle_jsonrpc(message)
         if response is not None:
-            _write_framed_message(stdout, response)
-
-
-def _run_fastmcp_stdio() -> bool:
-    try:
-        from mcp.server.fastmcp import FastMCP
-    except ImportError:
-        return False
-
-    server = FastMCP("legal-redactor")
-
-    @server.tool(name="restore_judgment_from_thread")
-    def restore_judgment_from_thread_tool(discord_thread_id: str, draft_text: str) -> str:
-        """Restore a drafted judgment using the Office Mac mapping bound to a Discord thread."""
-
-        return _safe_json_text(restore_judgment_from_thread(discord_thread_id, draft_text))
-
-    @server.tool(name="get_case_status_by_thread")
-    def get_case_status_by_thread_tool(discord_thread_id: str) -> str:
-        """Return non-sensitive Office Mac case status for a Discord thread."""
-
-        return _safe_json_text(get_case_status_by_thread(discord_thread_id))
-
-    @server.tool(name="bind_discord_thread_to_case")
-    def bind_discord_thread_to_case_tool(
-        case_folder: str,
-        discord_thread_url: str,
-        source_dir: str | None = None,
-        case_root: str | None = None,
-    ) -> str:
-        """Bind a Discord thread URL to an Office Mac case manifest."""
-
-        return _safe_json_text(bind_discord_thread_to_case(case_folder, discord_thread_url, source_dir, case_root))
-
-    server.run()
-    return True
+            _write_json_line(stdout, response)
 
 
 def _handle_jsonrpc(message: dict[str, Any]) -> dict[str, Any] | None:
@@ -141,7 +106,7 @@ def _handle_jsonrpc(message: dict[str, Any]) -> dict[str, Any] | None:
                 "tools": [
                     {
                         "name": "restore_judgment_from_thread",
-                        "description": "Restore a drafted judgment using the Office Mac case mapping bound to a Discord thread.",
+                        "description": "Restore an authorized legal-document draft using the local matter mapping bound to a collaboration thread.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -194,33 +159,17 @@ def _handle_jsonrpc(message: dict[str, Any]) -> dict[str, Any] | None:
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": "Adapter error"}}
 
 
-def _read_framed_message(stream) -> dict[str, Any] | None:
-    headers: dict[str, str] = {}
+def _read_json_line(stream) -> dict[str, Any] | None:
     while True:
         line = stream.readline()
         if line == b"":
             return None
-        if line in {b"\r\n", b"\n"}:
-            break
-        if b":" in line:
-            key, value = line.decode("ascii", errors="ignore").split(":", 1)
-            headers[key.lower()] = value.strip()
-        elif line.strip().startswith(b"{"):
+        if line.strip():
             return json.loads(line.decode("utf-8"))
 
-    length = int(headers.get("content-length", "0"))
-    if length <= 0:
-        return None
-    body = stream.read(length)
-    if not body:
-        return None
-    return json.loads(body.decode("utf-8"))
 
-
-def _write_framed_message(stream, message: dict[str, Any]) -> None:
-    body = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    stream.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii"))
-    stream.write(body)
+def _write_json_line(stream, message: dict[str, Any]) -> None:
+    stream.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n")
     stream.flush()
 
 

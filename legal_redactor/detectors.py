@@ -10,6 +10,7 @@ from .filters import clean_person_name as _clean_person_name
 from .filters import is_false_org as _is_false_org
 from .filters import is_false_person as _is_false_person
 from .filters import looks_like_false_location as _looks_like_false_location
+from .filters import _strip_org_narrative_prefixes
 from .lexicon import (
     COMMON_SURNAMES,
     FALLBACK_PERSON_PATTERNS,
@@ -238,27 +239,47 @@ def _extract_party_entity(body: str) -> str:
     field = re.sub(r"(?:答辩称|辩称|诉称|申请称|复议称|补充陈述|补充说明|陈述|说明|补充|称)$", "", field).strip()
     if not field:
         return ""
-
-    # 1. 优先尝试作为完整机构匹配（保留机构名中的括号如（集团））
-    org_match = ORG_RE.search(field)
-    if org_match and org_match.start() == 0:
-        cleaned = _clean_org_simple(org_match.group(0))
-        if cleaned and cleaned not in {"公司", "该公司", "本公司", "分公司"}:
-            return cleaned
-
-    # 2. 角色后“姓名 + 动作/属性”：证人刘芳到庭作证 / 上诉人陈戊靖不服原审判决
-    #    只取句首 2–4 字姓名，避免把“到庭作证”“提出异议”等并入实体。
+    # 1. 角色后“姓名 + 与/和机构/动作”优先：上诉人李书玲与中国农业银行…
+    #    或 证人刘芳到庭作证 / 上诉人陈戊靖不服原审判决
+    #    只取句首 2–4 字姓名，避免把机构整段或动作并入实体。
     person_action = re.match(
         r"^(?P<name>[\u4e00-\u9fa5·]{2,4})(?:"
         r"到庭|出庭|参加|提出|申请|不服|负责|办理|陈述|说明|表示|确认|拒绝|要求|主张|"
-        r"辩称|诉称|称|系|为|男|女|汉族|住|住所地|身份证|公民身份|于|在|已|将|以|向|与"
+        r"辩称|诉称|称|系|为|男|女|汉族|住|住所地|身份证|公民身份|于|在|已|将|以|向|与|和|及"
         r")",
         field,
     )
     if person_action:
         name = person_action.group("name")
-        if not _is_false_person(name):
+        rest = field[person_action.end() :]
+        # “姓名 + 与/和/及 + 机构”：明确召回人名，不把整段合成机构
+        if person_action.group(0)[-1] in "与和及" and not any(
+            marker in rest
+            for marker in (
+                "公司",
+                "集团",
+                "银行",
+                "律师事务所",
+                "会计师事务所",
+                "分行",
+                "支行",
+                "委员会",
+                "中心",
+                "医院",
+                "学校",
+            )
+        ):
+            # 与/和/及后不是机构时，不按人名截断（可能是“与会人员”等）
+            pass
+        elif not _is_false_person(name):
             return name
+
+    # 2. 优先尝试作为完整机构匹配（保留机构名中的括号如（集团））
+    org_match = ORG_RE.search(field)
+    if org_match and org_match.start() == 0:
+        cleaned = _clean_org_simple(org_match.group(0))
+        if cleaned and cleaned not in {"公司", "该公司", "本公司", "分公司"}:
+            return cleaned
 
     # 3. 如果不是机构，移除可能存在的尾部括号（如人名的曾用名、简称等）
     field_clean = re.sub(r"（.*?）|\(.*?\)", "", field).strip()
@@ -355,19 +376,21 @@ def _clean_org_simple(value: str) -> str:
         r"上诉人|被上诉人|再审申请人|再审被申请人|原审原告|原审被告)"
     )
     value = _role_prefix.sub("", value).strip()
-    
+
     # 剥离前导常见动词、介词、代词、语气词或连词（加盖、本案、系、然、由、为、费用由、关于等）
     _noise_prefix = re.compile(
         r"^(?:和|及|与|、|，|,|；|;|的|为|由|在|系|然|费用由|费用|加盖|本案|程中|导致|配合|协助|不服|认为|诉称|辩称|判决|裁定|关于|向|致|对|由其|将其|由该|将该|该|此|通知|请追加|身份系代表|去跟|见|返还给|支付给|返还|退还|偿还|遵循|根据|解(?=[\u4e00-\u9fa5]{2,4}(?:公司|集团|有限)))"
     )
-    
+
     # 循环剥离直到没有前导噪声词
     while True:
         prev_len = len(value)
         value = _noise_prefix.sub("", value).strip()
         if len(value) == prev_len:
             break
-            
+
+    # 与 clean_organization_text 对齐：剥离“到/原/设立的”等叙述前缀及“人名与机构”
+    value = _strip_org_narrative_prefixes(value)
     return value
 
 
@@ -479,15 +502,17 @@ def detect_standard_regex_candidates(text: str) -> list[Candidate]:
 
 
 def detect_regex_candidates(text: str, include_addresses: bool = False) -> list[Candidate]:
+    """Detect the narrow automatic identifier scope.
+
+    Phone numbers, PRC identity numbers, and case numbers are structurally
+    recognizable. Other patterns remain available for manual selection rather
+    than automatic redaction.
+    """
+    _ = include_addresses
     candidates: list[Candidate] = []
     candidates.extend(_sensitive_regex_candidates(text, PHONE_RE, "phone", "regex", 1.0, "手机号规则"))
     candidates.extend(_sensitive_regex_candidates(text, ID_RE, "id_number", "regex", 1.0, "身份证号规则"))
-    candidates.extend(_uscc_candidates(text))
-    candidates.extend(_bank_candidates(text))
-    candidates.extend(_regex_candidates(text, EMAIL_RE, "email", "regex", 1.0, "邮箱规则"))
     candidates.extend(_case_candidates(text, source="court_case_number_parser"))
-    if include_addresses:
-        candidates.extend(_address_candidates(text))
     return candidates
 
 
@@ -533,6 +558,16 @@ def detect_title_candidates(text: str) -> list[Candidate]:
 # 中文法律文书中常见的人名模式
 _FALLBACK_PERSON_PATTERNS = FALLBACK_PERSON_PATTERNS
 
+_MANUAL_LOCATION_SUFFIXES = ("街道", "镇", "乡", "村", "社区", "路", "街", "巷")
+
+
+def _inside_manual_location_context(text: str, start: int, end: int) -> bool:
+    """Do not infer a person from text that belongs to a manual-only location."""
+    window = text[max(0, start - 12) : min(len(text), end + 12)]
+    return any(suffix in window for suffix in _MANUAL_LOCATION_SUFFIXES)
+
+
+
 
 def detect_fallback_person_candidates(text: str) -> list[Candidate]:
     """兜底人名检测：扫描常见中文人名模式，不依赖当事人段格式。
@@ -547,7 +582,7 @@ def detect_fallback_person_candidates(text: str) -> list[Candidate]:
     for pattern in _FALLBACK_PERSON_PATTERNS:
         for match in pattern.finditer(text):
             raw_value = match.group(1).strip()
-            if not raw_value:
+            if _inside_manual_location_context(text, match.start(1), match.end(1)):
                 continue
             value = _clean_person_name(raw_value)
             if _is_false_person(value):

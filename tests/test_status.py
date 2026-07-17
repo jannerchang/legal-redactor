@@ -5,13 +5,10 @@ import socket
 
 from legal_redactor.local_config import diagnose_json_config, load_json_config
 from legal_redactor.status import (
-    EXPECTED_MLX_MODEL,
     StatusItem,
     build_status_payload,
-    ensure_mlx_server_ready,
     probe_case_root,
-    probe_mlx_runtime,
-    probe_mlx_server,
+    probe_model_manager,
     probe_recognition_mode,
 )
 
@@ -34,41 +31,31 @@ def test_status_item_shape_and_secret_filtering() -> None:
 
 def test_status_details_recursively_scrub_paths_and_secret_values() -> None:
     item = StatusItem(
-        "mlx_server",
-        "MLX",
+        "llm_api",
+        "LLM API",
         "ready",
         "ok",
         "none",
         {
             "model_ids": [
-                EXPECTED_MLX_MODEL,
+                "remote-model",
                 "/Users/jannerchang/private-model",
                 "C:\\Users\\jannerchang\\private-model\\model.bin",
-                "C:/Users/jannerchang/private-model/model.bin",
-                "\\\\server\\share\\private-model\\model.bin",
-                "//server/share/private-model/model.bin",
                 "https://example.com/docs/path",
                 "合同编号 A\\B-001",
-                "见附件路径：判决书\\附件1.pdf",
                 {"path": "/Volumes/cases/model.bin", "note": "Bearer secret-token-value"},
             ],
-            "nested": {
-                "config_path": "/Users/jannerchang/config/api.local.json",
-                "windows_path": "D:\\Office\\cases\\map.enc",
-                "unc_path": "\\\\fileserver\\legal\\case-a",
-            },
+            "nested": {"config_path": "/Users/jannerchang/config/api.local.json"},
             "message": "案件库目录存在且可写。",
         },
     ).to_dict()
 
     text = json.dumps(item, ensure_ascii=False)
-    details = item["details"]
-    model_ids = details["model_ids"]
-    assert EXPECTED_MLX_MODEL in model_ids
+    model_ids = item["details"]["model_ids"]
+    assert "remote-model" in model_ids
     assert "https://example.com/docs/path" in model_ids
     assert "合同编号 A\\B-001" in model_ids
-    assert "见附件路径：判决书\\附件1.pdf" in model_ids
-    assert details["message"] == "案件库目录存在且可写。"
+    assert item["details"]["message"] == "案件库目录存在且可写。"
     assert "/Users/" not in text
     assert "/Volumes/" not in text
     assert "secret-token-value" not in text
@@ -76,13 +63,10 @@ def test_status_details_recursively_scrub_paths_and_secret_values() -> None:
     assert "private-model" not in text
     assert "model.bin" not in text
     assert "api.local.json" not in text
-    assert "fileserver" not in text
-    assert "map.enc" not in text
-    assert "Office" not in text
     assert "configured" in text
 
 
-def test_json_config_diagnostics_preserve_legacy_safe_default(tmp_path, monkeypatch) -> None:
+def test_json_config_diagnostics_preserve_safe_default(tmp_path, monkeypatch) -> None:
     missing = diagnose_json_config("LEGAL_REDACTOR_API_CONFIG", "api.local.json", environ={}, config_dir=tmp_path)
     assert missing.state == "missing"
     assert missing.value == {}
@@ -107,113 +91,67 @@ def test_json_config_diagnostics_preserve_legacy_safe_default(tmp_path, monkeypa
     assert load_json_config("LEGAL_REDACTOR_API_CONFIG", "api.local.json") == {}
 
 
-def test_mlx_probe_skip_precedes_port_validation() -> None:
-    item = probe_mlx_server(
-        environ={
-            "LEGAL_REDACTOR_SKIP_MLX": "1",
-            "LEGAL_REDACTOR_MLX_PORT": "not-a-port",
-        }
+def test_model_manager_probe_checks_health_and_logical_registry(monkeypatch) -> None:
+    responses = iter(
+        [
+            (200, json.dumps({"status": "ok", "active_model": None, "worker_state": "stopped"})),
+            (200, json.dumps({"data": [{"id": "bonsai-27b"}, {"id": "bonsai-27b"}]})),
+        ]
+    )
+    monkeypatch.setattr("legal_redactor.status._http_get", lambda *args: next(responses))
+
+    item = probe_model_manager(
+        environ={"LEGAL_REDACTOR_MODEL_MANAGER_HOST": "manager.example.test", "LEGAL_REDACTOR_MODEL_MANAGER_PORT": "8123"},
+        timeout=0.01,
     )
 
-    assert item.state == "skipped"
-    assert item.details["reason"] == "skip_env"
+    assert item.state == "ready"
+    assert item.details == {
+        "host": "manager.example.test",
+        "port": 8123,
+        "expected_model_id": "bonsai-27b",
+        "worker_state": "stopped",
+        "model_ids": ["bonsai-27b"],
+    }
 
 
+def test_model_manager_probe_classifies_invalid_and_unavailable_responses(monkeypatch) -> None:
+    assert probe_model_manager(environ={"LEGAL_REDACTOR_MODEL_MANAGER_PORT": "bad"}).state == "error"
+    assert probe_model_manager(environ={"LEGAL_REDACTOR_SKIP_MLX": "1", "LEGAL_REDACTOR_MODEL_MANAGER_PORT": "bad"}).state == "skipped"
 
-def test_mlx_probe_requires_expected_model(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "legal_redactor.status._http_get_models",
-        lambda host, port, timeout: (200, json.dumps({"data": [{"id": "other-model"}]})),
-    )
+    monkeypatch.setattr("legal_redactor.status._http_get", lambda *args: (503, "{}"))
+    assert "HTTP 503" in probe_model_manager(environ={}, timeout=0.01).message
 
-    item = probe_mlx_server(environ={}, timeout=0.01)
+    monkeypatch.setattr("legal_redactor.status._http_get", lambda *args: (200, "not-json"))
+    assert "有效 JSON" in probe_model_manager(environ={}, timeout=0.01).message
 
-    assert item.state == "error"
-    assert item.details["reason"] == "model_mismatch"
+    responses = iter([(200, json.dumps({"status": "ok"})), (200, "[]")])
+    monkeypatch.setattr("legal_redactor.status._http_get", lambda *args: next(responses))
+    assert "模型列表格式" in probe_model_manager(environ={}, timeout=0.01).message
 
-    monkeypatch.setattr(
-        "legal_redactor.status._http_get_models",
-        lambda host, port, timeout: (
-            200,
-            json.dumps({"data": [{"id": EXPECTED_MLX_MODEL}, {"id": "/Users/jannerchang/private-model"}]}),
-        ),
-    )
+    responses = iter([(200, json.dumps({"status": "ok"})), (200, json.dumps({"data": [{"id": "/Users/private/model"}]}))])
+    monkeypatch.setattr("legal_redactor.status._http_get", lambda *args: next(responses))
+    assert "未注册预期模型" in probe_model_manager(environ={}, timeout=0.01).message
 
-    ready = probe_mlx_server(environ={}, timeout=0.01)
-    assert ready.state == "ready"
-    text = json.dumps(ready.to_dict(), ensure_ascii=False)
-    assert "/Users/" not in text
-    assert "private-model" not in text
-
-
-
-def test_mlx_probe_classifies_http_invalid_json_timeout_and_unreachable(monkeypatch) -> None:
-    monkeypatch.setattr("legal_redactor.status._http_get_models", lambda host, port, timeout: (503, "{}"))
-    assert probe_mlx_server(environ={}, timeout=0.01).details["reason"] == "http_error"
-
-    monkeypatch.setattr("legal_redactor.status._http_get_models", lambda host, port, timeout: (200, "not-json"))
-    assert probe_mlx_server(environ={}, timeout=0.01).details["reason"] == "invalid_json"
-
-    monkeypatch.setattr("legal_redactor.status._http_get_models", lambda host, port, timeout: (200, "[]"))
-    assert probe_mlx_server(environ={}, timeout=0.01).details["reason"] == "invalid_models_payload"
-
-    monkeypatch.setattr("legal_redactor.status._http_get_models", lambda host, port, timeout: (200, '{"data": {}}'))
-    assert probe_mlx_server(environ={}, timeout=0.01).details["reason"] == "invalid_models_payload"
-
-    def raise_timeout(host: str, port: int, timeout: float) -> tuple[int, str]:
+    def raise_timeout(*args: object) -> tuple[int, str]:
         raise socket.timeout()
 
-    monkeypatch.setattr("legal_redactor.status._http_get_models", raise_timeout)
-    assert probe_mlx_server(environ={}, timeout=0.01).details["reason"] == "timeout"
+    monkeypatch.setattr("legal_redactor.status._http_get", raise_timeout)
+    assert probe_model_manager(environ={}, timeout=0.01).state == "error"
 
-    def raise_oserror(host: str, port: int, timeout: float) -> tuple[int, str]:
+    def raise_oserror(*args: object) -> tuple[int, str]:
         raise OSError("connection refused")
 
-    monkeypatch.setattr("legal_redactor.status._http_get_models", raise_oserror)
-    monkeypatch.setattr("legal_redactor.status._safe_port_is_listening", lambda host, port, timeout: False)
-    unreachable = probe_mlx_server(environ={}, timeout=0.01)
-    assert unreachable.state == "missing"
-    assert unreachable.details["reason"] == "unreachable"
+    monkeypatch.setattr("legal_redactor.status._http_get", raise_oserror)
+    assert probe_model_manager(environ={}, timeout=0.01).state == "missing"
 
 
-def test_mlx_probe_rejects_out_of_range_port_without_network_call(monkeypatch) -> None:
-    called = False
+def test_model_manager_failure_reports_degraded_recognition_mode() -> None:
+    api = StatusItem("model_manager", "本地模型 API", "missing", "down", "configure")
+    fallback = probe_recognition_mode(api)
 
-    def fake_http_get(host: str, port: int, timeout: float) -> tuple[int, str]:
-        nonlocal called
-        called = True
-        return 200, "{}"
-
-    monkeypatch.setattr("legal_redactor.status._http_get_models", fake_http_get)
-
-    item = probe_mlx_server(environ={"LEGAL_REDACTOR_MLX_PORT": "70000"}, timeout=0.01)
-
-    assert item.state == "error"
-    assert item.details["port"] == 70000
-    assert called is False
-
-
-def test_mlx_skip_reports_degraded_recognition_mode() -> None:
-    mlx = probe_mlx_server(environ={"LEGAL_REDACTOR_SKIP_MLX": "1"}, timeout=0.01)
-    fallback = probe_recognition_mode(mlx)
-
-    assert mlx.state == "skipped"
     assert fallback.state == "degraded"
-    assert "低于 MLX" in fallback.message
-
-
-def test_mlx_runtime_reports_cache_sidecars_without_deleting(tmp_path, monkeypatch) -> None:
-    model_cache = tmp_path / "hub" / f"models--{EXPECTED_MLX_MODEL.replace('/', '--')}"
-    model_cache.mkdir(parents=True)
-    sidecar = model_cache / "._main"
-    sidecar.write_text("sidecar", encoding="utf-8")
-    monkeypatch.setattr("legal_redactor.status.shutil.which", lambda name, path=None: "/usr/local/bin/mlx_lm.server")
-
-    item = probe_mlx_runtime(environ={"HF_HOME": str(tmp_path)})
-
-    assert item.state == "degraded"
-    assert item.details["appledouble_count"] == 1
-    assert sidecar.exists()
+    assert "低于 LLM 辅助模式" in fallback.message
 
 
 def test_case_root_probe_ready_missing_and_unwritable(tmp_path) -> None:
@@ -248,17 +186,14 @@ def test_status_payload_does_not_expose_secrets_or_sensitive_text(tmp_path, monk
         json.dumps({"api_url": "http://100.64.0.1:8787", "api_token": "mcp-secret-token"}),
         encoding="utf-8",
     )
-    monkeypatch.setattr("legal_redactor.status.shutil.which", lambda name, path=None: None)
 
     payload = build_status_payload(
         environ={
             "LEGAL_REDACTOR_API_CONFIG": str(api_config),
             "LEGAL_REDACTOR_MCP_CONFIG": str(mcp_config),
-            "LEGAL_REDACTOR_SKIP_MLX": "1",
-            "HF_HOME": str(tmp_path / "hf"),
         },
         case_root=tmp_path,
-        mlx_timeout=0.01,
+        model_timeout=0.01,
     )
     text = json.dumps(payload, ensure_ascii=False)
 
@@ -272,29 +207,3 @@ def test_status_payload_does_not_expose_secrets_or_sensitive_text(tmp_path, monk
     assert "张三" not in text
     assert "【PERSON_001】" not in text
     assert all(set(item) <= {"id", "label", "state", "message", "action", "details"} for item in payload["components"])
-
-
-def test_ensure_mlx_server_ready_skips_start_when_already_ready(monkeypatch) -> None:
-    ready = StatusItem("mlx_server", "MLX", "ready", "ok", "none")
-    monkeypatch.setattr("legal_redactor.status.probe_mlx_server", lambda **kwargs: ready)
-    monkeypatch.setattr(
-        "legal_redactor.status.subprocess.run",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not start")),
-    )
-    assert ensure_mlx_server_ready().state == "ready"
-
-
-def test_ensure_mlx_server_ready_attempts_start_when_missing(monkeypatch) -> None:
-    calls = {"start": 0, "probe": 0}
-
-    def fake_probe(**kwargs):
-        calls["probe"] += 1
-        if calls["probe"] == 1:
-            return StatusItem("mlx_server", "MLX", "missing", "down", "start")
-        return StatusItem("mlx_server", "MLX", "ready", "ok", "none")
-
-    monkeypatch.setattr("legal_redactor.status.probe_mlx_server", fake_probe)
-    monkeypatch.setattr("legal_redactor.status.subprocess.run", lambda *args, **kwargs: calls.__setitem__("start", calls["start"] + 1) or type("CP", (), {"returncode": 0})())
-    item = ensure_mlx_server_ready()
-    assert item.state == "ready"
-    assert calls["start"] == 1

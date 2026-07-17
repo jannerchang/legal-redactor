@@ -15,7 +15,6 @@ from .config import HIGH_RISK_TYPES, PipelineConfig, RedactionProfile
 from .counters import TypeCounters
 from .detectors import (
     detect_standard_regex_candidates,
-    detect_heuristic_ner_candidates,
     remove_court_signatures,
 )
 from .admin_division import AdminDivisionDetector
@@ -136,9 +135,19 @@ def mask_hebei_text(text: str, get_loc_prefix=None) -> str:
 
 
 def _levels_allow_admin_overlap(level: str, used_level: str) -> bool:
-    direct_levels = {"province", "city", "county", "county_city", "township"}
-    return level in direct_levels and used_level in direct_levels
+    # A full database path supplies its component mappings itself. Same-level
+    # candidates may represent separate occurrences and therefore coexist.
+    return level == used_level and level in {"province", "city", "county", "county_city", "township"}
 
+
+def _admin_candidate_contains_used_spans(
+    candidate: Candidate,
+    spans: list[tuple[int, int, str]],
+) -> bool:
+    return any(
+        candidate.start <= used_start and candidate.end >= used_end and candidate.start != used_start
+        for used_start, used_end, _used_level in spans
+    )
 
 def _span_overlaps_admin(
     spans: list[tuple[int, int, str]],
@@ -155,6 +164,15 @@ def _span_overlaps_admin(
     return False
 
 
+
+_AUTOMATIC_ADMIN_LEVELS = frozenset({"province", "city", "county", "county_city"})
+
+
+def _automatic_admin_candidate(candidate: Candidate) -> bool:
+    """Keep automatic location redaction to province, city, district, and county."""
+    return candidate.type == "location" and str(candidate.metadata.get("level", "")) in _AUTOMATIC_ADMIN_LEVELS
+
+
 def _append_admin_detection(
     candidate: Candidate,
     *,
@@ -164,14 +182,14 @@ def _append_admin_detection(
     get_location_prefix,
     get_admin_prefix,
 ) -> None:
-    if candidate.type == "grassroots_org":
-        allowed = profile.redact_locations or profile.redact_organizations
-    else:
-        allowed = _candidate_allowed(candidate.type, profile)
-    if not allowed:
+    if not _automatic_admin_candidate(candidate):
+        return
+    if not _candidate_allowed(candidate.type, profile):
         return
     level = str(candidate.metadata.get("level", "") or "")
     if _span_overlaps_admin(admin_spans, candidate.start, candidate.end, level):
+        return
+    if _admin_candidate_contains_used_spans(candidate, admin_spans):
         return
     admin_spans.append((candidate.start, candidate.end, level))
     mappings.append(
@@ -304,7 +322,7 @@ def _as_project_candidate_if_needed(candidate: Candidate) -> Candidate:
     if candidate.type != "location":
         return candidate
     if candidate.text.endswith(("风电场", "项目", "工程", "小区", "花园", "公寓", "广场", "大厦", "产业园", "标段")):
-        return replace(candidate, type="project", reason=f"{candidate.reason}; HanLP 地名按项目后缀转为项目")
+        return replace(candidate, type="project", reason=f"{candidate.reason}; NER 地名按项目后缀转为项目")
     return candidate
 
 
@@ -451,7 +469,7 @@ def _linear_collect_admin_spans(pipeline, ctx) -> None:
             continue
         for candidate in sorted(
             detector.detect(ctx.scan_text),
-            key=lambda item: (item.start, -item.length),
+            key=lambda item: (item.start, item.length, item.end),
         ):
             before = len(ctx.mappings)
             _append_admin_detection(
@@ -467,12 +485,40 @@ def _linear_collect_admin_spans(pipeline, ctx) -> None:
 
 
 def _linear_collect_china_admin_candidates(pipeline, ctx) -> None:
-    if pipeline.config.enable_china_admin_rules:
-        for candidate in detect_china_admin_rule_candidates(ctx.scan_text):
-            level = str(candidate.metadata.get("level", "") or "")
-            if _span_overlaps_admin(ctx.admin_spans, candidate.start, candidate.end, level):
-                continue
-            ctx.admin_candidates.append(candidate)
+    if not (pipeline.config.enable_china_admin_rules and ctx.profile.redact_locations):
+        return
+    for candidate in detect_china_admin_rule_candidates(ctx.scan_text):
+        if not _automatic_admin_candidate(candidate):
+            continue
+        level = str(candidate.metadata.get("level", "") or "")
+        if _span_overlaps_admin(ctx.admin_spans, candidate.start, candidate.end, level):
+            continue
+        ctx.admin_candidates.append(candidate)
+
+
+_COURT_PERSONNEL_PREFIXES = (
+    "审判长",
+    "审判员",
+    "代理审判员",
+    "人民陪审员",
+    "法官助理",
+    "书记员",
+    "执行员",
+    "执行法官",
+)
+
+
+def _hanlp_candidate_allowed(candidate: Candidate, text: str) -> bool:
+    if candidate.type == "location":
+        return (
+            not candidate.text.startswith(("（", "("))
+            and candidate.text.endswith(("省", "市", "区", "县", "旗", "自治区", "特别行政区", "自治州"))
+        )
+    if candidate.type != "person":
+        return True
+    line_start = max(text.rfind("\n", 0, candidate.start) + 1, text.rfind("。", 0, candidate.start) + 1)
+    prefix = text[line_start:candidate.start].strip(" ：:")
+    return not prefix.endswith(_COURT_PERSONNEL_PREFIXES)
 
 
 def _linear_collect_hanlp_candidates(pipeline, ctx) -> None:
@@ -490,7 +536,7 @@ def _linear_collect_hanlp_candidates(pipeline, ctx) -> None:
             candidate = _as_project_candidate_if_needed(candidate)
             if not _candidate_allowed(candidate.type, ctx.profile):
                 continue
-            if candidate.type == "location" and candidate.text.startswith(("（", "(")):
+            if not _hanlp_candidate_allowed(candidate, ctx.scan_text):
                 continue
             if any(
                 not (candidate.end <= start or candidate.start >= end)
@@ -509,34 +555,19 @@ def _linear_run_sentence_extraction(pipeline, ctx, text):
     """
 
     def collect_heuristic_location_candidates() -> None:
-        if not (pipeline.config.enable_heuristic_ner and ctx.profile.redact_locations):
-            return
-        for candidate in detect_heuristic_ner_candidates(ctx.scan_text):
-            if candidate.type not in {"location", "grassroots_org"}:
-                continue
-            if any(
-                not (candidate.end <= start or candidate.start >= end)
-                for start, end, _level in ctx.admin_spans
-            ):
-                continue
-            if len(candidate.text) > 8 or any(
-                noise in candidate.text
-                for noise in (
-                    "银行", "保险", "公司", "集团", "法院", "检察院",
-                    "农业农村", "产业开发", "技术开发",
-                )
-            ):
-                continue
-            ctx.admin_candidates.append(candidate)
+        # Heuristic location guesses lack the administrative level evidence
+        # required for the narrow automatic scope. Users can add such text
+        # from the mapping-review selection UI when needed.
+        return
 
     ctx.sentence_extraction_mode = (
-        pipeline.config.enable_local_llm
-        and pipeline.config.local_llm.enabled
+        pipeline.config.enable_llm
+        and pipeline.config.llm.enabled
         and (
-            pipeline.config.local_llm.role == "sentence_entity_extraction"
+            pipeline.config.llm.role == "sentence_entity_extraction"
             or (
                 pipeline.config.semantic_llm_first
-                and pipeline.config.local_llm.mode == "max-effect"
+                and pipeline.config.llm.mode == "max-effect"
             )
         )
     )
@@ -555,14 +586,14 @@ def _linear_run_sentence_extraction(pipeline, ctx, text):
     if ctx.sentence_extraction_mode:
         from .llm import LegalEntityAuditor
 
-        auditor = LegalEntityAuditor(pipeline.config.local_llm)
+        auditor = LegalEntityAuditor(pipeline.config.llm)
         ctx.analysis = auditor.extract_sentence_entities(
             ctx.scan_text,
             enable_samples=False,
         )
         if ctx.analysis.get("error"):
             ctx.llm_extraction_failed = True
-            if not pipeline.config.local_llm.fail_open:
+            if not pipeline.config.llm.fail_open:
                 ctx.warnings.append(
                     f"整句 LLM 识别失败，已仅保留固定结构化正则脱敏：{ctx.analysis['error']}"
                 )
@@ -634,6 +665,11 @@ def _linear_run_engine(pipeline, ctx) -> None:
         profile=ctx.profile,
         get_location_prefix=ctx.get_location_prefix,
     )
+    engine.known_locations = {
+        mapping.original: mapping.masked
+        for mapping in ctx.mappings
+        if mapping.type == "location" and mapping.masked
+    }
     seed_candidates = [*ctx.admin_candidates, *ctx.hanlp_candidates]
 
     if ctx.sentence_extraction_success:
@@ -674,14 +710,14 @@ def _linear_run_engine(pipeline, ctx) -> None:
         ctx.review_candidates = deduped_review_candidates[:80]
 
         if (
-            pipeline.config.enable_local_llm
-            and pipeline.config.local_llm.enabled
+            pipeline.config.enable_llm
+            and pipeline.config.llm.enabled
             and ctx.review_candidates
             and not ctx.llm_extraction_failed
         ):
             from .llm import LegalEntityAuditor
 
-            auditor = LegalEntityAuditor(pipeline.config.local_llm)
+            auditor = LegalEntityAuditor(pipeline.config.llm)
             verify_list = [
                 {
                     "text": candidate.text,
@@ -862,9 +898,20 @@ class RedactionPipeline:
         all_mappings = []
         warnings = []
         prov_mapping = {}
+        shared_redaction_map = base_redaction_map
         for source_name, original_text in documents:
-            res = self.redact(original_text, source_file=source_name, prov_mapping=prov_mapping, base_redaction_map=base_redaction_map)
+            res = self.redact(
+                original_text,
+                source_file=source_name,
+                prov_mapping=prov_mapping,
+                base_redaction_map=shared_redaction_map,
+            )
             all_mappings.extend(res.redaction_map.mappings)
+            shared_redaction_map = RedactionMap.create(
+                mappings=all_mappings,
+                mode=profile.name,
+                source_file=None,
+            )
             if res.warnings:
                 warnings.extend(res.warnings)
                 

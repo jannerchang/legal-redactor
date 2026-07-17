@@ -12,6 +12,7 @@ import urllib.parse
 import urllib.request
 import base64
 import tempfile
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime
 from io import BytesIO
@@ -25,6 +26,7 @@ from .cases import (
     InvalidDiscordThreadError,
     InvalidWorkflowInputError,
     case_dir,
+    create_or_update_manifest,
     case_root_from_source_dir,
     case_workflow_public,
     case_workflow_state,
@@ -50,7 +52,7 @@ from .llm import is_noise_entity_text
 from .pipeline import RedactionPipeline
 from .postprocess import _filter_noise_entity_mappings
 from .restore import preview_restore, restore_docx
-from .status import build_status_payload, ensure_mlx_server_ready
+from .status import build_status_payload, probe_model_manager
 from .web_templates import (
     MAPPING_REVIEW_CATEGORY_LABELS,
     RESTORE_RISK_REASON_LABELS,
@@ -75,6 +77,8 @@ app = FastAPI(title="本地法律文书脱敏系统", version="0.1.2")
 class InputDocument:
     source_file: str
     text: str
+
+
 
 
 class DiscordApiError(RuntimeError):
@@ -126,29 +130,30 @@ def health() -> dict[str, str]:
 def api_status() -> dict:
     return _status_payload()
 
-
-@app.post("/api/ensure-mlx")
-def api_ensure_mlx() -> dict:
-    item = ensure_mlx_server_ready()
-    payload = item.to_dict()
-    payload["status"] = "ok" if item.state in {"ready", "skipped"} else "error"
-    return payload
+@app.get("/api/model-status")
+def api_model_status() -> dict[str, Any]:
+    return probe_model_manager().to_dict()
 
 
-
-
-def _pipeline_config_for_mlx_status(item, *, profile: str = "standard") -> tuple[PipelineConfig, list[str]]:
-    if item.state == "ready":
-        return PipelineConfig.from_llm_mode("max-effect", profile_name=profile), []
-    warning = f"MLX 未就绪，已降级为纯规则模式：{item.message}"
-    return PipelineConfig.offline_without_llm(profile), [warning]
+def _pipeline_config_for_model_status(
+    *,
+    profile: str = "standard",
+    llm_mode: str = "max-effect",
+) -> tuple[PipelineConfig, list[str]]:
+    status = probe_model_manager()
+    if status.state != "ready":
+        return PipelineConfig.offline_without_llm(profile), ["本地模型 API 未就绪，已降级为纯规则模式。"]
+    try:
+        return PipelineConfig.from_llm_mode(llm_mode, profile_name=profile), []
+    except ValueError:
+        return PipelineConfig.offline_without_llm(profile), ["本地模型 API 配置无效，已降级为纯规则模式。"]
 
 
 def _redaction_failure_body(exc: Exception, *, enable_hanlp: bool) -> str:
     if enable_hanlp:
-        suggestion = "建议：先取消勾选 HanLP，并确认 MLX 状态为就绪后重试。"
+        suggestion = "建议：先取消勾选 HanLP，并确认所选 API 模型仍可用后重试。"
     else:
-        suggestion = "建议：确认 MLX 状态为就绪后重试；当前未启用 HanLP，问题不在 HanLP 勾选项。"
+        suggestion = "建议：确认所选 API 模型仍可用后重试；当前未启用 HanLP，问题不在 HanLP 勾选项。"
     return f"<p>{html.escape(str(exc))}</p><p>{html.escape(suggestion)}</p>"
 
 
@@ -301,6 +306,26 @@ async def create_discord_thread(request: Request) -> JSONResponse:
             }
         )
     if manifest and manifest.hermes_request_id:
+        try:
+            recovered_thread_url = _find_discord_thread_for_case(case_folder, case_cause)
+            if recovered_thread_url:
+                manifest = create_or_update_manifest(
+                    case_root,
+                    case_folder,
+                    recovered_thread_url,
+                    source_dir=source_dir,
+                )
+                return JSONResponse(
+                    {
+                        "status": "bound",
+                        "workflow_state": "bound_thread",
+                        "thread_url": manifest.discord_thread_url,
+                        "thread_id": manifest.discord_thread_id,
+                        "message": "已从 Discord 找到 Hermes 创建的帖子并完成绑定",
+                    }
+                )
+        except (DiscordApiError, RuntimeError):
+            pass
         return JSONResponse(
             {
                 "status": "pending",
@@ -439,7 +464,6 @@ async def suggest_mapping_entry(request: Request) -> JSONResponse:
 def index() -> str:
     sample_info = ""
     status_panel = _render_status_panel(_status_payload())
-
     hanlp_attr = _hanlp_checked_attr()
     default_root_str = str(default_case_root())
     return render_home_page(status_panel, sample_info, hanlp_attr, default_root_str)
@@ -450,7 +474,7 @@ def _hanlp_checked_attr() -> str:
 
 
 def _status_payload() -> dict:
-    return build_status_payload(mlx_timeout=0.4)
+    return build_status_payload(model_timeout=0.4)
 
 
 _render_status_panel = render_status_panel
@@ -471,7 +495,6 @@ def _is_default_case_root_value(value: str) -> bool:
 async def analyze_page(
     text: str = Form(default=""),
     llm_mode: str = Form(default="max-effect"),
-    enable_llm: str | None = Form(default=None),
     file: UploadFile | None = File(default=None),
     files: list[UploadFile] = File(default=[]),
 ) -> str:
@@ -481,8 +504,7 @@ async def analyze_page(
         return _page("上传失败", str(exc))
 
     profile = "standard"
-    mlx_item = ensure_mlx_server_ready()
-    config, warnings = _pipeline_config_for_mlx_status(mlx_item, profile=profile)
+    config, warnings = _pipeline_config_for_model_status(profile=profile, llm_mode=llm_mode)
     pipeline = RedactionPipeline(config=config)
 
     # 执行语义审计（后台线程，避免阻塞 /health 等轻量请求）
@@ -495,7 +517,7 @@ async def analyze_page(
         analysis=analysis,
         original_documents=documents,
         profile=profile,
-        llm_mode="max-effect" if mlx_item.state == "ready" else "off"
+        llm_mode=llm_mode if config.enable_llm else "off",
     )
 
 def _render_audit_dashboard(
@@ -601,7 +623,6 @@ def _render_audit_dashboard(
         """
     )
 
-
 @app.post("/redact/confirmed", response_class=HTMLResponse)
 async def redact_confirmed_page(request: Request) -> str:
     """增量脱敏：每轮确认后立即替换，再用已脱敏文本做下一轮分析。
@@ -611,9 +632,9 @@ async def redact_confirmed_page(request: Request) -> str:
     """
     form = await request.form()
     bundle_json = form.get("bundle_json", "")
-    analysis_json = form.get("analysis_json", "")
+    analysis_json = form.get("analysis_json", "{}")
     profile = "standard"
-    llm_mode = "max-effect"
+    llm_mode = str(form.get("llm_mode", "max-effect"))
     round_num = int(form.get("round", "0"))
     previous_map_json = form.get("previous_map_json", "{}")
     previous_deselected_json = form.get("previous_deselected_json", "[]")
@@ -792,9 +813,8 @@ async def redact_confirmed_page(request: Request) -> str:
             warnings=[],
         )
 
-    # 对已脱敏文本做新一轮分析；MLX 未就绪时与 /redact 一样降级为纯规则
-    mlx_item = ensure_mlx_server_ready()
-    config, fallback_warnings = _pipeline_config_for_mlx_status(mlx_item, profile=profile)
+    # 对已脱敏文本做新一轮分析；API 不可用时与 /redact 一样降级为纯规则。
+    config, fallback_warnings = _pipeline_config_for_model_status(profile=profile, llm_mode=llm_mode)
     pipeline2 = RedactionPipeline(config=config)
     new_analysis = await asyncio.to_thread(pipeline2.analyze, redacted_text)
     new_analysis.setdefault("warnings", [])
@@ -825,7 +845,7 @@ async def redact_confirmed_page(request: Request) -> str:
             analysis=new_analysis,
             original_documents=[InputDocument(source_file="", text=redacted_text)],
             profile=profile,
-            llm_mode=llm_mode,
+            llm_mode=llm_mode if config.enable_llm else "off",
             round_num=round_num + 1,
             previous_map_json=current_map_json,
             previous_deselected_json=deselected_json,
@@ -849,7 +869,6 @@ async def redact_page(
     request: Request,
     text: str = Form(default=""),
     llm_mode: str = Form(default="max-effect"),
-    enable_llm: str | None = Form(default=None),
     enable_hanlp: str | None = Form(default=None),
     hanlp_model: str = Form(default=""),
     # enable_samples kept out of the form: samples never affect runtime redaction.
@@ -881,11 +900,8 @@ async def redact_page(
         except Exception as exc:
             return _page("已有映射表解析失败", f"解析错误: {exc}")
 
-    mlx_item = ensure_mlx_server_ready()
-    config, fallback_warnings = _pipeline_config_for_mlx_status(
-        mlx_item,
-        profile="standard",
-    )
+    config, fallback_warnings = _pipeline_config_for_model_status(profile="standard", llm_mode=llm_mode)
+    model_label = "Ternary Bonsai 27B（MLX 2-bit）" if config.enable_llm else "离线规则（本地模型 API 未就绪）"
     config = replace(
         config,
         enable_hanlp_ner=bool(enable_hanlp),
@@ -899,6 +915,7 @@ async def redact_page(
     effective_case_folder = case_folder.strip() or str(inferred_case_location.get("case_folder") or "")
     effective_case_root = manual_case_root or str(inferred_case_location.get("case_root") or "") or case_root.strip()
     effective_discord_thread_url = discord_thread_url.strip() or str(inferred_case_location.get("discord_thread_url") or "")
+    redaction_started = time.monotonic()
     try:
         if len(documents) > 1:
             result = await asyncio.to_thread(
@@ -918,6 +935,7 @@ async def redact_page(
             "脱敏失败",
             _redaction_failure_body(exc, enable_hanlp=bool(enable_hanlp)),
         )
+    duration_ms = max(0, round((time.monotonic() - redaction_started) * 1000))
     result = replace(result, redaction_map=_sanitize_redaction_map(result.redaction_map))
     warnings = [*fallback_warnings, *result.warnings]
     if len(documents) > 1:
@@ -948,6 +966,8 @@ async def redact_page(
             case_root=effective_case_root,
             case_folder=effective_case_folder,
             source_dir=inferred_source_dir,
+            model_label=model_label,
+            duration_ms=duration_ms,
         )
     redacted_doc = RedactedDocument(
         source_file=documents[0].source_file,
@@ -983,6 +1003,8 @@ async def redact_page(
         case_root=effective_case_root,
         case_folder=effective_case_folder,
         source_dir=inferred_source_dir,
+        model_label=model_label,
+        duration_ms=duration_ms,
     )
 
 
@@ -1362,6 +1384,7 @@ async def save_sample_page(request: Request) -> str:
     form = await request.form()
     map_type = form.getlist("map_type")
     map_original = form.getlist("map_original")
+    map_original_before = form.getlist("map_original_before")
     map_masked = form.getlist("map_masked")
     map_reason = form.getlist("map_reason")
     row_delete = form.getlist("row_delete")
@@ -1379,21 +1402,17 @@ async def save_sample_page(request: Request) -> str:
     original_index = {e.get("original", ""): e for e in original_mappings}
 
     deleted = set(str(r) for r in row_delete)
-    edited_index: dict[str, str] = {}
-    edited_types: dict[str, str] = {}
-    edited_reasons: dict[str, str] = {}
-    for i in range(max(len(map_original), len(map_masked))):
+    edited_index: dict[str, tuple[str, str, str, str]] = {}
+    for i in range(max(len(map_original), len(map_masked), len(map_original_before))):
         if str(i) in deleted:
             continue
         orig = (map_original[i] if i < len(map_original) else "").strip()
+        original_before = (map_original_before[i] if i < len(map_original_before) else "").strip()
         masked = (map_masked[i] if i < len(map_masked) else "").strip()
         t = (map_type[i] if i < len(map_type) else "other").strip()
         reason = (map_reason[i] if i < len(map_reason) else "").strip()
         if orig and masked:
-            edited_index[orig] = masked
-            edited_types[orig] = t
-            if reason:
-                edited_reasons[orig] = reason
+            edited_index[orig] = (original_before, masked, t, reason)
 
     entries: list[dict] = []
     processed: set[str] = set()
@@ -1421,16 +1440,23 @@ async def save_sample_page(request: Request) -> str:
                     processed.add(orig)
         except (ValueError, IndexError):
             continue
-    for orig, masked in edited_index.items():
+    for orig, (original_before, masked, t, reason) in edited_index.items():
         if orig in processed:
             continue
         processed.add(orig)
-        t = edited_types.get(orig, "other")
-        reason = edited_reasons.get(orig, "")
-        if orig in original_index:
-            old_masked = original_index[orig].get("masked", "")
-            if masked != old_masked:
-                entry = {"action": "modify", "type": t, "old_original": orig, "new_original": orig, "old_masked": old_masked, "new_masked": masked}
+        baseline_original = original_before or orig
+        original_entry = original_index.get(baseline_original)
+        if original_entry is not None:
+            old_masked = str(original_entry.get("masked", ""))
+            if orig != baseline_original or masked != old_masked:
+                entry = {
+                    "action": "modify",
+                    "type": t,
+                    "old_original": baseline_original,
+                    "new_original": orig,
+                    "old_masked": old_masked,
+                    "new_masked": masked,
+                }
                 if reason:
                     entry["reason"] = reason
                 entries.append(entry)
@@ -1558,22 +1584,27 @@ def edit_samples_page() -> str:
             entries = data.get("entries", [])
         except (json.JSONDecodeError, KeyError):
             pass
-
     rows = ""
     for i, e in enumerate(entries):
         action = e.get("action", "?")
+        original_before = e.get("old_original", "")
         orig = e.get("original") or e.get("new_original", "")
         masked = e.get("masked") or e.get("new_masked", "")
-        old = e.get("old_original", "")
+        old_masked = e.get("old_masked", "")
         reason = e.get("reason", "")
         action_label = {"keep": "保留", "delete": "黑名单", "add": "新增", "modify": "修改"}.get(action, action)
         row_class = "style='opacity:.6'" if action == "delete" else ""
         row_diagnose = _diagnose_sample_entry(e)
+        prior_mapping = (
+            f"原文：{html.escape(original_before)}<br>掩码：{html.escape(old_masked)}"
+            if action == "modify"
+            else ""
+        )
         rows += f"""<tr {row_class}>
           <td><span class="tag tag-{action}">{action_label}</span></td>
           <td><input name="orig_{i}" value="{html.escape(orig)}" style="width:180px"></td>
           <td><input name="masked_{i}" value="{html.escape(masked)}" style="width:140px"></td>
-          <td style="font-size:11px;color:var(--muted)">{html.escape(old)}</td>
+          <td style="font-size:11px;color:var(--muted)">{prior_mapping}</td>
           <td><textarea name="reason_{i}" rows="2" style="width:220px" placeholder="为什么删除/修改/添加">{html.escape(reason)}</textarea></td>
           <td style="font-size:12px;color:var(--ink);max-width:320px;word-break:break-all">{row_diagnose}</td>
           <td>
@@ -1610,7 +1641,7 @@ def edit_samples_page() -> str:
             <a href="/samples/compact" class="btn btn-secondary" style="margin-left:8px;">整理去重</a>
           </p>
           <table>
-            <thead><tr><th>类型</th><th>原文</th><th>替换为</th><th>旧值</th><th>修改理由</th><th>诊断与优化分析</th><th>操作</th></tr></thead>
+            <thead><tr><th>类型</th><th>现原文</th><th>现替换为</th><th>修改前映射</th><th>修改理由</th><th>诊断与优化分析</th><th>操作</th></tr></thead>
             <tbody>{rows}</tbody>
           </table>
         </section>
@@ -1908,6 +1939,8 @@ def _render_redaction_result(
     case_root: str = "",
     case_folder: str = "",
     source_dir: str = "",
+    model_label: str = "",
+    duration_ms: int | None = None,
 ) -> str:
     default_dir = save_dir.strip() or os.path.expanduser("~/Desktop")
     map_json = redaction_map_to_json(redaction_map)
@@ -1996,6 +2029,8 @@ def _render_redaction_result(
         redaction_map=redaction_map,
         mapping_edit_rows=mapping_edit_rows,
         review_html=review_html,
+        model_label=model_label,
+        duration_ms=duration_ms,
     )
 
 
@@ -2011,6 +2046,8 @@ def _render_batch_redaction_result(
     case_root: str = "",
     case_folder: str = "",
     source_dir: str = "",
+    model_label: str = "",
+    duration_ms: int | None = None,
 ) -> str:
     default_dir = save_dir.strip() or os.path.expanduser("~/Desktop")
 
@@ -2109,6 +2146,8 @@ def _render_batch_redaction_result(
         source_dir=source_dir,
         redaction_map=redaction_map,
         mapping_edit_rows=mapping_edit_rows,
+        model_label=model_label,
+        duration_ms=duration_ms,
     )
 
 
@@ -2421,6 +2460,66 @@ def _clean_case_cause(case_cause: str) -> str:
     return value[:80]
 
 
+def _find_discord_thread_for_case(case_folder: str, case_cause: str = "") -> str:
+    config = load_json_config("LEGAL_REDACTOR_API_CONFIG", "api.local.json")
+    token = _discord_bot_token(config)
+    channel_id = _discord_command_channel_id()
+    guild_id = str(
+        os.environ.get("LEGAL_REDACTOR_DISCORD_GUILD_ID")
+        or config_value(config, "discord_guild_id")
+        or ""
+    ).strip()
+    if not guild_id:
+        channel = _get_discord_json(f"/channels/{channel_id}", token)
+        guild_id = str(channel.get("guild_id", "")).strip()
+    if not guild_id:
+        raise DiscordApiError("Discord 指令频道缺少服务器 id")
+
+    payload = _get_discord_json(f"/guilds/{guild_id}/threads/active", token)
+    threads = payload.get("threads", []) if isinstance(payload, dict) else []
+    expected_title = _case_creation_title(case_folder, case_cause)
+    year_number = re.match(r"^（(\d{4})）(\d{1,8})", expected_title)
+    case_tokens = [expected_title]
+    if year_number:
+        year, number = year_number.groups()
+        case_tokens.extend((f"（{year}）{number}号", f"{year} {number}"))
+    matches = []
+    for thread in threads if isinstance(threads, list) else []:
+        if not isinstance(thread, dict):
+            continue
+        name = str(thread.get("name", ""))
+        if any(token and token in name for token in case_tokens):
+            thread_id = str(thread.get("id", "")).strip()
+            if thread_id:
+                matches.append(thread_id)
+    if len(matches) != 1:
+        return ""
+    return f"https://discord.com/channels/{guild_id}/{matches[0]}"
+
+
+def _get_discord_json(path: str, token: str) -> dict:
+    request = urllib.request.Request(
+        f"https://discord.com/api/v10{path}",
+        headers={
+            "Authorization": f"Bot {token}",
+            "User-Agent": "legal-redactor/0.1",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        exc.read()
+        raise DiscordApiError(f"Discord 帖子查询失败: HTTP {exc.code}") from exc
+    except OSError as exc:
+        raise DiscordApiError("Discord 帖子查询失败: 网络不可达") from exc
+    if not isinstance(data, dict):
+        raise DiscordApiError("Discord 帖子查询返回格式错误")
+    return data
+
+
+
+
 def _contains_local_path_text(value: str) -> bool:
     return bool(
         re.search(r"(^|\s)(~?/|/Users/|/Volumes/|/private/|/var/folders/|[A-Za-z]:[\\/]|\\\\)", value)
@@ -2640,7 +2739,9 @@ def _render_mapping_edit_row(index: int, entry: MappingEntry, review_candidate_t
     return f"""
         <tr data-map-row="{index}" data-categories="{category_attr}">
           <td><input name="map_type" value="{html.escape(entry.type)}"></td>
-          <td><textarea name="map_original" rows="2">{html.escape(entry.original)}</textarea></td>
+          <td><textarea name="map_original" rows="2">{html.escape(entry.original)}</textarea>
+            <input type="hidden" name="map_original_before" value="{html.escape(entry.original)}">
+          </td>
           <td><textarea name="map_masked" rows="2">{html.escape(entry.masked)}</textarea></td>
           <td><textarea name="map_reason" rows="2" placeholder="为什么删除/修改/添加">{html.escape(reason)}</textarea></td>
           <td>{html.escape(entry.source)}</td>
@@ -2660,7 +2761,9 @@ def _render_blank_mapping_row(index: int) -> str:
     return f"""
         <tr data-map-row="{index}" data-categories="">
           <td><input name="map_type" value="manual" placeholder="person/org"></td>
-          <td><textarea name="map_original" rows="2" placeholder="新增要替换的原文"></textarea></td>
+          <td><textarea name="map_original" rows="2" placeholder="新增要替换的原文"></textarea>
+            <input type="hidden" name="map_original_before" value="">
+          </td>
           <td><textarea name="map_masked" rows="2" placeholder="替换为"></textarea></td>
           <td><textarea name="map_reason" rows="2" placeholder="为什么新增这条"></textarea></td>
           <td>manual</td>

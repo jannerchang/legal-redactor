@@ -65,10 +65,6 @@ class CandidateCollector:
             candidates.extend(self._llm_candidates(context.text, context.llm_analysis))
             return CandidateCollectionResult(candidates=self._deduplicate_candidates(candidates))
 
-        has_local_org_ner = any(
-            candidate.type == "organization" and candidate.source.startswith("hanlp_ner")
-            for candidate in candidates
-        )
         candidates.extend(detect_title_candidates(context.text))
         candidates.extend(detect_inline_party_person_list_candidates(context.text))
         party_candidates: list[Candidate] = []
@@ -84,8 +80,7 @@ class CandidateCollector:
                         offset,
                     )
                 )
-                if not has_local_org_ner:
-                    local_orgs.extend(self._organization_candidates(segment, offset))
+                local_orgs.extend(self._organization_candidates(segment, offset))
         candidates.extend(party_candidates)
 
         if context.use_semantic_rules:
@@ -168,9 +163,6 @@ class CandidateCollector:
             for item in windows
             if isinstance(item, dict) and isinstance(item.get("id"), str)
         } if isinstance(windows, list) else {}
-        for item in analysis.get("locations", []):
-            for value in self._entity_values(item, "full", "name", "text"):
-                self._append_exact_candidate(candidates, text, value, "location", item, window_by_id)
         for item in analysis.get("persons", []):
             for value in self._entity_values(item, "name", "text"):
                 self._append_exact_candidate(candidates, text, value, "person", item, window_by_id)
@@ -181,9 +173,6 @@ class CandidateCollector:
             if isinstance(variants, list):
                 for value in variants:
                     self._append_exact_candidate(candidates, text, value, "organization", item, window_by_id)
-        for item in analysis.get("projects", []):
-            for value in self._entity_values(item, "name", "full", "text"):
-                self._append_exact_candidate(candidates, text, value, "project", item, window_by_id)
         return candidates
 
     @staticmethod

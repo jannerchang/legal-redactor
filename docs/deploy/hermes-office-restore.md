@@ -12,18 +12,39 @@ mkdir -p ~/.config/legal-redactor
 cp config/api.example.json ~/.config/legal-redactor/api.local.json
 ```
 
-Start the restore API on localhost for smoke tests:
+Start the restore API on localhost. Keep the API off public and private network
+interfaces; the Home Mac reaches it through an SSH reverse tunnel:
 
 ```bash
 LEGAL_REDACTOR_API_CONFIG=~/.config/legal-redactor/api.local.json \
   .venv/bin/python -m uvicorn legal_redactor.remote_api:app --host 127.0.0.1 --port 8787
 ```
 
-For Home Mac access, bind only to a private interface such as a Tailscale IP:
+Run the tunnel from the Office Mac to the Home Mac using a Tailscale MagicDNS
+hostname (or an SSH alias backed by that hostname), not a numeric Tailscale IP:
 
 ```bash
-.venv/bin/python -m uvicorn legal_redactor.remote_api:app --host 100.x.y.z --port 8787
+ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 -R 127.0.0.1:18787:127.0.0.1:8787 home-mac-mini
 ```
+
+Configure the Home Mac MCP adapter to call `http://127.0.0.1:18787`. Tailscale
+IP changes then affect neither the API bind address nor the MCP URL; MagicDNS
+resolves the SSH peer's current address.
+
+If Shadowrocket or the Tailscale route changes, do not replace the Home Mac
+MCP URL with a newly observed numeric Tailscale IP. Keep the Home Mac config at
+`http://127.0.0.1:18787`, restart the SSH reverse tunnel from the Office Mac,
+and verify on the Home Mac:
+
+```bash
+curl http://127.0.0.1:18787/health
+```
+
+After the health check returns `{"status":"ok"}`, reload or restart the
+`legal-redactor` MCP session in Hermes and retry the same restore request with
+the unchanged draft. An `office_unreachable` result is retryable; it must not
+trigger manual replacement of the final draft.
 
 Do not expose this API through a public port. The API requires:
 
@@ -82,25 +103,26 @@ The mapping table is not uploaded to Discord.
 
 ## Readiness Status
 
-The Web UI exposes a read-only status panel on the first screen and a machine
-endpoint:
+The Web UI exposes a read-only status panel and machine endpoints:
 
 ```bash
 curl http://127.0.0.1:7860/health
 curl http://127.0.0.1:7860/api/status
+curl http://127.0.0.1:7860/api/model-status
+curl http://127.0.0.1:18080/health
 curl http://127.0.0.1:18080/v1/models
 ```
 
-`/health` stays a lightweight liveness check. `/api/status` reports readiness
-for the existing local workflow:
+`/health` remains a lightweight Web liveness check. `/api/status` passively reports
+readiness for the local workflow, and `/api/model-status` returns only the model
+manager component state:
 
 - Web/API local config: `LEGAL_REDACTOR_API_CONFIG`, default
   `~/.config/legal-redactor/api.local.json`
-- MLX server: `LEGAL_REDACTOR_MLX_HOST`, `LEGAL_REDACTOR_MLX_PORT`,
-  `LEGAL_REDACTOR_SKIP_MLX`, expected model
-  `mlx-community/Qwen3.5-9B-MLX-4bit`
-- MLX cache/runtime: `HF_HOME`, `HF_HUB_DISABLE_XET`, `COPYFILE_DISABLE`,
-  `mlx_lm.server`, and macOS `._*` AppleDouble sidecar warnings
+- Local model API: `LEGAL_REDACTOR_MODEL_MANAGER_HOST` / `PORT`, default
+  `http://127.0.0.1:18080`; the registered logical model ID is `bonsai-27b`
+- MLX worker: `LEGAL_REDACTOR_MLX_WORKER_HOST` / `PORT`, default
+  `127.0.0.1:18081`, owned and started lazily by the manager only
 - Case root: `LEGAL_REDACTOR_CASE_ROOT` or the default local case root
 - Office restore API token presence: `LEGAL_REDACTOR_API_TOKEN` or
   `api_token` in `api.local.json`
@@ -110,11 +132,12 @@ for the existing local workflow:
   `LEGAL_REDACTOR_DISCORD_BOT_TOKEN` and
   `LEGAL_REDACTOR_DISCORD_COMMAND_CHANNEL_ID`
 
-The status endpoint is passive. It does not start MLX, kill port listeners,
-clean cache files, call MCP tools, send Discord messages, or write case files.
-If MLX is skipped or unavailable, the status should show degraded recognition
-support rather than presenting pure-rule mode as equivalent to MLX-assisted
-recognition.
+The status endpoints are passive. They do not start, stop, or modify the model
+manager or worker, call MCP tools, send Discord messages, or write case files.
+If the manager or its registered model is unavailable, redaction explicitly falls
+back to rules rather than treating that result as LLM-assisted recognition. Public
+status and manager responses expose logical IDs only, never model paths, tokens,
+document text, mappings, samples, or restored full text.
 
 ## Home Mac MCP Adapter
 
@@ -137,8 +160,8 @@ Configure Hermes to start the local MCP adapter:
 }
 ```
 
-Create the local MCP config from the example and fill in the Office Mac private
-API URL and token:
+Create the local MCP config from the example. It defaults to the Home Mac's
+local reverse-tunnel endpoint; fill in the matching Office API token:
 
 ```bash
 mkdir -p ~/.config/legal-redactor
@@ -151,9 +174,9 @@ Available tools:
 - `get_case_status_by_thread(discord_thread_id)`
 - `bind_discord_thread_to_case(case_folder, discord_thread_url, source_dir, case_root)`
 
-Hermes should pass the current Discord thread id and the drafted judgment text.
-The Office Mac resolves the thread id to a local case manifest, loads the local
-mapping table, restores the draft, and saves the restored text under `restored/`.
+Hermes should pass the current collaboration thread id and an authorized legal-document
+draft. The local workstation resolves the thread id to a matter manifest, loads the local
+mapping table, restores the draft, and saves the text under `restored/` for lawyer review.
 For binding, Hermes should pass `source_dir` when it knows the uploaded/source
 document directory. The Office API uses that directory before the configured
 case root, so empty shell manifests under an old configured root do not hide the
@@ -196,9 +219,9 @@ raw HTTP response bodies.
 
 ## Safety Rules
 
-- Mapping tables stay on the Office Mac.
-- Original materials stay on the Office Mac.
-- Restored judgments are saved on the Office Mac by default.
+- Mapping tables stay on the local workstation.
+- Original materials stay on the local workstation.
+- Restored legal-document drafts are saved on the local workstation by default for lawyer review.
 - API logs and responses must not include original text, restored text, or
   mapping values.
 - API/MCP responses return `unresolved_placeholder_count`, not placeholder

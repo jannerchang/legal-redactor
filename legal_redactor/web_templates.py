@@ -128,6 +128,13 @@ def _page(title: str, body: str) -> str:
         @keyframes redact-progress-slide{{0%{{transform:translateX(-120%)}}100%{{transform:translateX(320%)}}}}
         .redact-progress-text{{font-size:13px;color:var(--ink);white-space:nowrap}}
         .redact-elapsed{{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}}
+        .upload-file-list{{margin:10px 0 14px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg);padding:10px 12px}}
+        .upload-file-list[hidden]{{display:none}}
+        .upload-file-list-head{{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;font-size:12px;color:var(--muted)}}
+        .upload-file-list-items{{display:flex;flex-direction:column;gap:4px;max-height:180px;overflow:auto}}
+        .upload-file-item{{display:flex;align-items:flex-start;gap:8px;margin:0;font-size:12px;color:var(--ink);font-weight:400;cursor:pointer}}
+        .upload-file-item input{{width:auto;margin:2px 0 0;flex:0 0 auto}}
+        .upload-file-item span{{min-width:0;overflow-wrap:anywhere}}
         .btn:disabled{{opacity:.72;cursor:wait}}
         @media(max-width:768px){{body{{padding:14px}}section{{padding:18px}}.grid{{grid-template-columns:1fr}}}}
       </style>
@@ -181,6 +188,7 @@ def _page(title: str, body: str) -> str:
       (function(){{
         var form=document.getElementById('redact-form');
         if(!form)return;
+        var uploadSelection={{source:null,items:[]}};
         var stages=[
           {{sec:0,msg:'上传并读取文书…'}},
           {{sec:6,msg:'LLM 语义识别中…'}},
@@ -197,6 +205,163 @@ def _page(title: str, body: str) -> str:
           for(var i=stages.length-1;i>=0;i--){{if(sec>=stages[i].sec){{msg=stages[i].msg;break;}}}}
           return msg;
         }}
+        function uploadSuffix(name){{var i=String(name||'').lastIndexOf('.');return i>=0?String(name).slice(i).toLowerCase():'.txt';}}
+        function isSupportedUpload(name){{return ['.txt','.md','.doc','.docx','.pdf'].indexOf(uploadSuffix(name))>=0&&String(name||'').split('/').pop().indexOf('._')!==0;}}
+        function fileList(input){{return Array.prototype.slice.call((input&&input.files)||[]);}}
+        function selectedUploadItems(){{return uploadSelection.items.filter(function(item){{return item&&item.checked&&item.file;}});}}
+        function syncRelativePaths(){{
+          var relativeInput=document.getElementById('upload-relative-paths-input');
+          if(!relativeInput)return;
+          if(uploadSelection.source!=='directory'){{
+            relativeInput.value='';
+            return;
+          }}
+          var paths=selectedUploadItems().map(function(item){{return item.path||item.name||'';}}).filter(Boolean);
+          relativeInput.value=JSON.stringify(paths);
+        }}
+        function updateUploadSummary(){{
+          var summary=document.getElementById('upload-file-list-summary');
+          if(!summary)return;
+          var total=uploadSelection.items.length;
+          var checked=selectedUploadItems().length;
+          summary.textContent=total?'已选 '+checked+' / '+total+' 个支持文件':'已选 0 个支持文件';
+        }}
+        function renderUploadFileList(){{
+          var list=document.getElementById('upload-file-list');
+          var itemsEl=document.getElementById('upload-file-list-items');
+          if(!list||!itemsEl)return;
+          itemsEl.innerHTML='';
+          if(!uploadSelection.items.length){{
+            list.hidden=true;
+            updateUploadSummary();
+            syncRelativePaths();
+            return;
+          }}
+          list.hidden=false;
+          uploadSelection.items.forEach(function(item,idx){{
+            var row=document.createElement('label');
+            row.className='upload-file-item';
+            var cb=document.createElement('input');
+            cb.type='checkbox';
+            cb.className='upload-file-check';
+            cb.dataset.index=String(idx);
+            cb.checked=!!item.checked;
+            cb.addEventListener('change',function(){{
+              uploadSelection.items[idx].checked=!!cb.checked;
+              updateUploadSummary();
+              syncRelativePaths();
+            }});
+            var span=document.createElement('span');
+            span.textContent=item.path||item.name||('文件 '+(idx+1));
+            row.appendChild(cb);
+            row.appendChild(span);
+            itemsEl.appendChild(row);
+          }});
+          updateUploadSummary();
+          syncRelativePaths();
+        }}
+        function clearOtherUploadSource(isDirectory){{
+          if(isDirectory){{
+            var plainInput=document.getElementById('source-files');
+            if(plainInput)plainInput.value='';
+          }}else{{
+            var dirInput=document.getElementById('source-directory-files');
+            if(dirInput)dirInput.value='';
+          }}
+        }}
+        function buildRedactFormData(formEl){{
+          syncRelativePaths();
+          var fd=new FormData();
+          Array.prototype.forEach.call(formEl.elements,function(el){{
+            if(!el||!el.name||el.disabled)return;
+            if(el.classList&&el.classList.contains('upload-file-check'))return;
+            if(el.type==='file'){{
+              if(el.id==='source-files'||el.id==='source-directory-files')return;
+              Array.prototype.forEach.call(el.files||[],function(file){{fd.append(el.name,file,file.name);}});
+              return;
+            }}
+            if((el.type==='checkbox'||el.type==='radio')&&!el.checked)return;
+            if(el.tagName==='SELECT'&&el.multiple){{
+              Array.prototype.forEach.call(el.selectedOptions||[],function(opt){{fd.append(el.name,opt.value);}});
+              return;
+            }}
+            fd.append(el.name,el.value);
+          }});
+          var fieldName=uploadSelection.source==='directory'?'case_folder_files':'files';
+          selectedUploadItems().forEach(function(item){{
+            fd.append(fieldName,item.file,item.file.name||item.name||'document.txt');
+          }});
+          return fd;
+        }}
+        async function suggestCaseFromSelection(isDirectory){{
+          var selected=selectedUploadItems();
+          var paths=selected.map(function(item){{return item.path||item.name||'';}}).filter(Boolean);
+          var names=selected.map(function(item){{return item.name||'';}}).filter(Boolean);
+          if(!names.length)return;
+          try{{
+            var currentSourceDir=(document.getElementById('upload-source-dir-input')||{{value:''}}).value||'';
+            var currentThread=(document.getElementById('discord-thread-url-input')||{{value:''}}).value||'';
+            var rootInput=document.getElementById('case-root-input');
+            var rootAuto=rootInput?(rootInput.dataset.autoValue||''):'';
+            var rootValue=rootInput?(rootInput.value||''):'';
+            var currentRoot=shouldApplyAutoPrefill(rootValue,rootAuto)?'':rootValue;
+            var resp=await fetch('/api/suggest-case-location',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{filenames:names,relative_paths:isDirectory?paths:[],source_dir:currentSourceDir,discord_thread_url:currentThread,case_root:currentRoot}})}});
+            var data=await resp.json();
+            if(data.status==='ok'){{
+              var root=document.getElementById('case-root-input');
+              var folder=document.getElementById('case-folder-input');
+              var sourceDir=document.getElementById('upload-source-dir-input');
+              var discordUrl=document.getElementById('discord-thread-url-input');
+              if(root){{
+                if(shouldApplyAutoPrefill(root.value||'',root.dataset.autoValue||'')){{
+                  root.value=data.case_root||'';
+                  root.dataset.autoValue=data.case_root||'';
+                }}
+              }}
+              if(folder){{
+                if(shouldApplyAutoPrefill(folder.value||'',folder.dataset.autoValue||'')){{
+                  folder.value=data.case_folder||'';
+                  folder.dataset.autoValue=data.case_folder||'';
+                }}
+              }}
+              if(sourceDir&&data.matched_dir)sourceDir.value=data.matched_dir||'';
+              if(discordUrl&&!discordUrl.value.trim()&&data.discord_thread_url)discordUrl.value=data.discord_thread_url;
+              toast(data.discord_thread_url?'已识别案件目录和 Discord 链接: '+data.case_folder:'已识别案件目录: '+data.case_folder);
+            }}else if(data.status==='conflict'){{
+              toast(data.conflict_message||'案件目录或 Discord 链接存在冲突，请手动确认','warn');
+            }}else if(data.status==='ambiguous'){{
+              toast('匹配到多个案件目录，请手动填写案件文件夹名和根目录','warn');
+            }}else if(data.status==='not_found'){{
+              toast('未能自动识别案件目录，请手动填写','warn');
+            }}
+          }}catch(err){{
+            console.debug(err);
+            toast('案件目录自动识别失败','warn');
+          }}
+        }}
+        function setUploadFromInput(input,isDirectory){{
+          var all=fileList(input);
+          var supported=all.filter(function(f){{
+            var path=f.webkitRelativePath||f.name||'';
+            return path&&isSupportedUpload(path);
+          }});
+          clearOtherUploadSource(isDirectory);
+          uploadSelection.source=supported.length?(isDirectory?'directory':'files'):null;
+          uploadSelection.items=supported.map(function(f){{
+            return {{
+              file:f,
+              name:f.name||'',
+              path:f.webkitRelativePath||f.name||'',
+              checked:true
+            }};
+          }});
+          renderUploadFileList();
+          if(!supported.length){{
+            if(isDirectory&&all.length)toast('案件文件夹中没有可处理的 txt/md/doc/docx/pdf 文书','warn');
+            return;
+          }}
+          suggestCaseFromSelection(isDirectory);
+        }}
         form.addEventListener('submit',function(e){{
           e.preventDefault();
           var btn=document.getElementById('redact-submit-btn');
@@ -204,6 +369,12 @@ def _page(title: str, body: str) -> str:
           var text=document.getElementById('redact-progress-text');
           var elapsed=document.getElementById('redact-elapsed');
           if(!btn||btn.disabled)return;
+          var textArea=document.getElementById('text-input');
+          var hasText=!!(textArea&&String(textArea.value||'').trim());
+          if(!hasText&&!selectedUploadItems().length){{
+            toast('请先粘贴文本或勾选要上传的文件','warn');
+            return;
+          }}
           btn.disabled=true;
           btn.textContent='脱敏中…';
           if(prog)prog.hidden=false;
@@ -214,7 +385,7 @@ def _page(title: str, body: str) -> str:
             if(text)text.textContent=stageMessage(sec);
           }},500);
           function runRedact(){{
-            fetch('/redact',{{method:'POST',body:new FormData(form)}})
+            fetch('/redact',{{method:'POST',body:buildRedactFormData(form)}})
             .then(function(resp){{return resp.text().then(function(body){{return {{ok:resp.ok,body:body}};}});}})
             .then(function(res){{
               clearInterval(tick);
@@ -231,93 +402,22 @@ def _page(title: str, body: str) -> str:
               toast('脱敏失败：'+(err&&err.message?err.message:'网络中断'),'warn');
             }});
           }}
-          if(text)text.textContent='检查 MLX 本地模型…';
-          fetch('/api/ensure-mlx',{{method:'POST'}})
-            .then(function(resp){{return resp.json();}})
-            .then(function(st){{
-              if(st.state!=='ready'&&st.state!=='skipped'){{
-                throw new Error(st.message||'MLX 未就绪');
-              }}
-              if(text)text.textContent='上传并读取文书…';
-              runRedact();
-            }})
-            .catch(function(err){{
-              clearInterval(tick);
-              btn.disabled=false;
-              btn.textContent='一键脱敏';
-              if(prog)prog.hidden=true;
-              toast('MLX 未就绪：'+(err&&err.message?err.message:'请重新启动系统'),'warn');
-            }});
+          function checkModelStatus(){{
+            return fetch('/api/model-status').then(function(resp){{return resp.json();}}).catch(function(){{return {{state:'missing'}};}});
+          }}
+          if(text)text.textContent='检查本地模型 API…';
+          checkModelStatus().then(function(status){{
+            if(status.state!=='ready'&&status.state!=='skipped')toast('本地模型 API 未就绪，将使用纯规则模式','warn');
+            if(text)text.textContent='上传并读取文书…';
+            runRedact();
+          }});
         }});
+        var fileInput=document.getElementById('source-files');
+        if(fileInput)fileInput.addEventListener('change',function(){{setUploadFromInput(fileInput,false);}});
+        var dirInput=document.getElementById('source-directory-files');
+        if(dirInput)dirInput.addEventListener('change',function(){{setUploadFromInput(dirInput,true);}});
       }})();
-	      (function(){{
-	        function uploadSuffix(name){{var i=String(name||'').lastIndexOf('.');return i>=0?String(name).slice(i).toLowerCase():'.txt';}}
-	        function isSupportedUpload(name){{return ['.txt','.md','.doc','.docx','.pdf'].indexOf(uploadSuffix(name))>=0&&String(name||'').split('/').pop().indexOf('._')!==0;}}
-	        function fileList(input){{return Array.prototype.slice.call((input&&input.files)||[]);}}
-	        async function suggestCaseFromInput(input,isDirectory){{
-	          var all=fileList(input);
-	          var paths=all.map(function(f){{return f.webkitRelativePath||f.name||'';}}).filter(function(name){{return name&&isSupportedUpload(name);}});
-	          var names=all.map(function(f){{return f.name||'';}}).filter(function(name){{return name&&isSupportedUpload(name);}});
-	          var relativeInput=document.getElementById('upload-relative-paths-input');
-	          if(relativeInput)relativeInput.value=isDirectory?JSON.stringify(paths):'';
-	          if(isDirectory){{
-	            var plainInput=document.getElementById('source-files');
-	            if(plainInput)plainInput.value='';
-	          }}else{{
-	            var dirInput=document.getElementById('source-directory-files');
-	            if(dirInput)dirInput.value='';
-	          }}
-	          if(!names.length){{
-	            if(isDirectory&&all.length)toast('案件文件夹中没有可处理的 txt/md/doc/docx/pdf 文书','warn');
-	            return;
-	          }}
-	          try{{
-	            var currentSourceDir=(document.getElementById('upload-source-dir-input')||{{value:''}}).value||'';
-	            var currentThread=(document.getElementById('discord-thread-url-input')||{{value:''}}).value||'';
-	            var rootInput=document.getElementById('case-root-input');
-	            var rootAuto=rootInput?(rootInput.dataset.autoValue||''):'';
-	            var rootValue=rootInput?(rootInput.value||''):'';
-	            var currentRoot=shouldApplyAutoPrefill(rootValue,rootAuto)?'':rootValue;
-	            var resp=await fetch('/api/suggest-case-location',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{filenames:names,relative_paths:isDirectory?paths:[],source_dir:currentSourceDir,discord_thread_url:currentThread,case_root:currentRoot}})}});
-	            var data=await resp.json();
-	            if(data.status==='ok'){{
-	              var root=document.getElementById('case-root-input');
-	              var folder=document.getElementById('case-folder-input');
-	              var sourceDir=document.getElementById('upload-source-dir-input');
-	              var discordUrl=document.getElementById('discord-thread-url-input');
-	              if(root){{
-	                if(shouldApplyAutoPrefill(root.value||'',root.dataset.autoValue||'')){{
-	                  root.value=data.case_root||'';
-	                  root.dataset.autoValue=data.case_root||'';
-	                }}
-	              }}
-	              if(folder){{
-	                if(shouldApplyAutoPrefill(folder.value||'',folder.dataset.autoValue||'')){{
-	                  folder.value=data.case_folder||'';
-	                  folder.dataset.autoValue=data.case_folder||'';
-	                }}
-	              }}
-	              if(sourceDir&&data.matched_dir)sourceDir.value=data.matched_dir||'';
-	              if(discordUrl&&!discordUrl.value.trim()&&data.discord_thread_url)discordUrl.value=data.discord_thread_url;
-	              toast(data.discord_thread_url?'已识别案件目录和 Discord 链接: '+data.case_folder:'已识别案件目录: '+data.case_folder);
-	            }}else if(data.status==='conflict'){{
-	              toast(data.conflict_message||'案件目录或 Discord 链接存在冲突，请手动确认','warn');
-	            }}else if(data.status==='ambiguous'){{
-	              toast('匹配到多个案件目录，请手动填写案件文件夹名和根目录','warn');
-	            }}else if(data.status==='not_found'){{
-	              toast('未能自动识别案件目录，请手动填写','warn');
-	            }}
-	          }}catch(err){{
-	            console.debug(err);
-	            toast('案件目录自动识别失败','warn');
-	          }}
-	        }}
-	        var fileInput=document.getElementById('source-files');
-	        if(fileInput)fileInput.addEventListener('change',function(){{suggestCaseFromInput(fileInput,false);}});
-	        var dirInput=document.getElementById('source-directory-files');
-	        if(dirInput)dirInput.addEventListener('change',function(){{suggestCaseFromInput(dirInput,true);}});
-	      }})();
-      function addBlankRow(btn){{var tb=btn.parentElement.querySelector('tbody');if(!tb)return;var rows=tb.querySelectorAll('tr');var last=rows[rows.length-1];var c=last.cloneNode(true);var n=rows.length;c.dataset.mapRow=String(n);c.dataset.categories='';c.querySelectorAll('input,textarea').forEach(function(e){{if(e.name==='row_delete')e.value=n;if(e.name==='map_type')e.value='manual';if(e.name==='map_original'||e.name==='map_masked'||e.name==='map_role'||e.name==='map_reason')e.value='';if(e.name==='map_source')e.value='manual';if(e.name==='map_confidence')e.value='1.0';if(e.name==='map_restore_by_default')e.value='1';e.checked=false;}});tb.appendChild(c);filterMappingRows(activeMappingFilter());}}
+      function addBlankRow(btn){{var tb=btn.parentElement.querySelector('tbody');if(!tb)return;var rows=tb.querySelectorAll('tr');var last=rows[rows.length-1];var c=last.cloneNode(true);var n=rows.length;c.dataset.mapRow=String(n);c.dataset.categories='';c.querySelectorAll('input,textarea').forEach(function(e){{if(e.name==='row_delete')e.value=n;if(e.name==='map_type')e.value='manual';if(e.name==='map_original'||e.name==='map_original_before'||e.name==='map_masked'||e.name==='map_role'||e.name==='map_reason')e.value='';if(e.name==='map_source')e.value='manual';if(e.name==='map_confidence')e.value='1.0';if(e.name==='map_restore_by_default')e.value='1';e.checked=false;}});tb.appendChild(c);filterMappingRows(activeMappingFilter());}}
       function saveRow(idx,btn){{var row=btn.closest('tr');var orig=row.querySelector('[name^=orig_]').value;var masked=row.querySelector('[name^=masked_]').value;var reasonEl=row.querySelector('[name^=reason_]');var reason=reasonEl?reasonEl.value:'';fetch('/samples/update/'+idx,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{original:orig,masked:masked,reason:reason}})}}).then(function(r){{return r.json();}}).then(function(d){{toast(d.msg);}});}}
 	      function saveNewRow(total,btn){{var act=document.getElementById('new-action').value;var orig=document.getElementById('new-orig').value;var masked=document.getElementById('new-masked').value;var reasonEl=document.getElementById('new-reason');var reason=reasonEl?reasonEl.value:'';if(!orig||(act!=='delete'&&!masked)){{toast(act==='delete'?'请填写原文':'请填写原文和替换为','warn');return;}}fetch('/samples/add',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:act,original:orig,masked:masked,reason:reason}})}}).then(function(r){{return r.json();}}).then(function(d){{toast(d.msg);setTimeout(function(){{location.reload();}},1000);}});}}
 
@@ -786,17 +886,21 @@ def render_home_page(
           <form id="redact-form" action="/redact" method="post" enctype="multipart/form-data">
             <label>粘贴文本</label>
             <textarea name="text" id="text-input" rows="12" placeholder="粘贴文书原文，或拖拽 txt/md/doc/docx/pdf 文件到此处"></textarea>
-            <label>或上传 txt / md / doc / docx / pdf（可多选）</label>
+            <label>选择文件（可多选）</label>
             <input type="file" id="source-files" name="files" accept=".txt,.md,.doc,.docx,.pdf" multiple>
             <label>或选择案件文件夹（推荐）</label>
             <input type="file" id="source-directory-files" name="case_folder_files" accept=".txt,.md,.doc,.docx,.pdf" webkitdirectory directory multiple>
             <input type="hidden" id="upload-relative-paths-input" name="upload_relative_paths" value="">
+            <div id="upload-file-list" class="upload-file-list" hidden>
+              <div class="upload-file-list-head">
+                <span id="upload-file-list-summary">已选 0 个支持文件</span>
+              </div>
+              <div id="upload-file-list-items" class="upload-file-list-items"></div>
+            </div>
             <div class="row">
               <p class="hint">统一标准脱敏：人名、地名、机构名称及敏感编号按同一套规则处理。</p>
-              <input type="hidden" name="enable_llm" value="1">
+              <p class="hint">本地模型：Ternary Bonsai 27B（MLX 2-bit）。若本地模型 API 未就绪，提交会明确降级为纯规则模式。</p>
             </div>
-            <label>分析模型</label>
-            <p class="hint">固定使用 MLX Qwen3.5 9B 本地模型。</p>
             <input type="hidden" name="llm_mode" value="max-effect">
             <label style="display:flex; align-items:center; gap:8px; margin-top:12px; margin-bottom:12px; cursor:pointer;">
               <input type="checkbox" name="enable_hanlp" value="1" {hanlp_attr} style="width:auto; margin:0;">
@@ -847,7 +951,19 @@ def render_home_page(
             <button type="submit" class="btn btn-secondary">全部还原</button>
           </form>
         </section>
+
+
         """,
+    )
+def _redaction_timing_summary(model_label: str, duration_ms: int | None) -> str:
+    if duration_ms is None:
+        return ""
+    seconds = max(0, duration_ms) / 1000
+    return (
+        '<p class="hint">'
+        f'本次脱敏模型：{html.escape(model_label or "未记录")}；'
+        f'服务端处理用时：{seconds:.2f} 秒'
+        '</p>'
     )
 
 
@@ -881,6 +997,8 @@ def render_redaction_result_page(
     redaction_map,
     mapping_edit_rows,
     review_html,
+    model_label="",
+    duration_ms=None,
 ):
     return _page(
         title,
@@ -892,9 +1010,9 @@ def render_redaction_result_page(
           <a download="debug_trace.json" href="{debug_url}" class="btn btn-secondary">下载 debug_trace</a>
           <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制脱敏文本</button>
         </div>
+        {_redaction_timing_summary(model_label, duration_ms)}
 
         {workflow_panel}
-
 
         {discord_create_section}
         {discord_section}
@@ -942,7 +1060,7 @@ def render_redaction_result_page(
               <span>应用时按当前映射重新排列占位符</span>
             </label>
             <button type="submit" class="btn">应用表格修改/删除</button>
-            <button type="submit" formaction="/redact/save-sample" formtarget="save-iframe" class="btn btn-secondary" style="margin-left:8px;">保存为样本</button>
+            <button type="submit" formaction="/redact/save-sample" formtarget="save-iframe" class="btn btn-secondary" style="margin-left:8px">保存为样本</button>
           </form>
         </section>
         {'<section><h2>需人工复核</h2><table><thead><tr><th>类型</th><th>文本</th><th>来源</th><th>置信度</th><th>原因</th></tr></thead><tbody>' + review_html + '</tbody></table></section>' if review_html else ''}
@@ -979,6 +1097,8 @@ def render_batch_redaction_result_page(
     source_dir,
     redaction_map,
     mapping_edit_rows,
+    model_label="",
+    duration_ms=None,
 ):
     return _page(
         title,
@@ -990,11 +1110,11 @@ def render_batch_redaction_result_page(
           <a download="debug_trace.json" href="{debug_url}" class="btn btn-secondary">下载 debug_trace</a>
           <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制合并文本</button>
         </div>
+        {_redaction_timing_summary(model_label, duration_ms)}
 
         <textarea id="redacted-output" class="hidden-raw">{html.escape(combined_redacted)}</textarea>
 
         {workflow_panel}
-
 
         {discord_create_section}
         {discord_section}
@@ -1031,7 +1151,7 @@ def render_batch_redaction_result_page(
               <span>应用时按当前映射重新排列占位符</span>
             </label>
             <button type="submit" class="btn">应用表格修改/删除到全部文书</button>
-            <button type="submit" formaction="/redact/save-sample" formtarget="save-iframe" class="btn btn-secondary" style="margin-left:8px;">保存为样本</button>
+            <button type="submit" formaction="/redact/save-sample" formtarget="save-iframe" class="btn btn-secondary" style="margin-left:8px">保存为样本</button>
           </form>
         </section>
         """,

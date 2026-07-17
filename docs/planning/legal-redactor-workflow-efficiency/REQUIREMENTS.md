@@ -11,6 +11,11 @@ complexity: medium-high
 
 ## 1. Goal
 
+The intended operator is a lawyer or another authorized legal-service professional.
+AI assists with redaction, organization, summaries, and legal-document drafts; it does
+not provide a final legal opinion or produce a judicial decision. The operator remains
+responsible for authorization, confidentiality, source verification, and professional review.
+
 Improve the real operating workflow for `legal-redactor`, not only recognition
 accuracy. The target is to make daily use simpler, lower configuration and
 deployment friction, keep runtime cost controlled, and make sample-driven rule
@@ -82,8 +87,8 @@ config, model health, sample safety, Discord binding, and restore readiness.
    future behavior the sample is expected to teach.
 6. As an optimizer, I can start from the newest confirmed error samples and run a
    focused regression check before changing rules.
-7. As a Hermes user, I can bind a Discord thread to a case and later restore a
-   drafted judgment without exposing maps or original text to Discord.
+7. As a lawyer using Hermes, I can bind a collaboration thread to a matter and later
+   restore a legal-document draft without exposing maps or original text to Discord.
 8. As an operator, I can diagnose startup or restore failures in under one
    minute without guessing whether the problem is Web, MLX, Office API, MCP,
    token, or network.
@@ -110,12 +115,12 @@ config, model health, sample safety, Discord binding, and restore readiness.
    - highlight additions, deletes, and low-confidence rows;
    - preserve `map_reason`;
    - show restore-risk warnings before saving a risky correction.
-7. User saves output to the case archive and optionally sends only the redacted
-   attachment to Discord.
-8. Hermes later calls MCP with Discord thread id and draft text.
-9. Office Mac resolves the local manifest, restores text with the local map,
+7. The lawyer saves output to the matter archive and may send only an authorized,
+   redacted attachment to a controlled collaboration thread.
+8. Hermes later calls MCP with the thread id and a legal-document draft.
+9. The local workstation resolves the manifest, restores text with the local map,
    writes restored output under `restored/`, and returns only status/path and
-   unresolved placeholder counts.
+   unresolved placeholder counts for lawyer review.
 
 ## 6. Workstreams
 

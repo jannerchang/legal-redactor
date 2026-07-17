@@ -27,7 +27,7 @@ def main(argv: list[str] | None = None) -> int:
         "--llm-mode",
         choices=("max-effect", "balanced", "off"),
         default="max-effect",
-        help="本地 LLM 语义识别模式；max-effect 使用当前最高稳定本地模型",
+        help="本地 model-manager 的语义识别模式",
     )
     redact_parser.add_argument("--debug-trace", action="store_true", help="额外输出 debug_trace.json")
 
@@ -56,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
         "--llm-mode",
         choices=("max-effect", "balanced", "off"),
         default="max-effect",
-        help="评估使用的本地 LLM 模式",
+        help="评估使用的本地 model-manager 模式",
     )
     eval_parser.add_argument("--fail-under-recall", type=float, default=None, help="低于该 recall 时返回非零")
     eval_parser.add_argument("--fail-under-precision", type=float, default=None, help="低于该 precision 时返回非零")

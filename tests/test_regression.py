@@ -5,6 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from legal_redactor.model_manager import BONSAI_MODEL_ID
 from legal_redactor.models import MappingEntry, RedactionMap
 from legal_redactor.regression import (
     aggregate_sample_summaries,
@@ -20,6 +21,63 @@ from legal_redactor.regression import (
 RAW_PERSON = "张三"
 RAW_COMPANY = "星河建设有限公司"
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+def test_module_cli_uses_manager_logical_model_for_redaction(monkeypatch, tmp_path) -> None:
+    from legal_redactor import __main__ as module_cli
+
+    input_path = tmp_path / "judgment.txt"
+    input_path.write_text("原告张三。", encoding="utf-8")
+    configs = []
+
+    class FakePipeline:
+        def __init__(self, config) -> None:
+            configs.append(config)
+
+        def redact(self, text, source_file=None):
+            return type("Result", (), {
+                "redacted_text": text,
+                "redaction_map": RedactionMap.create([]),
+                "warnings": [],
+                "leaks": [],
+            })()
+
+    monkeypatch.setattr(module_cli, "RedactionPipeline", FakePipeline)
+    monkeypatch.setattr("legal_redactor.io.save_redaction_map_auto", lambda *args: None)
+
+    module_cli.main([str(input_path), "--output-dir", str(tmp_path / "output")])
+
+    assert len(configs) == 1
+    assert configs[0].enable_llm is True
+    assert configs[0].llm.model == BONSAI_MODEL_ID
+
+
+def test_module_cli_uses_manager_logical_model_for_evaluation(monkeypatch, tmp_path) -> None:
+    from legal_redactor import __main__ as module_cli
+
+    gold_path = tmp_path / "gold.json"
+    gold_path.write_text("[]", encoding="utf-8")
+    configs = []
+
+    def fake_evaluate(path, *, config):
+        configs.append(config)
+        return {
+            "case_count": 0,
+            "precision": 1.0,
+            "recall": 1.0,
+            "f1": 1.0,
+            "true_positive": 0,
+            "false_positive": 0,
+            "false_negative": 0,
+            "cases": [],
+        }
+
+    monkeypatch.setattr("legal_redactor.evaluation.evaluate_gold_file", fake_evaluate)
+
+    module_cli.main(["--eval-gold", str(gold_path)])
+
+    assert len(configs) == 1
+    assert configs[0].enable_llm is True
+    assert configs[0].llm.model == BONSAI_MODEL_ID
 
 
 def test_project_gold_report_keeps_metrics_and_drops_raw_diagnostics() -> None:

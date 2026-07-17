@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
+import sys
 import urllib.error
 
 from legal_redactor import mcp_adapter
@@ -23,16 +25,20 @@ def test_mcp_adapter_requires_api_url(monkeypatch) -> None:
 def test_mcp_adapter_reports_office_unreachable(monkeypatch) -> None:
     monkeypatch.setenv("LEGAL_REDACTOR_API_URL", "http://office.local")
     monkeypatch.setenv("LEGAL_REDACTOR_API_TOKEN", "token")
+    captured = {}
 
-    def fail(*args, **kwargs):
+    def fail(request, **kwargs):
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
         raise OSError("network down")
 
     monkeypatch.setattr(mcp_adapter.urllib.request, "urlopen", fail)
 
-    result = mcp_adapter.restore_judgment_from_thread("3", "draft")
+    draft = "本院认为：最终待还原文本。"
+    result = mcp_adapter.restore_judgment_from_thread("3", draft)
 
     assert result["ok"] is False
     assert result["error"]["code"] == "office_unreachable"
+    assert captured["payload"]["draft_text"] == draft
     assert "network down" not in str(result)
 
 
@@ -177,3 +183,40 @@ def test_jsonrpc_initialize_advertises_tools() -> None:
 
     assert response["result"]["serverInfo"]["name"] == "legal-redactor"
     assert "tools" in response["result"]["capabilities"]
+
+
+def test_run_stdio_uses_json_lines_without_fastmcp(monkeypatch) -> None:
+    request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    stdin = io.BytesIO(json.dumps(request).encode("utf-8") + b"\n")
+    stdout = io.BytesIO()
+
+    monkeypatch.setattr(mcp_adapter.sys, "stdin", type("Stdin", (), {"buffer": stdin})())
+    monkeypatch.setattr(mcp_adapter.sys, "stdout", type("Stdout", (), {"buffer": stdout})())
+
+    mcp_adapter.run_stdio()
+
+    response = json.loads(stdout.getvalue().decode("utf-8"))
+    assert response["id"] == 1
+    assert {tool["name"] for tool in response["result"]["tools"]} == {
+        "restore_judgment_from_thread",
+        "get_case_status_by_thread",
+        "bind_discord_thread_to_case",
+    }
+
+
+def test_adapter_process_handles_gateway_initialize_without_fastmcp() -> None:
+    request = {"jsonrpc": "2.0", "id": 1, "method": "initialize"}
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "legal_redactor.mcp_adapter"],
+        input=json.dumps(request) + "\n",
+        capture_output=True,
+        check=True,
+        encoding="utf-8",
+        timeout=5,
+    )
+
+    response = json.loads(completed.stdout)
+    assert response["id"] == 1
+    assert response["result"]["serverInfo"]["name"] == "legal-redactor"
+    assert completed.stderr == ""

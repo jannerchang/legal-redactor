@@ -1,4 +1,4 @@
 {
-  "api_url": "http://100.x.y.z:8787",
+  "api_url": "http://127.0.0.1:18787",
   "api_token": "replace-with-the-office-api-token"
 }
