@@ -877,7 +877,27 @@ def render_home_page(
     sample_info,
     hanlp_attr,
     default_root_str,
+    model_options,
+    default_model_id,
 ):
+    available_models = [
+        item
+        for item in model_options
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    ]
+    model_options_html = "".join(
+        f'<option value="{html.escape(str(item["id"]), quote=True)}"'
+        f'{" selected" if item["id"] == default_model_id else ""}>'
+        f'{html.escape(str(item.get("label") or item["id"]))}</option>'
+        for item in available_models
+    )
+    if not model_options_html:
+        model_options_html = '<option value="" selected>暂无可用模型（将使用纯规则）</option>'
+    model_hint = (
+        f"本地模型 API 当前提供 {len(available_models)} 个模型；每次处理都可重新选择。"
+        if available_models
+        else "本地模型 API 当前没有可用模型，提交会明确降级为纯规则模式。"
+    )
     return _page(
         "本地法律文书脱敏系统",
         status_panel + sample_info + f"""
@@ -899,8 +919,13 @@ def render_home_page(
             </div>
             <div class="row">
               <p class="hint">统一标准脱敏：人名、地名、机构名称及敏感编号按同一套规则处理。</p>
-              <p class="hint">本地模型：Ternary Bonsai 27B（MLX 2-bit）。若本地模型 API 未就绪，提交会明确降级为纯规则模式。</p>
+              <p class="hint">{html.escape(model_hint)}</p>
             </div>
+            <label for="model-choice">本次处理使用的模型</label>
+            <select id="model-choice" name="model" style="min-width:320px">
+              {model_options_html}
+            </select>
+            <p class="hint">选择只影响本次文书。切换模型时，模型管理器会卸载当前 MLX worker，再加载所选模型。</p>
             <input type="hidden" name="llm_mode" value="max-effect">
             <label style="display:flex; align-items:center; gap:8px; margin-top:12px; margin-bottom:12px; cursor:pointer;">
               <input type="checkbox" name="enable_hanlp" value="1" {hanlp_attr} style="width:auto; margin:0;">

@@ -17,18 +17,58 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.responses import Response
 
-BONSAI_MODEL_ID = "bonsai-27b"
+DEFAULT_MODEL_ID = "bonsai-27b"
+BONSAI_MODEL_ID = DEFAULT_MODEL_ID
 BONSAI_MODEL_LABEL = "Ternary Bonsai 27B（MLX 2-bit）"
+QWEN_MODEL_ID = "qwen3.5-9b"
+QWEN_MODEL_LABEL = "Qwen3.5 9B（MLX 4-bit）"
 DEFAULT_MODEL_PATH = Path.home() / "Models/HuggingFace/prism-ml/Ternary-Bonsai-27B-mlx-2bit"
+DEFAULT_QWEN_MODEL_PATH = (
+    Path.home()
+    / "Models/HuggingFace/hub/models--mlx-community--Qwen3.5-9B-MLX-4bit"
+)
 DEFAULT_WORKER_HOST = "127.0.0.1"
 DEFAULT_WORKER_PORT = 18081
+DEFAULT_MODEL_SEARCH_ROOTS = (
+    Path.home() / "Models/HuggingFace",
+    Path.home() / ".cache/huggingface/hub",
+)
+SUPPORTED_MODEL_TYPES = frozenset(
+    {
+        "deepseek_v2",
+        "deepseek_v3",
+        "gemma",
+        "gemma2",
+        "gemma3_text",
+        "glm4",
+        "glm4_moe",
+        "llama",
+        "mistral",
+        "mixtral",
+        "phi3",
+        "phi4mm",
+        "qwen2",
+        "qwen2_moe",
+        "qwen3",
+        "qwen3_5",
+        "qwen3_5_text",
+        "qwen3_moe",
+    }
+)
+BUILTIN_MODEL_SOURCE_NAMES = frozenset(
+    {
+        "Ternary-Bonsai-27B-mlx-2bit",
+        "models--prism-ml--Ternary-Bonsai-27B-mlx-2bit",
+        "models--mlx-community--Qwen3.5-9B-MLX-4bit",
+    }
+)
 
 
 @dataclass(frozen=True)
 class ModelSpec:
     id: str
     label: str
-    path: Path
+    path: Path | str
 
 
 class ModelManagerError(RuntimeError):
@@ -61,8 +101,10 @@ class ModelManager:
         worker_port: int,
         startup_timeout_seconds: float = 130,
         popen_factory: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+        model_discovery: Callable[[], Mapping[str, ModelSpec]] | None = None,
     ) -> None:
         self._models = dict(models)
+        self._model_discovery = model_discovery
         self._worker_host = worker_host
         self._worker_port = worker_port
         self._startup_timeout_seconds = startup_timeout_seconds
@@ -72,14 +114,30 @@ class ModelManager:
         self._active_model: str | None = None
         self._worker_state = "stopped"
 
+    def _refresh_models(self) -> None:
+        if self._model_discovery is None:
+            return
+        discovered = dict(self._model_discovery())
+        discovered[BONSAI_MODEL_ID] = ModelSpec(BONSAI_MODEL_ID, BONSAI_MODEL_LABEL, DEFAULT_MODEL_PATH)
+        discovered[QWEN_MODEL_ID] = ModelSpec(
+            QWEN_MODEL_ID,
+            QWEN_MODEL_LABEL,
+            os.environ.get("LEGAL_REDACTOR_QWEN_MODEL", str(DEFAULT_QWEN_MODEL_PATH)),
+        )
+        self._models = discovered
+
+
     def models_payload(self) -> dict[str, Any]:
-        return {
-            "object": "list",
-            "data": [
-                {"id": spec.id, "object": "model"}
-                for spec in self._models.values()
-            ],
-        }
+        with self._lock:
+            self._refresh_models()
+            return {
+                "object": "list",
+                "data": [
+                    {"id": spec.id, "object": "model", "name": spec.label}
+                    for spec in self._models.values()
+                    if _model_source_is_available(spec.path)
+                ],
+            }
 
     def health_payload(self) -> dict[str, str | None]:
         with self._lock:
@@ -92,12 +150,14 @@ class ModelManager:
 
     def ensure_model(self, model_id: str) -> ModelSpec:
         with self._lock:
+            self._refresh_models()
             spec = self._models.get(model_id)
             if spec is None:
                 raise ModelNotFoundError("Requested model is not registered")
-            if not (spec.path / "config.json").is_file():
+            if not _model_source_is_available(spec.path):
                 raise ModelManagerError("Registered model is unavailable")
-            self._ensure_worker()
+            spec = ModelSpec(spec.id, spec.label, _resolve_model_source(spec.path))
+            self._ensure_worker(spec)
             return spec
 
     def proxy_chat_completion(self, payload: dict[str, Any]) -> tuple[int, bytes, str]:
@@ -127,24 +187,15 @@ class ModelManager:
 
     def shutdown(self) -> None:
         with self._lock:
-            process = self._worker_process
-            self._worker_process = None
-            self._active_model = None
-            self._worker_state = "stopped"
-            if process is None or process.poll() is not None:
-                return
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+            self._stop_worker()
 
-    def _ensure_worker(self) -> None:
+    def _ensure_worker(self, spec: ModelSpec) -> None:
         self._refresh_worker_state()
         if self._worker_process is not None and self._worker_state == "ready":
-            return
-        if self._worker_process is not None:
+            if self._active_model == spec.id:
+                return
+            self._stop_worker()
+        elif self._worker_process is not None:
             raise ModelManagerError("MLX worker stopped before handling the request")
         if not shutil.which("mlx_lm.server"):
             raise ModelManagerError("mlx_lm.server is not installed")
@@ -153,6 +204,8 @@ class ModelManager:
 
         command = [
             "mlx_lm.server",
+            "--model",
+            str(spec.path),
             "--host",
             self._worker_host,
             "--port",
@@ -167,6 +220,7 @@ class ModelManager:
             "2",
         ]
         self._worker_state = "starting"
+        self._active_model = spec.id
         try:
             self._worker_process = self._popen_factory(
                 command,
@@ -175,19 +229,37 @@ class ModelManager:
             )
         except OSError as exc:
             self._worker_state = "error"
+            self._active_model = None
             raise ModelManagerError("Failed to start MLX worker") from exc
 
         deadline = time.monotonic() + self._startup_timeout_seconds
         while time.monotonic() < deadline:
             if self._worker_process.poll() is not None:
+                self._worker_process = None
                 self._worker_state = "error"
+                self._active_model = None
                 raise ModelManagerError("MLX worker exited during startup")
             if _worker_is_healthy(self._worker_host, self._worker_port):
                 self._worker_state = "ready"
                 return
             time.sleep(0.1)
+        self._stop_worker()
         self._worker_state = "error"
         raise ModelManagerError("MLX worker startup timed out")
+
+    def _stop_worker(self) -> None:
+        process = self._worker_process
+        self._worker_process = None
+        self._active_model = None
+        self._worker_state = "stopped"
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
 
     def _refresh_worker_state(self) -> None:
         process = self._worker_process
@@ -196,6 +268,8 @@ class ModelManager:
                 self._worker_state = "stopped"
             return
         if process.poll() is not None:
+            self._worker_process = None
+            self._active_model = None
             self._worker_state = "error"
             return
         if _worker_is_healthy(self._worker_host, self._worker_port):
@@ -257,8 +331,99 @@ def default_model_manager() -> ModelManager:
         raise RuntimeError("LEGAL_REDACTOR_MLX_WORKER_PORT must be an integer") from exc
     if not 1 <= worker_port <= 65535:
         raise RuntimeError("LEGAL_REDACTOR_MLX_WORKER_PORT must be between 1 and 65535")
-    spec = ModelSpec(BONSAI_MODEL_ID, BONSAI_MODEL_LABEL, DEFAULT_MODEL_PATH)
-    return ModelManager({spec.id: spec}, worker_host, worker_port)
+    models = discover_model_specs()
+    models[BONSAI_MODEL_ID] = ModelSpec(BONSAI_MODEL_ID, BONSAI_MODEL_LABEL, DEFAULT_MODEL_PATH)
+    models[QWEN_MODEL_ID] = ModelSpec(
+        QWEN_MODEL_ID,
+        QWEN_MODEL_LABEL,
+        os.environ.get("LEGAL_REDACTOR_QWEN_MODEL", str(DEFAULT_QWEN_MODEL_PATH)),
+    )
+    return ModelManager(models, worker_host, worker_port, model_discovery=discover_model_specs)
+
+
+def discover_model_specs(
+    search_roots: tuple[Path, ...] = DEFAULT_MODEL_SEARCH_ROOTS,
+) -> dict[str, ModelSpec]:
+    discovered: dict[str, ModelSpec] = {}
+    for root in search_roots:
+        expanded_root = root.expanduser()
+        if not expanded_root.is_dir():
+            continue
+        candidates = [expanded_root]
+        try:
+            candidates.extend(sorted(path for path in expanded_root.iterdir() if path.is_dir()))
+        except OSError:
+            continue
+        for candidate in candidates:
+            if candidate.name in BUILTIN_MODEL_SOURCE_NAMES:
+                continue
+            if not _model_source_is_available(candidate) or not _is_supported_discovered_model(candidate):
+                continue
+            model_id = _logical_model_id(candidate.name)
+            if not model_id or model_id in discovered:
+                continue
+            discovered[model_id] = ModelSpec(
+                model_id,
+                _model_display_label(candidate.name),
+                candidate,
+            )
+    return discovered
+
+
+def _logical_model_id(directory_name: str) -> str:
+    name = directory_name.strip()
+    if name.startswith("models--"):
+        name = name.removeprefix("models--").replace("--", "/")
+    return name
+
+
+def _model_display_label(directory_name: str) -> str:
+    model_id = _logical_model_id(directory_name)
+    return model_id.rsplit("/", 1)[-1] or model_id
+
+
+def _resolve_model_source(source: Path | str) -> Path | str:
+    value = str(source).strip()
+    path = Path(value).expanduser()
+    if (path / "config.json").is_file():
+        return path
+    refs_main = path / "refs" / "main"
+    if refs_main.is_file():
+        try:
+            revision = refs_main.read_text(encoding="utf-8").strip()
+        except OSError:
+            revision = ""
+        snapshot = path / "snapshots" / revision
+        if revision and (snapshot / "config.json").is_file():
+            return snapshot
+    return source
+
+
+def _is_supported_discovered_model(source: Path | str) -> bool:
+    resolved = _resolve_model_source(source)
+    config_path = Path(str(resolved)).expanduser() / "config.json"
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    model_type = payload.get("model_type")
+    if not isinstance(model_type, str):
+        text_config = payload.get("text_config")
+        model_type = text_config.get("model_type") if isinstance(text_config, dict) else None
+    return model_type in SUPPORTED_MODEL_TYPES
+
+
+def _model_source_is_available(source: Path | str) -> bool:
+    value = str(source).strip()
+    if not value:
+        return False
+    resolved = _resolve_model_source(source)
+    path = Path(str(resolved)).expanduser()
+    if path.is_dir():
+        return (path / "config.json").is_file()
+    return not path.is_absolute() and value.count("/") == 1
 
 
 def _worker_is_healthy(host: str, port: int) -> bool:

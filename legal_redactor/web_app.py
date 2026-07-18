@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
 import html
 import json
 import os
@@ -53,6 +54,7 @@ from .pipeline import RedactionPipeline
 from .postprocess import _filter_noise_entity_mappings
 from .restore import preview_restore, restore_docx
 from .status import build_status_payload, probe_model_manager
+from .model_manager import DEFAULT_MODEL_ID
 from .web_templates import (
     MAPPING_REVIEW_CATEGORY_LABELS,
     RESTORE_RISK_REASON_LABELS,
@@ -130,21 +132,78 @@ def health() -> dict[str, str]:
 def api_status() -> dict:
     return _status_payload()
 
+@app.get("/api/models")
+def api_models() -> JSONResponse:
+    try:
+        payload = _model_manager_json("/v1/models")
+    except (OSError, ValueError, http.client.HTTPException):
+        return JSONResponse({"object": "list", "data": []}, status_code=503)
+    return JSONResponse(payload)
+
+
 @app.get("/api/model-status")
 def api_model_status() -> dict[str, Any]:
     return probe_model_manager().to_dict()
+
+
+def _model_manager_json(path: str, *, timeout: float = 1.5) -> dict[str, Any]:
+    status = probe_model_manager(timeout=timeout)
+    if status.state != "ready":
+        raise OSError("model manager unavailable")
+    host = str(status.details.get("host") or "")
+    port = int(status.details.get("port") or 0)
+    connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        connection.request("GET", path)
+        response = connection.getresponse()
+        body = response.read()
+    finally:
+        connection.close()
+    if response.status >= 400:
+        raise OSError("model manager request failed")
+    payload = json.loads(body)
+    if not isinstance(payload, dict):
+        raise ValueError("invalid model manager response")
+    return payload
+
+
+def _available_model_options() -> list[dict[str, str]]:
+    try:
+        payload = _model_manager_json("/v1/models", timeout=0.4)
+    except (OSError, ValueError, http.client.HTTPException, json.JSONDecodeError):
+        return []
+    options: list[dict[str, str]] = []
+    for item in payload.get("data", []):
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()
+        if not model_id:
+            continue
+        options.append({"id": model_id, "label": str(item.get("name") or model_id)})
+    return options
+
+
+def _model_label(model_id: str, options: list[dict[str, str]] | None = None) -> str:
+    for item in options or _available_model_options():
+        if item["id"] == model_id:
+            return item["label"]
+    return model_id
 
 
 def _pipeline_config_for_model_status(
     *,
     profile: str = "standard",
     llm_mode: str = "max-effect",
+    model: str = DEFAULT_MODEL_ID,
 ) -> tuple[PipelineConfig, list[str]]:
     status = probe_model_manager()
     if status.state != "ready":
         return PipelineConfig.offline_without_llm(profile), ["本地模型 API 未就绪，已降级为纯规则模式。"]
+    model_ids = status.details.get("model_ids", [])
+    if model not in model_ids:
+        return PipelineConfig.offline_without_llm(profile), ["所选模型当前不可用，已降级为纯规则模式。"]
     try:
-        return PipelineConfig.from_llm_mode(llm_mode, profile_name=profile), []
+        return PipelineConfig.from_llm_mode(llm_mode, profile_name=profile, model=model), []
     except ValueError:
         return PipelineConfig.offline_without_llm(profile), ["本地模型 API 配置无效，已降级为纯规则模式。"]
 
@@ -466,7 +525,14 @@ def index() -> str:
     status_panel = _render_status_panel(_status_payload())
     hanlp_attr = _hanlp_checked_attr()
     default_root_str = str(default_case_root())
-    return render_home_page(status_panel, sample_info, hanlp_attr, default_root_str)
+    return render_home_page(
+        status_panel,
+        sample_info,
+        hanlp_attr,
+        default_root_str,
+        _available_model_options(),
+        DEFAULT_MODEL_ID,
+    )
 
 def _hanlp_checked_attr() -> str:
     # LLM 主路径下 HanLP 为可选增强；默认不勾选，避免与 MLX 同时占满内存导致进程被系统杀掉。
@@ -495,6 +561,7 @@ def _is_default_case_root_value(value: str) -> bool:
 async def analyze_page(
     text: str = Form(default=""),
     llm_mode: str = Form(default="max-effect"),
+    model: str = Form(default=DEFAULT_MODEL_ID),
     file: UploadFile | None = File(default=None),
     files: list[UploadFile] = File(default=[]),
 ) -> str:
@@ -504,7 +571,7 @@ async def analyze_page(
         return _page("上传失败", str(exc))
 
     profile = "standard"
-    config, warnings = _pipeline_config_for_model_status(profile=profile, llm_mode=llm_mode)
+    config, warnings = _pipeline_config_for_model_status(profile=profile, llm_mode=llm_mode, model=model)
     pipeline = RedactionPipeline(config=config)
 
     # 执行语义审计（后台线程，避免阻塞 /health 等轻量请求）
@@ -518,6 +585,7 @@ async def analyze_page(
         original_documents=documents,
         profile=profile,
         llm_mode=llm_mode if config.enable_llm else "off",
+        model=config.llm.model if config.enable_llm else model,
     )
 
 def _render_audit_dashboard(
@@ -525,6 +593,7 @@ def _render_audit_dashboard(
     original_documents: list[InputDocument],
     profile: str,
     llm_mode: str,
+    model: str = DEFAULT_MODEL_ID,
     round_num: int = 0,
     previous_map_json: str = "{}",
     previous_deselected_json: str = "[]",
@@ -584,6 +653,7 @@ def _render_audit_dashboard(
           <form action="/redact/confirmed" method="post">
             <input type="hidden" name="profile" value="{profile}">
             <input type="hidden" name="llm_mode" value="{llm_mode}">
+            <input type="hidden" name="model" value="{html.escape(model)}">
             <input type="hidden" name="bundle_json" value="{html.escape(bundle_json)}">
             <input type="hidden" name="analysis_json" value="{html.escape(json.dumps(analysis, ensure_ascii=False))}">
             <input type="hidden" name="round" value="{round_num}">
@@ -635,6 +705,7 @@ async def redact_confirmed_page(request: Request) -> str:
     analysis_json = form.get("analysis_json", "{}")
     profile = "standard"
     llm_mode = str(form.get("llm_mode", "max-effect"))
+    model = str(form.get("model", DEFAULT_MODEL_ID))
     round_num = int(form.get("round", "0"))
     previous_map_json = form.get("previous_map_json", "{}")
     previous_deselected_json = form.get("previous_deselected_json", "[]")
@@ -814,7 +885,7 @@ async def redact_confirmed_page(request: Request) -> str:
         )
 
     # 对已脱敏文本做新一轮分析；API 不可用时与 /redact 一样降级为纯规则。
-    config, fallback_warnings = _pipeline_config_for_model_status(profile=profile, llm_mode=llm_mode)
+    config, fallback_warnings = _pipeline_config_for_model_status(profile=profile, llm_mode=llm_mode, model=model)
     pipeline2 = RedactionPipeline(config=config)
     new_analysis = await asyncio.to_thread(pipeline2.analyze, redacted_text)
     new_analysis.setdefault("warnings", [])
@@ -846,6 +917,7 @@ async def redact_confirmed_page(request: Request) -> str:
             original_documents=[InputDocument(source_file="", text=redacted_text)],
             profile=profile,
             llm_mode=llm_mode if config.enable_llm else "off",
+            model=config.llm.model if config.enable_llm else model,
             round_num=round_num + 1,
             previous_map_json=current_map_json,
             previous_deselected_json=deselected_json,
@@ -869,6 +941,7 @@ async def redact_page(
     request: Request,
     text: str = Form(default=""),
     llm_mode: str = Form(default="max-effect"),
+    model: str = Form(default=DEFAULT_MODEL_ID),
     enable_hanlp: str | None = Form(default=None),
     hanlp_model: str = Form(default=""),
     # enable_samples kept out of the form: samples never affect runtime redaction.
@@ -900,8 +973,9 @@ async def redact_page(
         except Exception as exc:
             return _page("已有映射表解析失败", f"解析错误: {exc}")
 
-    config, fallback_warnings = _pipeline_config_for_model_status(profile="standard", llm_mode=llm_mode)
-    model_label = "Ternary Bonsai 27B（MLX 2-bit）" if config.enable_llm else "离线规则（本地模型 API 未就绪）"
+    model_options = _available_model_options()
+    config, fallback_warnings = _pipeline_config_for_model_status(profile="standard", llm_mode=llm_mode, model=model)
+    model_label = _model_label(config.llm.model, model_options) if config.enable_llm else "离线规则（本地模型 API 未就绪）"
     config = replace(
         config,
         enable_hanlp_ner=bool(enable_hanlp),

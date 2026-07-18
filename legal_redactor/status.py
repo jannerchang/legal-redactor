@@ -11,7 +11,7 @@ from typing import Any, Mapping
 from .cases import default_case_root
 from .config import DEFAULT_MODEL_MANAGER_HOST, DEFAULT_MODEL_MANAGER_PORT
 from .local_config import JsonConfigDiagnostic, config_value, diagnose_json_config
-from .model_manager import BONSAI_MODEL_ID
+from .model_manager import DEFAULT_MODEL_ID
 ALLOWED_STATES = {"ready", "degraded", "missing", "error", "skipped"}
 
 
@@ -73,7 +73,7 @@ def build_status_payload(
     return {
         "status": "ok",
         "overall_state": _overall_state(public_components),
-        "expected_model_id": BONSAI_MODEL_ID,
+        "default_model_id": DEFAULT_MODEL_ID,
         "components": public_components,
     }
 
@@ -135,7 +135,7 @@ def probe_model_manager(
             "skipped",
             "本地模型 API 已由 LEGAL_REDACTOR_SKIP_MLX=1 跳过；将使用纯规则模式。",
             "取消该环境变量后启动本地模型 API",
-            {"host": DEFAULT_MODEL_MANAGER_HOST, "port": DEFAULT_MODEL_MANAGER_PORT, "expected_model_id": BONSAI_MODEL_ID, "reason": "skip_requested"},
+            {"host": DEFAULT_MODEL_MANAGER_HOST, "port": DEFAULT_MODEL_MANAGER_PORT, "reason": "skip_requested"},
         )
     endpoint = _model_manager_endpoint(env)
     if endpoint is None:
@@ -145,10 +145,10 @@ def probe_model_manager(
             "error",
             "本地模型 API 地址无效。",
             "设置有效的 LEGAL_REDACTOR_MODEL_MANAGER_HOST 和 PORT",
-            {"expected_model_id": BONSAI_MODEL_ID, "reason": "invalid_endpoint"},
+            {"reason": "invalid_endpoint"},
         )
     host, port = endpoint
-    details: dict[str, Any] = {"host": host, "port": port, "expected_model_id": BONSAI_MODEL_ID}
+    details: dict[str, Any] = {"host": host, "port": port}
     try:
         health_status, health_body = _http_get(host, port, "/health", timeout)
     except socket.timeout:
@@ -190,10 +190,10 @@ def probe_model_manager(
         if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip()
     ))
     details["model_ids"] = model_ids[:8]
-    if BONSAI_MODEL_ID not in model_ids:
-        details["reason"] = "expected_model_not_registered"
-        return StatusItem("model_manager", "本地模型 API", "error", "本地模型 API 未注册预期模型。", "检查模型管理器的注册表", details)
-    return StatusItem("model_manager", "本地模型 API", "ready", "本地模型 API 已就绪。", "无需处理", details)
+    if not model_ids:
+        details["reason"] = "no_models_registered"
+        return StatusItem("model_manager", "本地模型 API", "error", "本地模型 API 当前没有可用模型。", "下载或配置至少一个 MLX 模型", details)
+    return StatusItem("model_manager", "本地模型 API", "ready", f"本地模型 API 已就绪，可选 {len(model_ids)} 个模型。", "无需处理", details)
 
 
 def probe_recognition_mode(model_manager_item: StatusItem) -> StatusItem:

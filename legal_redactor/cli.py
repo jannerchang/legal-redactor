@@ -29,6 +29,7 @@ def main(argv: list[str] | None = None) -> int:
         default="max-effect",
         help="本地 model-manager 的语义识别模式",
     )
+    redact_parser.add_argument("--model", default="bonsai-27b", help="model-manager 返回的逻辑模型 ID")
     redact_parser.add_argument("--debug-trace", action="store_true", help="额外输出 debug_trace.json")
 
     restore_parser = subparsers.add_parser("restore", help="按 redaction_map 反向还原")
@@ -58,6 +59,7 @@ def main(argv: list[str] | None = None) -> int:
         default="max-effect",
         help="评估使用的本地 model-manager 模式",
     )
+    eval_parser.add_argument("--model", default="bonsai-27b", help="model-manager 返回的逻辑模型 ID")
     eval_parser.add_argument("--fail-under-recall", type=float, default=None, help="低于该 recall 时返回非零")
     eval_parser.add_argument("--fail-under-precision", type=float, default=None, help="低于该 precision 时返回非零")
 
@@ -78,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
 def _run_redact(args: argparse.Namespace) -> int:
     input_path = Path(args.input)
     text = read_document(input_path)
-    config = PipelineConfig.offline_without_llm() if args.no_llm else PipelineConfig.from_llm_mode(args.llm_mode)
+    config = PipelineConfig.offline_without_llm() if args.no_llm else PipelineConfig.from_llm_mode(args.llm_mode, model=args.model)
     pipeline = RedactionPipeline(config=config)
     result = pipeline.redact(text, source_file=input_path.name)
 
@@ -160,7 +162,7 @@ def _run_clear_samples(args: argparse.Namespace) -> int:
 def _run_eval(args: argparse.Namespace) -> int:
     from .evaluation import evaluate_gold_file, evaluation_report_to_json
 
-    config = PipelineConfig.offline_without_llm() if args.no_llm else PipelineConfig.from_llm_mode(args.llm_mode)
+    config = PipelineConfig.offline_without_llm() if args.no_llm else PipelineConfig.from_llm_mode(args.llm_mode, model=args.model)
     report = evaluate_gold_file(args.gold, config=config)
     print(
         "cases={case_count} precision={precision:.4f} recall={recall:.4f} f1={f1:.4f} "

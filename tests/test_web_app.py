@@ -129,7 +129,7 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertEqual(model_status.status_code, 200)
         self.assertEqual(model_status.json(), manager_status)
 
-    def test_index_includes_status_panel_and_fixed_manager_model(self) -> None:
+    def test_index_includes_status_panel_and_dynamic_model_choice(self) -> None:
         payload = {
             "status": "ok",
             "overall_state": "degraded",
@@ -147,6 +147,13 @@ class WebAppUploadTests(unittest.TestCase):
         with (
             patch("legal_redactor.web_app._status_payload", return_value=payload),
             patch("legal_redactor._samples.load_all_samples", return_value=({}, set())),
+            patch(
+                "legal_redactor.web_app._available_model_options",
+                return_value=[
+                    {"id": "bonsai-27b", "label": "Ternary Bonsai 27B（MLX 2-bit）"},
+                    {"id": "qwen3.5-9b", "label": "Qwen3.5 9B（MLX 4-bit）"},
+                ],
+            ),
         ):
             page = index()
 
@@ -174,11 +181,30 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertIn('id="redact-form"', page)
         self.assertIn('id="redact-progress"', page)
         self.assertIn("Ternary Bonsai 27B（MLX 2-bit）", page)
+        self.assertIn("Qwen3.5 9B（MLX 4-bit）", page)
+        self.assertIn('id="model-choice"', page)
+        self.assertIn('name="model"', page)
+        self.assertIn("每次处理都可重新选择", page)
         self.assertIn("/api/model-status", page)
         self.assertIn("已用时", page)
-        self.assertNotIn("API 模型（可选）", page)
-        self.assertNotIn("model-choice", page)
         self.assertNotIn("super-secret-token", page)
+
+
+    def test_models_endpoint_forwards_public_manager_registry(self) -> None:
+        from fastapi.testclient import TestClient
+
+        payload = {
+            "object": "list",
+            "data": [
+                {"id": "bonsai-27b", "object": "model", "name": "Ternary Bonsai 27B（MLX 2-bit）"},
+                {"id": "qwen3.5-9b", "object": "model", "name": "Qwen3.5 9B（MLX 4-bit）"},
+            ],
+        }
+        with patch("legal_redactor.web_app._model_manager_json", return_value=payload):
+            response = TestClient(app).get("/api/models")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), payload)
 
 
     def test_index_inline_script_is_syntactically_valid(self) -> None:
@@ -951,7 +977,7 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertGreaterEqual(len(configs), 2)
         self.assertTrue(all(cfg.enable_llm is False for cfg in configs))
 
-    def test_redact_route_uses_fixed_manager_model_and_reports_duration(self) -> None:
+    def test_redact_route_uses_selected_manager_model_and_reports_duration(self) -> None:
         from fastapi.testclient import TestClient
 
         configs = []
@@ -972,22 +998,27 @@ class WebAppUploadTests(unittest.TestCase):
                     warnings=[],
                 )
 
+        ready = SimpleNamespace(
+            state="ready",
+            details={"model_ids": ["bonsai-27b", "qwen3.5-9b"]},
+        )
         with (
-            patch("legal_redactor.web_app.probe_model_manager", return_value=SimpleNamespace(state="ready")),
+            patch("legal_redactor.web_app.probe_model_manager", return_value=ready),
+            patch("legal_redactor.web_app._available_model_options", return_value=[{"id": "qwen3.5-9b", "label": "Qwen3.5 9B（MLX 4-bit）"}]),
             patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
         ):
             client = TestClient(app)
-            response = client.post("/redact", data={"text": "原告张三。"})
+            response = client.post("/redact", data={"text": "原告张三。", "model": "qwen3.5-9b"})
             home = client.get("/")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(home.status_code, 200)
         self.assertEqual(len(configs), 1)
         self.assertTrue(configs[0].enable_llm)
-        self.assertEqual(configs[0].llm.model, "bonsai-27b")
-        self.assertIn("本次脱敏模型：Ternary Bonsai 27B（MLX 2-bit）", response.text)
+        self.assertEqual(configs[0].llm.model, "qwen3.5-9b")
+        self.assertIn("本次脱敏模型：Qwen3.5 9B（MLX 4-bit）", response.text)
         self.assertIn("服务端处理用时：", response.text)
-        self.assertNotIn("model-choice", home.text)
+        self.assertIn("model-choice", home.text)
 
     def test_clear_samples_api_returns_delete_stats_and_rebuilds_auto_file(self) -> None:
         from pathlib import Path

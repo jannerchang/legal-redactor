@@ -89,11 +89,12 @@
 - 系统：macOS 26.5.1
 - Python：3.13.2（项目 `.venv`）
 - 本地模型 API：`model-manager`，默认 `127.0.0.1:18080`
-- 逻辑模型 ID：`bonsai-27b`（展示名：Ternary Bonsai 27B（MLX 2-bit））
+- 默认逻辑模型 ID：`bonsai-27b`（展示名：Ternary Bonsai 27B（MLX 2-bit））
+- 已注册可选模型还包括 `qwen3.5-9b`（展示名：Qwen3.5 9B（MLX 4-bit））
 - 默认 Web 端口：`127.0.0.1:7860`
 - Office 私网还原 API：建议绑定 `127.0.0.1:8787`，通过 SSH 反向隧道暴露到 Home Mac 的 `127.0.0.1:18787`
 
-应用和 Web 表单只向本地 `model-manager` 发送逻辑 ID `bonsai-27b`。管理器把该 ID 映射到本机权重，并以 OpenAI-compatible `POST /v1/chat/completions` 代理给内部 MLX worker；权重路径不会出现在应用请求、Web 页面或管理器公开响应中。模型 API 不可用时，系统明确提示并降级为纯规则模式，仍可完成基础脱敏、映射保存、MCP 还原和 Discord 发帖流程。
+应用和 Web 表单只向本地 `model-manager` 发送逻辑模型 ID。管理器通过 OpenAI-compatible `GET /v1/models` 公布当前可用模型，并把每次请求选择的 ID 映射到本机 MLX 权重；切换模型时会卸载当前 worker 后加载所选模型。权重路径不会出现在应用请求或 Web 页面中。模型 API 不可用时，系统明确提示并降级为纯规则模式，仍可完成基础脱敏、映射保存、MCP 还原和 Discord 发帖流程。
 
 ## 安装与启动
 
@@ -221,24 +222,27 @@ Hermes 工具调用只传协作 thread id 和法律文书草稿；本地工作�
 
 ## 本地模型管理器
 
-唯一的对外模型端点是 `model-manager`，默认 `http://127.0.0.1:18080`。它公开 OpenAI-compatible `GET /v1/models` 和 `POST /v1/chat/completions`，当前注册表只包含逻辑模型 ID `bonsai-27b`。Web 和 CLI 固定使用该可信配置；浏览器和命令行不接受任意权重路径或模型 ID。
+唯一的对外模型端点是 `model-manager`，默认 `http://127.0.0.1:18080`。它公开 OpenAI-compatible `GET /v1/models` 和 `POST /v1/chat/completions`。Web 每次载入页面时读取模型列表，处理文书时提交本次选择的逻辑模型 ID；CLI 可使用 `--model` 指定同一个 ID。浏览器和命令行仍不接受任意权重路径。
 
-管理器本身通过 `scripts/start_model_manager.sh` 启动或复用。内部 MLX worker 默认仅监听 `127.0.0.1:18081`，由管理器按请求惰性拥有和关闭；不要直接启动 worker。可通过以下环境变量分别覆盖本机监听地址：
+管理器启动时会自动扫描 `~/Models/HuggingFace` 和 `~/.cache/huggingface/hub` 中包含 `config.json` 的本地模型；Hugging Face 缓存目录会转换为逻辑 ID，例如 `models--owner--model` 显示为 `owner/model`。因此以后下载到这些目录的新 MLX 模型，重启模型管理器后会自动出现在下拉列表，不需要改代码。内置的 `bonsai-27b` 和 `qwen3.5-9b` 保留更友好的短 ID 与展示名。
+
+管理器本身通过 `scripts/start_model_manager.sh` 启动或复用。内部 MLX worker 默认仅监听 `127.0.0.1:18081`，由管理器按请求惰性拥有、切换和关闭；不要直接启动 worker。可通过以下环境变量分别覆盖本机监听地址，并可用 `LEGAL_REDACTOR_QWEN_MODEL` 覆盖 Qwen 模型的本地路径或 Hugging Face 仓库 ID：
 
 ```bash
 LEGAL_REDACTOR_MODEL_MANAGER_HOST=127.0.0.1
 LEGAL_REDACTOR_MODEL_MANAGER_PORT=18080
 LEGAL_REDACTOR_MLX_WORKER_HOST=127.0.0.1
 LEGAL_REDACTOR_MLX_WORKER_PORT=18081
+LEGAL_REDACTOR_QWEN_MODEL=~/Models/HuggingFace/hub/models--mlx-community--Qwen3.5-9B-MLX-4bit/snapshots/<revision>
 ```
 
-例如，管理器协议始终使用逻辑 ID：
+例如，先读取可选模型，再在请求中传入其中一个逻辑 ID：
 
 ```bash
 curl -fsS http://127.0.0.1:18080/v1/models
 curl -fsS http://127.0.0.1:18080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"bonsai-27b","messages":[{"role":"user","content":"Return exactly {}"}],"stream":false,"temperature":0,"max_tokens":16}'
+  -d '{"model":"qwen3.5-9b","messages":[{"role":"user","content":"Return exactly {}"}],"stream":false,"temperature":0,"max_tokens":16}'
 ```
 
 管理器或模型不可用时，应用显式使用纯规则模式；不会尝试 Ollama、Open WebUI 或其他后端。LLM 只负责整句实体识别和低置信候选审核，不负责控制全文替换。

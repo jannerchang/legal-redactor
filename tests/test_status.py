@@ -95,7 +95,7 @@ def test_model_manager_probe_checks_health_and_logical_registry(monkeypatch) -> 
     responses = iter(
         [
             (200, json.dumps({"status": "ok", "active_model": None, "worker_state": "stopped"})),
-            (200, json.dumps({"data": [{"id": "bonsai-27b"}, {"id": "bonsai-27b"}]})),
+            (200, json.dumps({"data": [{"id": "bonsai-27b"}, {"id": "qwen3.5-9b"}]})),
         ]
     )
     monkeypatch.setattr("legal_redactor.status._http_get", lambda *args: next(responses))
@@ -109,9 +109,8 @@ def test_model_manager_probe_checks_health_and_logical_registry(monkeypatch) -> 
     assert item.details == {
         "host": "manager.example.test",
         "port": 8123,
-        "expected_model_id": "bonsai-27b",
         "worker_state": "stopped",
-        "model_ids": ["bonsai-27b"],
+        "model_ids": ["bonsai-27b", "qwen3.5-9b"],
     }
 
 
@@ -129,9 +128,9 @@ def test_model_manager_probe_classifies_invalid_and_unavailable_responses(monkey
     monkeypatch.setattr("legal_redactor.status._http_get", lambda *args: next(responses))
     assert "模型列表格式" in probe_model_manager(environ={}, timeout=0.01).message
 
-    responses = iter([(200, json.dumps({"status": "ok"})), (200, json.dumps({"data": [{"id": "/Users/private/model"}]}))])
+    responses = iter([(200, json.dumps({"status": "ok"})), (200, json.dumps({"data": []}))])
     monkeypatch.setattr("legal_redactor.status._http_get", lambda *args: next(responses))
-    assert "未注册预期模型" in probe_model_manager(environ={}, timeout=0.01).message
+    assert "没有可用模型" in probe_model_manager(environ={}, timeout=0.01).message
 
     def raise_timeout(*args: object) -> tuple[int, str]:
         raise socket.timeout()

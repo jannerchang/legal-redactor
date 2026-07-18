@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import os
-from .model_manager import BONSAI_MODEL_ID
+from .model_manager import DEFAULT_MODEL_ID
 
 
 
@@ -174,7 +174,7 @@ class LLMAPIConfig:
     enabled: bool = True
     role: str = "candidate_review_only"
     mode: str = "max-effect"
-    model: str = BONSAI_MODEL_ID
+    model: str = DEFAULT_MODEL_ID
     temperature: float = 0.0
     context_window: int = 32768
     output_format: str = "json"
@@ -215,10 +215,11 @@ class PipelineConfig:
         )
 
     @classmethod
-    def max_effect(cls, profile_name: str = "standard") -> "PipelineConfig":
+    def max_effect(cls, profile_name: str = "standard", model: str = DEFAULT_MODEL_ID) -> "PipelineConfig":
         llm = LLMAPIConfig(
             enabled=True,
             role="sentence_entity_extraction",
+            model=model,
             mode="max-effect",
             context_window=8192,
             timeout_seconds=120,
@@ -232,10 +233,11 @@ class PipelineConfig:
         )
 
     @classmethod
-    def balanced_llm(cls, profile_name: str = "standard") -> "PipelineConfig":
+    def balanced_llm(cls, profile_name: str = "standard", model: str = DEFAULT_MODEL_ID) -> "PipelineConfig":
         llm = LLMAPIConfig(
             enabled=True,
             role="sentence_entity_extraction",
+            model=model,
             mode="balanced",
             context_window=8192,
             timeout_seconds=180,
@@ -249,11 +251,16 @@ class PipelineConfig:
         )
 
     @classmethod
-    def from_llm_mode(cls, llm_mode: str, profile_name: str = "standard") -> "PipelineConfig":
+    def from_llm_mode(
+        cls,
+        llm_mode: str,
+        profile_name: str = "standard",
+        model: str = DEFAULT_MODEL_ID,
+    ) -> "PipelineConfig":
         if llm_mode == "off":
             return cls.offline_without_llm(profile_name)
         if llm_mode == "balanced":
-            return cls.balanced_llm(profile_name)
+            return cls.balanced_llm(profile_name, model=model)
         if llm_mode == "max-effect":
-            return cls.max_effect(profile_name)
+            return cls.max_effect(profile_name, model=model)
         raise ValueError(f"unsupported llm mode: {llm_mode}")

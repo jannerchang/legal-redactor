@@ -20,7 +20,7 @@ manager_is_healthy() {
   local models
   curl -fsS -m 2 "http://$HOST:$PORT/health" >/dev/null 2>&1 || return 1
   models="$(curl -fsS -m 2 "http://$HOST:$PORT/v1/models" 2>/dev/null)" || return 1
-  "$PYTHON_BIN" -c 'import json, sys; payload=json.load(sys.stdin); sys.exit(0 if any(item.get("id") == "bonsai-27b" for item in payload.get("data", []) if isinstance(item, dict)) else 1)' <<<"$models"
+  "$PYTHON_BIN" -c 'import json, sys; payload=json.load(sys.stdin); sys.exit(0 if any(isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip() for item in payload.get("data", [])) else 1)' <<<"$models"
 }
 
 if manager_is_healthy; then

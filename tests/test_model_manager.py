@@ -9,7 +9,12 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from legal_redactor.model_manager import ModelManager, ModelSpec, create_model_manager_app
+from legal_redactor.model_manager import (
+    ModelManager,
+    ModelSpec,
+    create_model_manager_app,
+    discover_model_specs,
+)
 
 
 class _FakeProcess:
@@ -86,7 +91,7 @@ def _manager(tmp_path: Path, port: int, created: list[_FakeProcess]) -> ModelMan
 
     def popen(command: list[str], **kwargs: object) -> _FakeProcess:
         assert kwargs == {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
-        assert "--model" not in command
+        assert command[command.index("--model") + 1] == str(model_path)
         created.append(_FakeProcess())
         return created[-1]
 
@@ -101,7 +106,7 @@ def test_manager_exposes_only_registered_logical_model(tmp_path: Path) -> None:
 
     assert client.get("/v1/models").json() == {
         "object": "list",
-        "data": [{"id": "bonsai-27b", "object": "model"}],
+        "data": [{"id": "bonsai-27b", "object": "model", "name": "Test Bonsai"}],
     }
     assert client.get("/health").json() == {
         "status": "ok",
@@ -157,8 +162,112 @@ def test_manager_starts_worker_without_inheriting_output(tmp_path: Path, monkeyp
 
     assert len(calls) == 1
     assert calls[0][1] == {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
-    assert "--model" not in calls[0][0]
+    assert calls[0][0][calls[0][0].index("--model") + 1] == str(model_path)
     manager.shutdown()
+
+
+def test_manager_switches_owned_worker_when_model_changes(tmp_path: Path, monkeypatch) -> None:
+    first_path = tmp_path / "first"
+    second_path = tmp_path / "second"
+    for path in (first_path, second_path):
+        path.mkdir()
+        (path / "config.json").write_text("{}", encoding="utf-8")
+    created: list[_FakeProcess] = []
+
+    def popen(command: list[str], **kwargs: object) -> _FakeProcess:
+        del command, kwargs
+        created.append(_FakeProcess())
+        return created[-1]
+
+    monkeypatch.setattr("legal_redactor.model_manager._port_is_listening", lambda host, port: False)
+    with _WorkerServer() as worker:
+        manager = ModelManager(
+            {
+                "first": ModelSpec("first", "First", first_path),
+                "second": ModelSpec("second", "Second", second_path),
+            },
+            "127.0.0.1",
+            worker.port,
+            startup_timeout_seconds=1,
+            popen_factory=popen,
+        )
+        client = TestClient(create_model_manager_app(manager))
+        assert client.post("/v1/chat/completions", json={"model": "first"}).status_code == 200
+        assert client.post("/v1/chat/completions", json={"model": "second"}).status_code == 200
+
+    assert len(created) == 2
+    assert created[0].terminated
+    assert manager.health_payload()["active_model"] == "second"
+    manager.shutdown()
+
+
+def test_manager_hides_unavailable_models_from_registry(tmp_path: Path) -> None:
+    available = tmp_path / "available"
+    available.mkdir()
+    (available / "config.json").write_text("{}", encoding="utf-8")
+    manager = ModelManager(
+        {
+            "available": ModelSpec("available", "Available", available),
+            "missing": ModelSpec("missing", "Missing", tmp_path / "missing"),
+        },
+        "127.0.0.1",
+        _unused_port(),
+    )
+
+    assert manager.models_payload()["data"] == [
+        {"id": "available", "object": "model", "name": "Available"}
+    ]
+
+
+def test_discovery_registers_direct_and_huggingface_cache_models(tmp_path: Path) -> None:
+    direct = tmp_path / "Acme-7B-MLX-4bit"
+    direct.mkdir()
+    (direct / "config.json").write_text('{"model_type":"qwen3"}', encoding="utf-8")
+
+    cached = tmp_path / "models--mlx-community--Fresh-Model-MLX-8bit"
+    snapshot = cached / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    (cached / "refs").mkdir()
+    (cached / "refs" / "main").write_text("abc123", encoding="utf-8")
+    (snapshot / "config.json").write_text('{"model_type":"llama"}', encoding="utf-8")
+    embedding = tmp_path / "models--sentence-transformers--Embedding"
+    embedding_snapshot = embedding / "snapshots" / "def456"
+    embedding_snapshot.mkdir(parents=True)
+    (embedding / "refs").mkdir()
+    (embedding / "refs" / "main").write_text("def456", encoding="utf-8")
+    (embedding_snapshot / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
+
+    discovered = discover_model_specs((tmp_path,))
+
+    assert set(discovered) == {
+        "Acme-7B-MLX-4bit",
+        "mlx-community/Fresh-Model-MLX-8bit",
+    }
+    assert discovered["Acme-7B-MLX-4bit"].label == "Acme-7B-MLX-4bit"
+    assert discovered["mlx-community/Fresh-Model-MLX-8bit"].label == "Fresh-Model-MLX-8bit"
+
+
+def test_manager_refreshes_discovered_models_without_restart(tmp_path: Path) -> None:
+    model_dir = tmp_path / "First-MLX"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type":"qwen3"}', encoding="utf-8")
+    def discovery() -> dict[str, ModelSpec]:
+        return discover_model_specs((tmp_path,))
+
+    manager = ModelManager(
+        discovery(),
+        "127.0.0.1",
+        _unused_port(),
+        model_discovery=discovery,
+    )
+
+    assert {item["id"] for item in manager.models_payload()["data"]} >= {"First-MLX"}
+
+    second = tmp_path / "Second-MLX"
+    second.mkdir()
+    (second / "config.json").write_text('{"model_type":"llama"}', encoding="utf-8")
+
+    assert {item["id"] for item in manager.models_payload()["data"]} >= {"First-MLX", "Second-MLX"}
 
 
 def test_manager_scrubs_unknown_and_worker_errors(tmp_path: Path, monkeypatch) -> None:

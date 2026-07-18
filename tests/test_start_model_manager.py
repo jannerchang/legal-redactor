@@ -14,7 +14,7 @@ class _HealthyManagerHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             payload = {"status": "ok", "active_model": None, "worker_state": "stopped"}
         elif self.path == "/v1/models":
-            payload = {"object": "list", "data": [{"id": "bonsai-27b", "object": "model"}]}
+            payload = {"object": "list", "data": [{"id": "qwen3.5-9b", "object": "model"}]}
         else:
             self.send_error(404)
             return

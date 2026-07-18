@@ -64,10 +64,10 @@ def test_balanced_config_targets_same_manager_model() -> None:
     assert config.llm.context_window == 8192
 
 
-def test_from_llm_mode_has_no_custom_model_override() -> None:
+def test_from_llm_mode_accepts_registered_model_choice() -> None:
     assert PipelineConfig.from_llm_mode("max-effect").llm.model == BONSAI_MODEL_ID
-    with pytest.raises(TypeError):
-        PipelineConfig.from_llm_mode("max-effect", model="other")  # type: ignore[call-arg]
+    assert PipelineConfig.from_llm_mode("max-effect", model="qwen3.5-9b").llm.model == "qwen3.5-9b"
+    assert PipelineConfig.from_llm_mode("balanced", model="qwen3.5-9b").llm.model == "qwen3.5-9b"
 
 
 def test_auditor_sends_openai_manager_request_and_parses_choice(monkeypatch) -> None:
