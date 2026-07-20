@@ -39,7 +39,7 @@ except ImportError as exc:
 
 PLACEHOLDER_RE = re.compile(r"【[^】]{1,80}】")
 
-app = FastAPI(title="legal-redactor Office restore API", version="0.1.2")
+app = FastAPI(title="legal-redactor Office restore API", version="0.2.0")
 
 
 class RestoreTextRequest(BaseModel):

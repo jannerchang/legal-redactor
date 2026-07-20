@@ -71,7 +71,7 @@ except ImportError as exc:
     raise RuntimeError("启动 Web UI 需要先安装依赖：pip install -r requirements.txt") from exc
 
 
-app = FastAPI(title="本地法律文书脱敏系统", version="0.1.2")
+app = FastAPI(title="本地法律文书脱敏系统", version="0.2.0")
 
 
 @dataclass(frozen=True)

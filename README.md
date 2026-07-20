@@ -17,19 +17,17 @@
 > 律师的专业判断，也不得用于未经授权的案件材料。未公开材料不得发送到公共 AI 或未经批准的
 > 第三方服务；使用者应自行遵守保密、数据安全、个人信息保护及所在机构的内部制度。
 
-## v0.1.2 架构更新
+## v0.2.0 全文识别更新
 
-`v0.1.2` 把候选发现、实体确认和流程编排拆成三个职责明确的深模块，目标是让后续新增 detector、调整 LLM 审核或修改掩码规则时，只改真正拥有该行为的模块：
+`v0.2.0` 默认使用 `qwen3.5-9b` 执行整篇文书双轮识别：首轮建立案件级实体登记表，第二轮重新阅读全文补充遗漏实体与明确的同一主体关系，再校验所有名称确实逐字存在于原文后生成确定性映射。
 
-- `CandidateCollector.collect(context)` 是候选发现的唯一生产接口，统一处理规则、HanLP、行政区划种子和 LLM 精确候选的顺序、offset 与去重；内部 helper 不再作为第二套公开接口。
-- `LinearRuleEngine.discover(text, candidates, analysis)` 只负责先应用 LLM reject/calibrate，再处理 span 冲突、确认实体并扩展确定性映射；不再导入或调用 detector。
-- `RedactionPipeline.redact` / `redact_many` 保持为稳定入口，负责固定正则、样本/base 映射、行政区划 span gate、LLM 编排、后处理和结果组装。
-- 删除未接入运行时的 `detector_registry`，避免维护者把新 detector 接到不会生效的错误 seam。
-- 非主 LLM 路径只执行一次规则发现；审核完成后仅追加 LLM 精确候选，不再重新扫描整篇法律文书。
+- Web、CLI 与配置工厂默认统一为 `full_document` 和 `qwen3.5-9b`，仍可按次切换模型或回退逐句窗口。
+- 人名与机构采用两轮合并登记；身份证号、电话、银行账号、案号及通过 gate 的行政区划继续走确定性规则。
+- 第二轮失败时保留首轮有效结果；首轮失败、无效或超过 120000 字符时明确回退逐句窗口，不截断原文。
+- ModelManager 继续只接收逻辑模型 ID，支持模型切换回滚与 worker 自愈，不向应用或页面暴露权重路径。
+- TXT 下载加入 UTF-8 BOM，兼容按系统默认编码打开中文文本的编辑器。
 
-本次改动保持外部调用方式、Web/CLI 入口、样本库运行时行为和失败降级策略不变。合并前聚焦回归覆盖候选顺序、offset、同姓编号、机构别名、行政区划优先级、LLM 校准顺序、fail-closed 短路和 Web 离线兜底。
-
-详细职责和不变量见 [线性阅读重构说明](docs/LINEAR_REFACTOR.md)。
+此前 `v0.1.2` 完成的候选发现、实体确认与流程编排分层仍保持不变：`CandidateCollector.collect(context)` 是候选发现入口，`LinearRuleEngine.discover(...)` 负责候选接受和映射扩展，`RedactionPipeline.redact` / `redact_many` 负责编排与降级。
 
 ## 工作原理
 
