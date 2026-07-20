@@ -2,7 +2,7 @@
 
 > **依据**:[`README.md`](README.md) + [`../../README.md`](../../README.md) + [`../LINEAR_REFACTOR.md`](../LINEAR_REFACTOR.md)
 > **格式**:七层硬门槛 + 决策表 + Step 顺序 + 时间盒
-> **schema 引用**:[`gate.schema.md`](/Users/jannerchang/Downloads/forge-flow-ffcs-1.0.74/plugins/ffcs/templates/gate.schema.md)
+> **schema 引用**:[`gate.schema.md`](/Users/example/Downloads/forge-flow-ffcs-1.0.74/plugins/ffcs/templates/gate.schema.md)
 > **版本**:v0.1 · `2026-06-10`
 
 ## §1 · 七层硬门槛(本 milestone 特化)

@@ -553,6 +553,7 @@ async def test_save_sample_page_only_saves_diffs(tmp_path, monkeypatch):
         "manual_corrections",
         "false_positive_deletes",
         "missing_adds",
+        "manual_modify_count",
         "restore_unresolved_placeholders",
         "newest_sample_provenance",
         "regression_suggestions",
@@ -560,6 +561,7 @@ async def test_save_sample_page_only_saves_diffs(tmp_path, monkeypatch):
     assert summary["manual_corrections"] == 3
     assert summary["false_positive_deletes"] == 1
     assert summary["missing_adds"] == 1
+    assert summary["manual_modify_count"] == 1
     assert {item["original"] for item in summary["lookup_entries"]} == {"李四明", "新增人名"}
     assert {item["original"] for item in summary["delete_blacklist_candidates"]} == {"删除人名"}
     delete_item = summary["delete_blacklist_candidates"][0]

@@ -4,7 +4,7 @@ Issues and PRDs for this repo live as GitHub issues. Use the `gh` CLI for all op
 
 ## Repository
 
-- Remote: `https://github.com/jannerchang/legal-redactor.git`
+- Remote: `https://github.com/<owner>/legal-redactor.git`
 - Run `gh` commands from the repo root so GitHub infers the repository from `git remote -v`.
 
 ## Conventions

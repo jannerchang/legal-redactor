@@ -1,7 +1,7 @@
 # candidate-collection-architecture · candidate-collector · execution plan
 
 > **Basis**: [README.md](README.md), GitHub issue #8, [../../../../LINEAR_REFACTOR.md](../../../../LINEAR_REFACTOR.md)
-> **Schema reference**: `/Users/jannerchang/.claude/plugins/cache/pbvcity/ffcs/1.1.30/templates/gate.schema.md`
+> **Schema reference**: `/Users/example/.claude/plugins/cache/pbvcity/ffcs/1.1.30/templates/gate.schema.md`
 > **Update rhythm**: synchronize this file and [_progress.md](_progress.md) at each step/gate
 > **Version**: v1.0 · 2026-07-09
 

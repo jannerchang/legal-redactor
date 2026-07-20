@@ -37,9 +37,14 @@ def _m6_report(
     f1: float = 1.0,
     precision: float = 1.0,
     recall: float = 1.0,
+    high_risk_miss_count: int | None = None,
+    wrong_merge_count: int | None = None,
+    wrong_split_count: int | None = None,
     manual_corrections: int = 0,
     false_positive_deletes: int = 0,
     missing_adds: int = 0,
+    manual_modify_count: int | None = None,
+    review_action_total: int | None = None,
     suppressed_risky_entry_count: int = 0,
     restore_unresolved_placeholder_count: int | None = None,
     gold_evaluation_ms: int | None = 900,
@@ -65,6 +70,9 @@ def _m6_report(
             "precision": precision,
             "recall": recall,
             "f1": f1,
+            "high_risk_miss_count": high_risk_miss_count,
+            "wrong_merge_count": wrong_merge_count,
+            "wrong_split_count": wrong_split_count,
             "cases": [],
         },
         "workflow": {
@@ -76,6 +84,8 @@ def _m6_report(
             "delete_blacklist_candidate_count": 0,
             "suppressed_risky_entry_count": suppressed_risky_entry_count,
             "restore_unresolved_placeholder_count": restore_unresolved_placeholder_count,
+            "manual_modify_count": manual_modify_count,
+            "review_action_total": review_action_total,
             "ignored_browser_fields": [],
         },
         "samples": {
@@ -135,7 +145,7 @@ def test_build_report_blocks_auto_switch_when_required_metric_evidence_is_missin
         generated_at="2026-07-03T00:00:00+00:00",
     )
 
-    assert report["schema_version"] == "M8-runtime-benchmark-report/v1"
+    assert report["schema_version"] == "M8-runtime-benchmark-report/v2"
     assert report["comparison"]["compatible"] is True
     assert report["comparison"]["deltas"][0]["label"] == "rapid-mlx"
     assert report["comparison"]["deltas"][0]["timing"]["total_redaction_eval_ms_delta"] == -200
@@ -186,6 +196,10 @@ def test_complete_evidence_can_recommend_faster_candidate_without_quality_regres
         ("false_positive_deletes", {"false_positive_deletes": 1}),
         ("missing_adds", {"missing_adds": 1}),
         ("suppressed_risky_entry_count", {"suppressed_risky_entry_count": 1}),
+        ("high_risk_miss_count", {"high_risk_miss_count": 1}),
+        ("wrong_merge_count", {"wrong_merge_count": 1}),
+        ("wrong_split_count", {"wrong_split_count": 1}),
+        ("review_action_total", {"review_action_total": 2}),
         ("restore_unresolved_placeholder_count", {"restore_unresolved_placeholder_count": 1}),
     ],
 )
@@ -197,9 +211,14 @@ def test_quality_or_workflow_regression_blocks_runtime_switch(field: str, kwargs
         "probe": {"model_match": True, "endpoint_label": "local-mlx"},
     }
 
+    baseline_kwargs = {"review_action_total": 1} if field == "review_action_total" else {}
     report = build_runtime_benchmark_report(
         [
-            _candidate("baseline", _m6_report(gold_evaluation_ms=900), observation=observation),
+            _candidate(
+                "baseline",
+                _m6_report(gold_evaluation_ms=900, **baseline_kwargs),
+                observation=observation,
+            ),
             _candidate("rapid-mlx", _m6_report(gold_evaluation_ms=600, **kwargs), observation=observation),
         ],
         generated_at="2026-07-03T00:00:00+00:00",
@@ -257,7 +276,7 @@ def test_privacy_boundary_rejects_raw_diagnostics_but_allows_m6_omitted_flags() 
 @pytest.mark.parametrize(
     "unsafe_value",
     [
-        "private manifest at /Users/jannerchang/legal-redactor/output/private",
+        "private manifest at /Users/example/legal-redactor/output/private",
         "private manifest at /Volumes/cases/output/private",
         "private manifest at ~/cases/output/private",
         r"private manifest at C:\\Users\\janner\\cases\\private",
@@ -344,7 +363,7 @@ def test_cli_writes_runtime_benchmark_report_and_errors_without_traceback(tmp_pa
     assert "baseline" in result.stdout
     assert "rapid-mlx" in result.stdout
     payload = json.loads(output_path.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == "M8-runtime-benchmark-report/v1"
+    assert payload["schema_version"] == "M8-runtime-benchmark-report/v2"
     assert payload["recommendation"]["action"] == "manual_review"
     assert str(tmp_path) not in json.dumps(payload, ensure_ascii=False)
 

@@ -89,7 +89,7 @@
 ### 实测脚本
 
 ```bash
-node /Users/jannerchang/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.111/lib/milestone-doc-check.mjs --dir docs/planning/legal-redactor-workflow-efficiency/milestones/M4-guided-intake-case-binding
+node /Users/example/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.111/lib/milestone-doc-check.mjs --dir docs/planning/legal-redactor-workflow-efficiency/milestones/M4-guided-intake-case-binding
 ```
 
 ### 验证标准

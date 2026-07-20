@@ -250,7 +250,7 @@ meeting requirements.
 - Required pre-review machine check:
 
 ```bash
-node /Users/jannerchang/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.123/lib/milestone-doc-check.mjs --dir docs/planning/legal-redactor-workflow-efficiency/milestones/M6-regression-measurement
+node /Users/example/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.123/lib/milestone-doc-check.mjs --dir docs/planning/legal-redactor-workflow-efficiency/milestones/M6-regression-measurement
 ```
 
 - Gate 0a must pass before Step 0 POC execution.

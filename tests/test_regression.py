@@ -174,9 +174,33 @@ def test_workflow_summary_aggregates_counts_without_forged_labels() -> None:
     assert workflow["delete_blacklist_candidate_count"] == 1
     assert workflow["suppressed_risky_entry_count"] == 1
     assert workflow["ignored_browser_fields"] == ["status", "workflow_state"]
+    assert workflow["manual_add_count"] == 2
+    assert workflow["manual_delete_count"] == 1
+    assert workflow["manual_modify_count"] is None
+    assert workflow["review_action_total"] is None
+    assert workflow["review_action_total_reason"] == "missing_manual_modify_evidence"
     encoded = json.dumps(workflow, ensure_ascii=False)
     assert RAW_PERSON not in encoded
     assert RAW_COMPANY not in encoded
+
+
+def test_workflow_summary_counts_explicit_modify_actions() -> None:
+    workflow = aggregate_sample_summaries(
+        [
+            {
+                "manual_corrections": 3,
+                "false_positive_deletes": 1,
+                "missing_adds": 1,
+                "manual_modify_count": 1,
+            }
+        ]
+    )
+
+    assert workflow["manual_add_count"] == 1
+    assert workflow["manual_delete_count"] == 1
+    assert workflow["manual_modify_count"] == 1
+    assert workflow["review_action_total"] == 3
+    assert workflow["review_action_total_reason"] is None
 
 
 def test_sample_provenance_is_metadata_only(tmp_path) -> None:
@@ -271,9 +295,10 @@ def test_build_regression_report_schema_and_privacy(tmp_path) -> None:
         "restore",
         "timing",
         "privacy",
+        "recognition",
         "regression_suggestions",
     }
-    assert report["schema_version"] == "M6-regression-report/v1"
+    assert report["schema_version"] == "M6-regression-report/v2"
     assert report["restore"] is None
     assert report["samples"]["newest_sample_provenance"]["exists"] is False
     assert report["privacy"]["safe_by_default"] is True

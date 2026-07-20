@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -13,6 +14,11 @@ from .io import (
 )
 from .pipeline import RedactionPipeline
 from .restore import preview_restore, restore_docx, restore_text
+from .recognition_benchmark import (
+    load_benchmark_manifest,
+    recognition_benchmark_report_to_json,
+    run_recognition_benchmark,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -28,6 +34,12 @@ def main(argv: list[str] | None = None) -> int:
         choices=("max-effect", "balanced", "off"),
         default="max-effect",
         help="本地 model-manager 的语义识别模式",
+    )
+    redact_parser.add_argument(
+        "--recognition-mode",
+        choices=("sentence_windows", "full_document"),
+        default="sentence_windows",
+        help="实体识别路径；整篇文书为实验模式",
     )
     redact_parser.add_argument("--model", default="bonsai-27b", help="model-manager 返回的逻辑模型 ID")
     redact_parser.add_argument("--debug-trace", action="store_true", help="额外输出 debug_trace.json")
@@ -59,9 +71,25 @@ def main(argv: list[str] | None = None) -> int:
         default="max-effect",
         help="评估使用的本地 model-manager 模式",
     )
+    eval_parser.add_argument(
+        "--recognition-mode",
+        choices=("sentence_windows", "full_document"),
+        default="sentence_windows",
+        help="评估使用的实体识别路径",
+    )
     eval_parser.add_argument("--model", default="bonsai-27b", help="model-manager 返回的逻辑模型 ID")
     eval_parser.add_argument("--fail-under-recall", type=float, default=None, help="低于该 recall 时返回非零")
     eval_parser.add_argument("--fail-under-precision", type=float, default=None, help="低于该 precision 时返回非零")
+    benchmark_parser = subparsers.add_parser(
+        "recognition-benchmark",
+        help="对固定 manifest 运行识别模式/模型配对实验",
+    )
+    benchmark_parser.add_argument("--manifest", required=True, help="输入 manifest JSON")
+    benchmark_parser.add_argument("--base-dir", required=True, help="manifest 相对路径基准目录")
+    benchmark_parser.add_argument("--gold", default=None, help="可选 gold JSON")
+    benchmark_parser.add_argument("--code-commit", required=True, help="当前代码提交 ID")
+    benchmark_parser.add_argument("--replicates", type=int, default=1, help="每个矩阵单元重复次数")
+    benchmark_parser.add_argument("--out", required=True, help="隐私安全报告输出路径")
 
     args = parser.parse_args(argv)
     if args.command == "redact":
@@ -74,13 +102,19 @@ def main(argv: list[str] | None = None) -> int:
         return _run_clear_samples(args)
     if args.command == "eval":
         return _run_eval(args)
+    if args.command == "recognition-benchmark":
+        return _run_recognition_benchmark(args)
     return 1
 
 
 def _run_redact(args: argparse.Namespace) -> int:
     input_path = Path(args.input)
     text = read_document(input_path)
-    config = PipelineConfig.offline_without_llm() if args.no_llm else PipelineConfig.from_llm_mode(args.llm_mode, model=args.model)
+    config = PipelineConfig.offline_without_llm() if args.no_llm else PipelineConfig.from_llm_mode(
+        args.llm_mode,
+        model=args.model,
+        recognition_mode=args.recognition_mode,
+    )
     pipeline = RedactionPipeline(config=config)
     result = pipeline.redact(text, source_file=input_path.name)
 
@@ -162,7 +196,11 @@ def _run_clear_samples(args: argparse.Namespace) -> int:
 def _run_eval(args: argparse.Namespace) -> int:
     from .evaluation import evaluate_gold_file, evaluation_report_to_json
 
-    config = PipelineConfig.offline_without_llm() if args.no_llm else PipelineConfig.from_llm_mode(args.llm_mode, model=args.model)
+    config = PipelineConfig.offline_without_llm() if args.no_llm else PipelineConfig.from_llm_mode(
+        args.llm_mode,
+        model=args.model,
+        recognition_mode=args.recognition_mode,
+    )
     report = evaluate_gold_file(args.gold, config=config)
     print(
         "cases={case_count} precision={precision:.4f} recall={recall:.4f} f1={f1:.4f} "
@@ -184,6 +222,28 @@ def _run_eval(args: argparse.Namespace) -> int:
         return 2
     if args.fail_under_precision is not None and report["precision"] < args.fail_under_precision:
         return 2
+    return 0
+
+
+def _run_recognition_benchmark(args: argparse.Namespace) -> int:
+    output_path = Path(args.out)
+    try:
+        manifest = load_benchmark_manifest(args.manifest)
+        report = run_recognition_benchmark(
+            manifest,
+            base_dir=args.base_dir,
+            gold_path=args.gold,
+            code_commit=args.code_commit,
+            replicate_count=args.replicates,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"recognition benchmark failed: {exc}", file=sys.stderr)
+        return 2
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(recognition_benchmark_report_to_json(report), encoding="utf-8")
+    print(f"report: {output_path}")
+    print(f"runs: {len(report['runs'])}")
     return 0
 
 

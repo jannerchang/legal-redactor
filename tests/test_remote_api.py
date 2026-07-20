@@ -161,17 +161,17 @@ def test_bind_discord_thread_to_case_ignores_missing_remote_case_root_override(t
 
 
 def test_case_status_by_thread_returns_discord_thread_url(tmp_path, monkeypatch) -> None:
-    create_or_update_manifest(tmp_path, "2026 6372", "https://discord.com/channels/1498679306967056394/1520000496138457160")
+    create_or_update_manifest(tmp_path, "2026 6372", "https://discord.com/channels/111/222/333")
     monkeypatch.setattr("legal_redactor.remote_api.get_case_root", lambda: tmp_path)
     monkeypatch.setattr("legal_redactor.remote_api._bind_case_root_candidates", lambda configured: [tmp_path])
 
-    result = case_status_by_thread("1520000496138457160", None)
+    result = case_status_by_thread("333", None)
 
     assert result["ok"] is True
     assert result["code"] == "missing_map"
     assert result["case"]["case_folder"] == "2026 6372"
-    assert result["case"]["discord_thread_id"] == "1520000496138457160"
-    assert result["case"]["discord_thread_url"] == "https://discord.com/channels/1498679306967056394/1520000496138457160"
+    assert result["case"]["discord_thread_id"] == "333"
+    assert result["case"]["discord_thread_url"] == "https://discord.com/channels/111/222/333"
     assert result["restore"]["status"] == "missing_map"
     assert result["next_action"] == "upload_mapping"
     assert_remote_payload_safe(result)

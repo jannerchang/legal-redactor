@@ -5,12 +5,17 @@ import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from json import JSONDecodeError
 from typing import Any
 
 from ._logging import get_logger
 from .config import LLMAPIConfig
+from .entity_registry import (
+    RegistryValidationResult,
+    parse_full_document_registry,
+    validate_registry_against_text,
+)
 
 
 
@@ -908,6 +913,30 @@ def orchestrate_sentence_extractions(
     return orchestrated
 
 
+@dataclass(frozen=True)
+class ModelCallMetadata:
+    call_count: int = 0
+    retry_count: int = 0
+    duration_ms: int = 0
+    prompt_token_count: int | None = None
+    completion_token_count: int | None = None
+    total_token_count: int | None = None
+    http_status: int | None = None
+
+
+@dataclass(frozen=True)
+class ModelManagerCallResult:
+    response_text: str
+    metadata: ModelCallMetadata
+
+
+@dataclass(frozen=True)
+class FullDocumentRegistryExtraction:
+    validation: RegistryValidationResult = dataclass_field(default_factory=RegistryValidationResult)
+    status: str = "success"
+    reason: str | None = None
+    metadata: ModelCallMetadata = dataclass_field(default_factory=ModelCallMetadata)
+
 @dataclass
 class LegalEntityAuditor:
     config: LLMAPIConfig
@@ -933,6 +962,84 @@ class LegalEntityAuditor:
             _logger.warning("语义审计与验证联合调用失败：%s", exc)
             # 联合调用失败时，返回空提取，并采用 fail-open（空拒绝列表）以保留所有规则候选
             return {"locations": [], "companies": [], "persons": [], "reject": [], "error": str(exc)}
+    def extract_full_document_registry(
+        self,
+        text: str,
+        enable_samples: bool = False,
+    ) -> FullDocumentRegistryExtraction:
+        """Extract and validate one document-level entity registry."""
+        _ = enable_samples
+        if not self.config.enabled:
+            return FullDocumentRegistryExtraction(status="disabled", reason="llm_disabled")
+        if len(text) > self.config.full_document_max_chars:
+            return FullDocumentRegistryExtraction(status="fallback", reason="input_too_large")
+
+        prompt = self._build_full_document_registry_prompt(text, enable_samples=False)
+        attempts = 1 + self.config.full_document_retry_count
+        total_metadata = ModelCallMetadata()
+        last_reason = "invalid_registry_payload"
+        for attempt in range(attempts):
+            current_prompt = prompt if attempt == 0 else self._build_registry_repair_prompt(text)
+            try:
+                response = self._call_model_manager_with_metadata(
+                    current_prompt,
+                    max_tokens=self.config.full_document_max_output_tokens,
+                    timeout_seconds=self.config.full_document_timeout_seconds,
+                )
+            except Exception as exc:
+                reason = self._safe_exception_reason(exc)
+                total_metadata = self._merge_call_metadata(
+                    total_metadata,
+                    ModelCallMetadata(
+                        call_count=1,
+                        retry_count=1 if attempt else 0,
+                        http_status=self._exception_http_status(exc),
+                    ),
+                )
+                return FullDocumentRegistryExtraction(
+                    status="fallback",
+                    reason=reason,
+                    metadata=total_metadata,
+                )
+
+            total_metadata = self._merge_call_metadata(
+                total_metadata,
+                ModelCallMetadata(
+                    call_count=response.metadata.call_count,
+                    retry_count=1 if attempt else 0,
+                    duration_ms=response.metadata.duration_ms,
+                    prompt_token_count=response.metadata.prompt_token_count,
+                    completion_token_count=response.metadata.completion_token_count,
+                    total_token_count=response.metadata.total_token_count,
+                    http_status=response.metadata.http_status,
+                ),
+            )
+            parsed = parse_full_document_registry(response.response_text)
+            if not parsed.valid:
+                last_reason = parsed.error or "invalid_registry_payload"
+                if attempt + 1 < attempts:
+                    continue
+                return FullDocumentRegistryExtraction(
+                    validation=parsed,
+                    status="fallback",
+                    reason=last_reason,
+                    metadata=total_metadata,
+                )
+            validated = validate_registry_against_text(text, parsed)
+            if not validated.valid:
+                return FullDocumentRegistryExtraction(
+                    validation=validated,
+                    status="fallback",
+                    reason=validated.error or "invalid_registry_payload",
+                    metadata=total_metadata,
+                )
+            return FullDocumentRegistryExtraction(
+                validation=validated,
+                status="success",
+                metadata=total_metadata,
+            )
+        return FullDocumentRegistryExtraction(status="fallback", reason=last_reason, metadata=total_metadata)
+
 
     def extract_sentence_entities(self, text: str, enable_samples: bool = False) -> dict[str, Any]:
         """Extract entities from sentence windows; context is previous/next sentence only."""
@@ -1155,6 +1262,16 @@ class LegalEntityAuditor:
         return merged
 
     def _call_model_manager(self, prompt: str, *, max_tokens: int = _AUDIT_MAX_TOKENS) -> dict[str, Any]:
+        response = self._call_model_manager_with_metadata(prompt, max_tokens=max_tokens)
+        return self._parse_json(response.response_text)
+
+    def _call_model_manager_with_metadata(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = _AUDIT_MAX_TOKENS,
+        timeout_seconds: int | None = None,
+    ) -> ModelManagerCallResult:
         body = json.dumps(
             {
                 "model": self.config.model,
@@ -1168,8 +1285,10 @@ class LegalEntityAuditor:
         connection = http.client.HTTPConnection(
             self.config.model_manager_host,
             self.config.model_manager_port,
-            timeout=self.config.timeout_seconds,
+            timeout=timeout_seconds or self.config.timeout_seconds,
         )
+        started = time.monotonic()
+        status: int | None = None
         try:
             connection.request(
                 "POST",
@@ -1178,12 +1297,14 @@ class LegalEntityAuditor:
                 headers={"Content-Type": "application/json"},
             )
             response = connection.getresponse()
+            status = response.status
             data = response.read().decode("utf-8", errors="replace")
         finally:
             connection.close()
+        duration_ms = max(0, int(round((time.monotonic() - started) * 1000)))
 
-        if response.status >= 400:
-            raise RuntimeError(f"Model manager HTTP {response.status}")
+        if status is not None and status >= 400:
+            raise RuntimeError(f"Model manager HTTP {status}")
 
         try:
             raw = json.loads(data)
@@ -1194,7 +1315,18 @@ class LegalEntityAuditor:
             raise RuntimeError("Model manager returned an empty response")
         message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
         response_text = message.get("content", "") if isinstance(message, dict) else ""
-        return self._parse_json(response_text)
+        usage = raw.get("usage", {}) if isinstance(raw, dict) else {}
+        return ModelManagerCallResult(
+            response_text=response_text if isinstance(response_text, str) else "",
+            metadata=ModelCallMetadata(
+                call_count=1,
+                duration_ms=duration_ms,
+                prompt_token_count=self._usage_int(usage, "prompt_tokens"),
+                completion_token_count=self._usage_int(usage, "completion_tokens"),
+                total_token_count=self._usage_int(usage, "total_tokens"),
+                http_status=status,
+            ),
+        )
 
     @staticmethod
     def _json_decode_failure_kind(value: str) -> str:
@@ -1583,6 +1715,78 @@ class LegalEntityAuditor:
             f"上一句：{previous_context}\n"
             f"下一句：{next_context}\n\n"
             f"=== 句子窗口 ===\n{windows_str}\n"
+        )
+
+    @staticmethod
+    def _usage_int(usage: object, key: str) -> int | None:
+        if not isinstance(usage, dict):
+            return None
+        value = usage.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    @staticmethod
+    def _merge_call_metadata(left: ModelCallMetadata, right: ModelCallMetadata) -> ModelCallMetadata:
+        def add_optional(a: int | None, b: int | None) -> int | None:
+            if a is None and b is None:
+                return None
+            return (a or 0) + (b or 0)
+
+        return ModelCallMetadata(
+            call_count=left.call_count + right.call_count,
+            retry_count=left.retry_count + right.retry_count,
+            duration_ms=left.duration_ms + right.duration_ms,
+            prompt_token_count=add_optional(left.prompt_token_count, right.prompt_token_count),
+            completion_token_count=add_optional(left.completion_token_count, right.completion_token_count),
+            total_token_count=add_optional(left.total_token_count, right.total_token_count),
+            http_status=right.http_status if right.http_status is not None else left.http_status,
+        )
+
+    @staticmethod
+    def _safe_exception_reason(exc: Exception) -> str:
+        if isinstance(exc, TimeoutError):
+            return "timeout"
+        match = re.search(r"HTTP (\d{3})", str(exc))
+        if match:
+            return f"http_{match.group(1)}"
+        return type(exc).__name__.lower()
+
+    @staticmethod
+    def _exception_http_status(exc: Exception) -> int | None:
+        match = re.search(r"HTTP (\d{3})", str(exc))
+        return int(match.group(1)) if match else None
+
+    def _build_registry_repair_prompt(self, text: str) -> str:
+        return (
+            "/no_think\n"
+            "上一轮输出不是合法的案件级实体登记 JSON。重新阅读同一全文，只输出合法 JSON；"
+            "不要解释、不要 Markdown、不要省略字段。\n"
+            f"=== 文书全文 ===\n{text}\n"
+        )
+
+    def _build_full_document_registry_prompt(
+        self,
+        text: str,
+        enable_samples: bool = False,
+    ) -> str:
+        _ = enable_samples
+        return (
+            "/no_think\n"
+            "你是法律文书案件级实体登记器。一次阅读完整文书，只输出一个紧凑 JSON 对象；"
+            "不要解释、不要 Markdown、不要输出脱敏稿。\n"
+            "只登记三类：person、organization、location。primary_text、variants、evidence 必须逐字来自原文，"
+            "不得修改内部字符；evidence 每条不超过 160 字。\n"
+            "同一真实主体的明确全称、简称、曾用名可放入同一 entities 项；无法确认时放 uncertain。"
+            "明确不是同一主体的 ID 放 do_not_merge。\n"
+            "禁止登记普通指代、职务称谓（如张经理）、审判人员、法官助理、书记员、项目、合同、案号、"
+            "电话、身份证号、银行账号、详细地址或其他编号。地点只登记符合当前脱敏策略的行政区划名称。\n"
+            "entity_id 使用文书内稳定短 ID；confidence 为 0 到 1。无实体时返回空数组。\n"
+            "输出格式："
+            '{"entities":[{"entity_id":"person-1","type":"person","primary_text":"张三",'
+            '"variants":["张三"],"confidence":0.9,"evidence":["原告张三"]}],'
+            '"do_not_merge":[{"left_id":"org-1","right_id":"org-2"}],'
+            '"uncertain":[{"text":"星河公司","possible_type":"organization",'
+            '"possible_entity_ids":["org-1","org-2"]}]}\n'
+            f"=== 文书全文 ===\n{text}\n"
         )
 
     def _build_merged_prompt(self, text: str, candidates: list[dict], enable_samples: bool = False) -> str:

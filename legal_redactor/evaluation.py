@@ -16,13 +16,25 @@ class ExpectedEntity:
     original: str
     type: str | None = None
     masked: str | None = None
+    high_risk: bool | None = None
+    entity_id: str | None = None
+    alias_group: str | None = None
+    do_not_merge: tuple[str, ...] = ()
 
-    def to_dict(self) -> dict[str, str]:
-        data = {"original": self.original}
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"original": self.original}
         if self.type:
             data["type"] = self.type
         if self.masked:
             data["masked"] = self.masked
+        if self.high_risk is not None:
+            data["high_risk"] = self.high_risk
+        if self.entity_id:
+            data["entity_id"] = self.entity_id
+        if self.alias_group:
+            data["alias_group"] = self.alias_group
+        if self.do_not_merge:
+            data["do_not_merge"] = list(self.do_not_merge)
         return data
 
 
@@ -40,6 +52,12 @@ def evaluate_gold_file(
     pipeline = RedactionPipeline(config=config or PipelineConfig.max_effect())
     case_reports = []
     totals = {"tp": 0, "fp": 0, "fn": 0}
+    per_type_totals: dict[str, dict[str, int]] = {}
+    high_risk_miss_count = 0
+    high_risk_evidence = False
+    wrong_merge_count = 0
+    wrong_split_count = 0
+    identity_evidence = False
     for index, raw_case in enumerate(cases, 1):
         if not isinstance(raw_case, dict):
             raise ValueError(f"case #{index} 必须是 JSON 对象")
@@ -48,8 +66,23 @@ def evaluate_gold_file(
         totals["tp"] += int(case_report["true_positive"])
         totals["fp"] += int(case_report["false_positive"])
         totals["fn"] += int(case_report["false_negative"])
+        for entity_type, counts in case_report.get("by_type_counts", {}).items():
+            totals_for_type = per_type_totals.setdefault(entity_type, {"tp": 0, "fp": 0, "fn": 0})
+            for key in ("tp", "fp", "fn"):
+                totals_for_type[key] += int(counts.get(key, 0))
+        if case_report.get("high_risk_miss_count") is not None:
+            high_risk_evidence = True
+            high_risk_miss_count += int(case_report["high_risk_miss_count"])
+        if case_report.get("wrong_merge_count") is not None:
+            identity_evidence = True
+            wrong_merge_count += int(case_report["wrong_merge_count"])
+            wrong_split_count += int(case_report["wrong_split_count"])
 
     metrics = _metrics(totals["tp"], totals["fp"], totals["fn"])
+    by_type = {
+        entity_type: {**counts, **_metrics(counts["tp"], counts["fp"], counts["fn"])}
+        for entity_type, counts in sorted(per_type_totals.items())
+    }
     return {
         "version": "1.0",
         "gold_file": str(path),
@@ -59,6 +92,12 @@ def evaluate_gold_file(
         "false_positive": totals["fp"],
         "false_negative": totals["fn"],
         **metrics,
+        "by_type": by_type,
+        "high_risk_miss_count": high_risk_miss_count if high_risk_evidence else None,
+        "high_risk_miss_reason": None if high_risk_evidence else "missing_high_risk_annotation",
+        "wrong_merge_count": wrong_merge_count if identity_evidence else None,
+        "wrong_split_count": wrong_split_count if identity_evidence else None,
+        "identity_metric_reason": None if identity_evidence else "missing_identity_annotation",
         "cases": case_reports,
     }
 
@@ -77,6 +116,11 @@ def evaluate_case(
     result = pipeline.redact(text, source_file=str(source_file))
     actual = _actual_entities(result.redaction_map.mappings)
     matches, missing, extra = _match_entities(expected, actual)
+    by_type_counts = _type_counts(expected, actual, matches, missing, extra)
+    high_risk_items = [item for item in expected if item.high_risk is not None]
+    high_risk_misses = [item for item in missing if item.high_risk is True]
+    identity_items = [item for item in expected if item.entity_id or item.alias_group or item.do_not_merge]
+    wrong_merge_count, wrong_split_count = _identity_errors(expected, actual)
     metrics = _metrics(len(matches), len(extra), len(missing))
     return {
         "name": name,
@@ -92,6 +136,11 @@ def evaluate_case(
         "extra": [item.to_dict() for item in extra],
         "warnings": result.warnings,
         "leaks": [leak.to_dict() for leak in result.leaks],
+        "recognition_stats": result.recognition_stats.to_dict() if result.recognition_stats else None,
+        "by_type_counts": by_type_counts,
+        "high_risk_miss_count": len(high_risk_misses) if high_risk_items else None,
+        "wrong_merge_count": wrong_merge_count if identity_items else None,
+        "wrong_split_count": wrong_split_count if identity_items else None,
     }
 
 
@@ -144,10 +193,15 @@ def _expected_entity(item: Any) -> ExpectedEntity:
         raise ValueError("expected 条目缺少 original/text/name/full")
     entity_type = item.get("type")
     masked = item.get("masked")
+    raw_guard = item.get("do_not_merge", [])
     return ExpectedEntity(
         original=original,
         type=str(entity_type) if entity_type else None,
         masked=str(masked) if masked else None,
+        high_risk=item.get("high_risk") if isinstance(item.get("high_risk"), bool) else None,
+        entity_id=str(item["entity_id"]) if item.get("entity_id") else None,
+        alias_group=str(item["alias_group"]) if item.get("alias_group") else None,
+        do_not_merge=tuple(str(value) for value in raw_guard) if isinstance(raw_guard, list) else (),
     )
 
 
@@ -159,7 +213,15 @@ def _actual_entities(mappings: list[MappingEntry]) -> list[ExpectedEntity]:
         if key in seen:
             continue
         seen.add(key)
-        actual.append(ExpectedEntity(type=mapping.type, original=mapping.original, masked=mapping.masked))
+        actual.append(
+            ExpectedEntity(
+                type=mapping.type,
+                original=mapping.original,
+                masked=mapping.masked,
+                entity_id=mapping.entity_id,
+                do_not_merge=mapping.do_not_merge,
+            )
+        )
     return actual
 
 
@@ -197,6 +259,64 @@ def _find_match(
             continue
         return index
     return None
+
+
+def _type_counts(
+    expected: list[ExpectedEntity],
+    actual: list[ExpectedEntity],
+    _matched: list[ExpectedEntity],
+    missing: list[ExpectedEntity],
+    extra: list[ExpectedEntity],
+) -> dict[str, dict[str, int]]:
+    types = {item.type or "unknown" for item in [*expected, *actual]}
+    missing_ids = {id(item) for item in missing}
+    extra_ids = {id(item) for item in extra}
+    return {
+        entity_type: {
+            "tp": sum(
+                id(item) not in missing_ids and (item.type or "unknown") == entity_type
+                for item in expected
+            ),
+            "fp": sum(id(item) in extra_ids and (item.type or "unknown") == entity_type for item in actual),
+            "fn": sum(id(item) in missing_ids and (item.type or "unknown") == entity_type for item in expected),
+        }
+        for entity_type in types
+    }
+
+
+def _identity_errors(
+    expected: list[ExpectedEntity],
+    actual: list[ExpectedEntity],
+) -> tuple[int, int]:
+    actual_by_original = {item.original: item for item in actual}
+    blocked_pairs: set[tuple[str, str]] = set()
+    for item in expected:
+        actual_item = actual_by_original.get(item.original)
+        if actual_item is None or not actual_item.masked:
+            continue
+        for blocked_id in item.do_not_merge:
+            blocked = next((candidate for candidate in expected if candidate.entity_id == blocked_id), None)
+            blocked_actual = actual_by_original.get(blocked.original) if blocked else None
+            if blocked_actual and blocked_actual.masked == actual_item.masked:
+                left = item.entity_id or item.original
+                right = blocked.entity_id or blocked.original
+                blocked_pairs.add(tuple(sorted((left, right))))
+
+    wrong_split = 0
+    groups: dict[str, list[ExpectedEntity]] = {}
+    for item in expected:
+        group = item.alias_group or item.entity_id
+        if group:
+            groups.setdefault(group, []).append(item)
+    for items in groups.values():
+        masks = {
+            actual_by_original[item.original].masked
+            for item in items
+            if item.original in actual_by_original and actual_by_original[item.original].masked
+        }
+        if len(masks) > 1:
+            wrong_split += 1
+    return len(blocked_pairs), wrong_split
 
 
 def _metrics(tp: int, fp: int, fn: int) -> dict[str, float]:

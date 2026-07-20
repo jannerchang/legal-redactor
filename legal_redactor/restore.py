@@ -14,7 +14,7 @@ def restore_text(redacted_text: str, redaction_map: RedactionMap, restore_all: b
     可能的误匹配问题（例如某个占位符碰巧出现在不应还原的上下文中）。
     """
     entries = _entries_to_restore(redaction_map.mappings, restore_all)
-    lookup = {entry.masked: entry.original for entry in entries if entry.masked}
+    lookup = _restore_lookup(entries)
     return replace_by_lookup(redacted_text, lookup)
 
 
@@ -35,7 +35,7 @@ def restore_docx(
         raise RuntimeError("还原 docx 需要安装 python-docx：pip install -r requirements.txt") from exc
 
     entries = _entries_to_restore(redaction_map.mappings, restore_all)
-    lookup = {entry.masked: entry.original for entry in entries if entry.masked}
+    lookup = _restore_lookup(entries)
     document = Document(str(input_path))
     count = 0
     for paragraph in _iter_document_paragraphs(document):
@@ -64,6 +64,32 @@ def preview_restore(redacted_text: str, redaction_map: RedactionMap, restore_all
         skipped_entries=skipped_entries,
         diff=diff,
     )
+
+
+def _restore_lookup(entries: list[MappingEntry]) -> dict[str, str]:
+    """Restore unique masks exactly and shared registry masks to their primary text."""
+    grouped: dict[str, list[MappingEntry]] = {}
+    for entry in entries:
+        if entry.masked:
+            grouped.setdefault(entry.masked, []).append(entry)
+
+    lookup: dict[str, str] = {}
+    for masked, candidates in grouped.items():
+        if len(candidates) == 1:
+            lookup[masked] = candidates[0].original
+            continue
+        canonical = next(
+            (
+                entry.restore_original
+                for entry in candidates
+                if entry.restore_original
+            ),
+            None,
+        )
+        lookup[masked] = canonical if canonical is not None else candidates[-1].original
+    return lookup
+
+
 
 
 def _entries_to_restore(entries: list[MappingEntry], restore_all: bool) -> list[MappingEntry]:

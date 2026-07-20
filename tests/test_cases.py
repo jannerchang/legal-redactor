@@ -239,11 +239,11 @@ def test_remote_payload_safety_rejects_forbidden_fields_and_values() -> None:
     assert_remote_payload_safe({"restore": {"restored_relative_path": "restored/judgment.txt"}})
     for payload in [
         {"restore": {"unresolved_placeholders": ["【PERSON_001】"]}},
-        {"restore": {"restored_relative_path": "/Users/jannerchang/private.txt"}},
+        {"restore": {"restored_relative_path": "/Users/example/private.txt"}},
         {"restore": {"restored_relative_path": "../../secret.txt"}},
         {"restore": {"restored_relative_path": "/private/model.bin"}},
-        {"restore": {"restored_relative_path": "C:\\Users\\jannerchang\\private-model\\model.bin"}},
-        {"restore": {"restored_relative_path": "C:/Users/jannerchang/private-model/model.bin"}},
+        {"restore": {"restored_relative_path": "C:\\Users\\private-user\\private-model\\model.bin"}},
+        {"restore": {"restored_relative_path": "C:/Users/example/private-model/model.bin"}},
         {"restore": {"restored_relative_path": "\\\\server\\share\\private-model\\model.bin"}},
         {"restore": {"restored_relative_path": "//server/share/private-model/model.bin"}},
         {"restore": {"restored_relative_path": "\\\\fileserver"}},

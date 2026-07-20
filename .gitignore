@@ -35,8 +35,12 @@ tests/*
 !tests/test_model_manager.py
 !tests/test_llm_config.py
 !tests/test_start_model_manager.py
+!tests/test_recognition_benchmark.py
+!tests/test_models.py
+!tests/test_restore.py
 test_new_rules.py
 scratch_test_samples.py
 .ff-state/
 .claude/
 .codex/
+.agents/

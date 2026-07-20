@@ -143,7 +143,7 @@ class ModelManager:
         with self._lock:
             self._refresh_worker_state()
             return {
-                "status": "ok",
+                "status": "error" if self._worker_state == "error" else "ok",
                 "active_model": self._active_model,
                 "worker_state": self._worker_state,
             }
@@ -191,12 +191,35 @@ class ModelManager:
 
     def _ensure_worker(self, spec: ModelSpec) -> None:
         self._refresh_worker_state()
+        previous_spec: ModelSpec | None = None
         if self._worker_process is not None and self._worker_state == "ready":
             if self._active_model == spec.id:
                 return
+            previous_spec = self._available_model_spec(self._active_model)
             self._stop_worker()
         elif self._worker_process is not None:
             raise ModelManagerError("MLX worker stopped before handling the request")
+
+        try:
+            self._start_worker(spec)
+        except ModelManagerError as switch_error:
+            if previous_spec is None:
+                raise
+            try:
+                self._start_worker(previous_spec)
+            except ModelManagerError as rollback_error:
+                raise ModelManagerError("MLX worker switch and rollback failed") from rollback_error
+            raise ModelManagerError("Requested model failed to start; previous model restored") from switch_error
+
+    def _available_model_spec(self, model_id: str | None) -> ModelSpec | None:
+        if model_id is None:
+            return None
+        spec = self._models.get(model_id)
+        if spec is None or not _model_source_is_available(spec.path):
+            return None
+        return ModelSpec(spec.id, spec.label, _resolve_model_source(spec.path))
+
+    def _start_worker(self, spec: ModelSpec) -> None:
         if not shutil.which("mlx_lm.server"):
             raise ModelManagerError("mlx_lm.server is not installed")
         if _port_is_listening(self._worker_host, self._worker_port):

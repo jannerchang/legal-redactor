@@ -39,13 +39,13 @@ def test_status_details_recursively_scrub_paths_and_secret_values() -> None:
         {
             "model_ids": [
                 "remote-model",
-                "/Users/jannerchang/private-model",
-                "C:\\Users\\jannerchang\\private-model\\model.bin",
+                "/Users/example/private-model",
+                "C:\\Users\\private-user\\private-model\\model.bin",
                 "https://example.com/docs/path",
                 "合同编号 A\\B-001",
                 {"path": "/Volumes/cases/model.bin", "note": "Bearer secret-token-value"},
             ],
-            "nested": {"config_path": "/Users/jannerchang/config/api.local.json"},
+            "nested": {"config_path": "/Users/example/config/api.local.json"},
             "message": "案件库目录存在且可写。",
         },
     ).to_dict()
@@ -59,7 +59,7 @@ def test_status_details_recursively_scrub_paths_and_secret_values() -> None:
     assert "/Users/" not in text
     assert "/Volumes/" not in text
     assert "secret-token-value" not in text
-    assert "jannerchang" not in text
+    assert "private-user" not in text
     assert "private-model" not in text
     assert "model.bin" not in text
     assert "api.local.json" not in text
@@ -114,6 +114,21 @@ def test_model_manager_probe_checks_health_and_logical_registry(monkeypatch) -> 
     }
 
 
+
+def test_model_manager_probe_reports_worker_error_as_unavailable(monkeypatch) -> None:
+    responses = iter(
+        [
+            (200, json.dumps({"status": "error", "active_model": None, "worker_state": "error"})),
+        ]
+    )
+    monkeypatch.setattr("legal_redactor.status._http_get", lambda *args: next(responses))
+
+    item = probe_model_manager(environ={}, timeout=0.01)
+
+    assert item.state == "error"
+    assert item.details["worker_state"] == "error"
+    assert item.details["reason"] == "worker_error"
+    assert probe_recognition_mode(item).state == "degraded"
 def test_model_manager_probe_classifies_invalid_and_unavailable_responses(monkeypatch) -> None:
     assert probe_model_manager(environ={"LEGAL_REDACTOR_MODEL_MANAGER_PORT": "bad"}).state == "error"
     assert probe_model_manager(environ={"LEGAL_REDACTOR_SKIP_MLX": "1", "LEGAL_REDACTOR_MODEL_MANAGER_PORT": "bad"}).state == "skipped"

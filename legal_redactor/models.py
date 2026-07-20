@@ -64,13 +64,20 @@ class MappingEntry:
     confidence: float
     restore_by_default: bool
     reason: str | None = None
+    entity_id: str | None = None
+    do_not_merge: tuple[str, ...] = ()
+    restore_original: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MappingEntry":
-        return cls(**data)
+        values = dict(data)
+        raw_guard = values.get("do_not_merge", ())
+        values["do_not_merge"] = tuple(raw_guard) if isinstance(raw_guard, (list, tuple)) else ()
+        values.setdefault("restore_original", None)
+        return cls(**values)
 
 
 @dataclass
@@ -112,7 +119,7 @@ class RedactionMap:
             created_at=str(data.get("created_at", "")),
             mode=str(data.get("mode", "normal")),
             source_file=data.get("source_file"),
-            mappings=[MappingEntry(**item) for item in data.get("mappings", [])],
+            mappings=[MappingEntry.from_dict(item) for item in data.get("mappings", [])],
         )
 
 
@@ -137,6 +144,27 @@ class RestorePreview:
     diff: str
 
 
+@dataclass(frozen=True)
+class RecognitionRunStats:
+    mode: str
+    model_id: str | None
+    status: str
+    document_count: int = 1
+    call_count: int = 0
+    retry_count: int = 0
+    fallback_count: int = 0
+    conflict_count: int = 0
+    duration_ms: int = 0
+    prompt_token_count: int | None = None
+    completion_token_count: int | None = None
+    total_token_count: int | None = None
+    reason: str | None = None
+    category_counts: dict[str, int] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 @dataclass
 class RedactionResult:
     original_text: str
@@ -147,6 +175,7 @@ class RedactionResult:
     leaks: list[Leak]
     mode: str
     warnings: list[str] = field(default_factory=list)
+    recognition_stats: RecognitionRunStats | None = None
 
 
 @dataclass
@@ -166,3 +195,4 @@ class BatchRedactionResult:
     leaks: list[Leak]
     mode: str
     warnings: list[str] = field(default_factory=list)
+    recognition_stats: RecognitionRunStats | None = None

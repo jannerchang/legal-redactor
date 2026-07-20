@@ -177,7 +177,7 @@ forged decision fields are hard gates.
 
 ### 6.4 · FFCS/profile status
 
-- **命令**:`node .../status-card.mjs --cwd=/Users/jannerchang/legal-redactor --json` and `node .../local-config.mjs profile --host=/Users/jannerchang/legal-redactor`
+- **命令**:`node .../status-card.mjs --cwd=/Users/example/legal-redactor --json` and `node .../local-config.mjs profile --host=/Users/example/legal-redactor`
 - **实测时间**:2026-06-29 CST
 
 | # | 名称 | 文档分类 | 权威分类 | 权威源行号 | 动作 |

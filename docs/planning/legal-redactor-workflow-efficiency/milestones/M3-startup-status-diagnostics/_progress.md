@@ -223,10 +223,10 @@ are mandatory.
   `.venv/bin/python -m py_compile legal_redactor/local_config.py legal_redactor/status.py legal_redactor/web_app.py`
   → pass; `git diff --check` → pass.
 - **Gate 2 doc-check**:
-  `node /Users/jannerchang/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.111/lib/milestone-doc-check.mjs --dir docs/planning/legal-redactor-workflow-efficiency/milestones/M3-startup-status-diagnostics --gate2`
+  `node /Users/example/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.111/lib/milestone-doc-check.mjs --dir docs/planning/legal-redactor-workflow-efficiency/milestones/M3-startup-status-diagnostics --gate2`
   → `OK · 0 findings`.
 - **pre-push checklist dry-run**:
-  `node /Users/jannerchang/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.111/lib/pre-push-checklist.mjs --project-root /Users/jannerchang/legal-redactor --dry-run`
+  `node /Users/example/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.111/lib/pre-push-checklist.mjs --project-root /Users/example/legal-redactor --dry-run`
   → `severity=pass`; fixture check skipped/pass due `git ls-files ... ENOBUFS`; no GitHub push/PR in this run.
 - **read-only smoke**:
   - existing `http://127.0.0.1:7860/health` → `{"status":"ok","bind_host":"127.0.0.1","network":"offline"}`

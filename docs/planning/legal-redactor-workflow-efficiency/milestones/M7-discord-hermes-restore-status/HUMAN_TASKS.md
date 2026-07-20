@@ -1,6 +1,6 @@
 # M7-discord-hermes-restore-status · discord-hermes-restore-status · HUMAN_TASKS · 用户介入项
 
-> **依据**:[README.md](README.md) + [EXECUTION_PLAN.md](EXECUTION_PLAN.md) + /Users/jannerchang/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.123/templates/gate.schema.md §四
+> **依据**:[README.md](README.md) + [EXECUTION_PLAN.md](EXECUTION_PLAN.md) + /Users/example/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.123/templates/gate.schema.md §四
 > **节奏**:实装期填 · §A 物理无法 + §B 评审拍板 · 不混 AI 自决项
 > **强约束**:不把 AI 自己能判断的设计选型塞进本文件 · §B 评审拍板项必须 Gate 0a 内消化完
 > **版本**:v1.1 · 2026-06-29

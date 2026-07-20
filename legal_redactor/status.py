@@ -164,11 +164,21 @@ def probe_model_manager(
         health_payload = json.loads(health_body)
     except json.JSONDecodeError:
         return StatusItem("model_manager", "本地模型 API", "error", "本地模型 API /health 未返回有效 JSON。", "检查模型管理器", details)
-    if not isinstance(health_payload, dict) or health_payload.get("status") != "ok":
+    if not isinstance(health_payload, dict) or health_payload.get("status") not in {"ok", "error"}:
         return StatusItem("model_manager", "本地模型 API", "error", "本地模型 API /health 返回结构不符合协议。", "检查模型管理器", details)
     worker_state = health_payload.get("worker_state")
     if worker_state in {"ready", "stopped", "starting", "error"}:
         details["worker_state"] = worker_state
+    if health_payload.get("status") == "error" or worker_state == "error":
+        details["reason"] = "worker_error"
+        return StatusItem(
+            "model_manager",
+            "本地模型 API",
+            "error",
+            "本地模型 worker 当前不可用。",
+            "检查模型管理器后重试",
+            details,
+        )
     try:
         models_status, models_body = _http_get(host, port, "/v1/models", timeout)
     except socket.timeout:

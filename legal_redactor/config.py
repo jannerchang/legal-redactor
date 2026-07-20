@@ -174,14 +174,31 @@ class LLMAPIConfig:
     enabled: bool = True
     role: str = "candidate_review_only"
     mode: str = "max-effect"
+    recognition_mode: str = "sentence_windows"
     model: str = DEFAULT_MODEL_ID
     temperature: float = 0.0
     context_window: int = 32768
     output_format: str = "json"
     timeout_seconds: int = 120
+    full_document_max_chars: int = 120000
+    full_document_max_output_tokens: int = 8192
+    full_document_timeout_seconds: int = 240
+    full_document_retry_count: int = 1
     fail_open: bool = True
     model_manager_host: str = field(default_factory=lambda: os.environ.get("LEGAL_REDACTOR_MODEL_MANAGER_HOST", DEFAULT_MODEL_MANAGER_HOST))
     model_manager_port: int = field(default_factory=lambda: int(os.environ.get("LEGAL_REDACTOR_MODEL_MANAGER_PORT", str(DEFAULT_MODEL_MANAGER_PORT))))
+
+    def __post_init__(self) -> None:
+        if self.recognition_mode not in {"sentence_windows", "full_document"}:
+            raise ValueError(f"unsupported recognition mode: {self.recognition_mode}")
+        if self.full_document_max_chars <= 0:
+            raise ValueError("full_document_max_chars must be positive")
+        if self.full_document_max_output_tokens <= 0:
+            raise ValueError("full_document_max_output_tokens must be positive")
+        if self.full_document_timeout_seconds <= 0:
+            raise ValueError("full_document_timeout_seconds must be positive")
+        if self.full_document_retry_count < 0:
+            raise ValueError("full_document_retry_count must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -215,12 +232,18 @@ class PipelineConfig:
         )
 
     @classmethod
-    def max_effect(cls, profile_name: str = "standard", model: str = DEFAULT_MODEL_ID) -> "PipelineConfig":
+    def max_effect(
+        cls,
+        profile_name: str = "standard",
+        model: str = DEFAULT_MODEL_ID,
+        recognition_mode: str = "sentence_windows",
+    ) -> "PipelineConfig":
         llm = LLMAPIConfig(
             enabled=True,
             role="sentence_entity_extraction",
             model=model,
             mode="max-effect",
+            recognition_mode=recognition_mode,
             context_window=8192,
             timeout_seconds=120,
             fail_open=True,
@@ -233,12 +256,18 @@ class PipelineConfig:
         )
 
     @classmethod
-    def balanced_llm(cls, profile_name: str = "standard", model: str = DEFAULT_MODEL_ID) -> "PipelineConfig":
+    def balanced_llm(
+        cls,
+        profile_name: str = "standard",
+        model: str = DEFAULT_MODEL_ID,
+        recognition_mode: str = "sentence_windows",
+    ) -> "PipelineConfig":
         llm = LLMAPIConfig(
             enabled=True,
             role="sentence_entity_extraction",
             model=model,
             mode="balanced",
+            recognition_mode=recognition_mode,
             context_window=8192,
             timeout_seconds=180,
             fail_open=False,
@@ -256,11 +285,20 @@ class PipelineConfig:
         llm_mode: str,
         profile_name: str = "standard",
         model: str = DEFAULT_MODEL_ID,
+        recognition_mode: str = "sentence_windows",
     ) -> "PipelineConfig":
         if llm_mode == "off":
             return cls.offline_without_llm(profile_name)
         if llm_mode == "balanced":
-            return cls.balanced_llm(profile_name, model=model)
+            return cls.balanced_llm(
+                profile_name,
+                model=model,
+                recognition_mode=recognition_mode,
+            )
         if llm_mode == "max-effect":
-            return cls.max_effect(profile_name, model=model)
+            return cls.max_effect(
+                profile_name,
+                model=model,
+                recognition_mode=recognition_mode,
+            )
         raise ValueError(f"unsupported llm mode: {llm_mode}")

@@ -108,7 +108,7 @@ curl -s http://127.0.0.1:18080/v1/models
 ### 实测脚本
 
 ```bash
-node /Users/jannerchang/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.111/lib/milestone-doc-check.mjs --dir docs/planning/legal-redactor-workflow-efficiency/milestones/M3-startup-status-diagnostics
+node /Users/example/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.111/lib/milestone-doc-check.mjs --dir docs/planning/legal-redactor-workflow-efficiency/milestones/M3-startup-status-diagnostics
 ```
 
 ### 验证标准

@@ -3,16 +3,18 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from .regression import LEGACY_SCHEMA_VERSION as M6_LEGACY_SCHEMA_VERSION
 from .regression import SCHEMA_VERSION as M6_SCHEMA_VERSION
 from .regression import assert_privacy_safe_report
 
 
-SCHEMA_VERSION = "M8-runtime-benchmark-report/v1"
+SCHEMA_VERSION = "M8-runtime-benchmark-report/v2"
+LEGACY_SCHEMA_VERSION = "M8-runtime-benchmark-report/v1"
 _CONTEXT_REQUIRED_FIELDS = (
     "gold_set_id",
     "gold_set_hash",
@@ -30,6 +32,9 @@ _QUALITY_FIELDS = (
     "precision",
     "recall",
     "f1",
+    "high_risk_miss_count",
+    "wrong_merge_count",
+    "wrong_split_count",
 )
 _WORKFLOW_FIELDS = (
     "summary_count",
@@ -40,6 +45,10 @@ _WORKFLOW_FIELDS = (
     "delete_blacklist_candidate_count",
     "suppressed_risky_entry_count",
     "restore_unresolved_placeholder_count",
+    "manual_add_count",
+    "manual_delete_count",
+    "manual_modify_count",
+    "review_action_total",
 )
 _RAW_KEYS = {
     "original",
@@ -57,7 +66,6 @@ _RAW_KEYS = {
     "lookup_entries",
     "delete_blacklist_candidates",
     "suppressed_risky_entries",
-    "tokens",
     "api_token",
     "authorization",
     "prompt",
@@ -79,6 +87,7 @@ _WORKFLOW_REGRESSION_FIELDS = (
     "missing_adds",
     "suppressed_risky_entry_count",
     "restore_unresolved_placeholder_count",
+    "review_action_total",
 )
 
 
@@ -90,7 +99,10 @@ class BenchmarkCandidateInput:
     m6_report_path: str | Path
     m6_report: dict[str, Any]
     benchmark_context: dict[str, Any]
-    observation: dict[str, Any] = field(default_factory=dict)
+    observation: dict[str, Any] = dataclass_field(default_factory=dict)
+
+def supported_m6_schema_versions() -> frozenset[str]:
+    return frozenset({M6_SCHEMA_VERSION, M6_LEGACY_SCHEMA_VERSION})
 
 
 def build_runtime_benchmark_report(
@@ -204,6 +216,7 @@ def _build_candidate(candidate: BenchmarkCandidateInput, *, base_dir: Path) -> d
         "resources": resources,
         "errors": errors,
         "probe": _candidate_probe(probe_observation),
+        "recognition": _project_recognition(candidate.m6_report, observation),
     }
     assert_privacy_safe_benchmark_report(candidate_report)
     return candidate_report
@@ -213,8 +226,8 @@ def _validate_m6_report(report: dict[str, Any]) -> None:
     if not isinstance(report, dict):
         raise ValueError("M6 report must be a JSON object")
     assert_privacy_safe_report(report)
-    if report.get("schema_version") != M6_SCHEMA_VERSION:
-        raise ValueError(f"M6 report schema_version must be {M6_SCHEMA_VERSION}")
+    if report.get("schema_version") not in supported_m6_schema_versions():
+        raise ValueError("M6 report schema_version is unsupported")
     required_paths = (
         ("gold", "case_count"),
         ("gold", "precision"),
@@ -265,6 +278,33 @@ def _validate_label(value: str, description: str) -> None:
         raise ValueError(f"{description} is required")
     if _SENSITIVE_TEXT_RE.search(value) or _ABSOLUTE_PATH_RE.search(value):
         raise ValueError(f"{description} is not privacy-safe")
+
+
+def _project_recognition(report: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any]:
+    value = report.get("recognition") if isinstance(report.get("recognition"), dict) else {}
+    runtime = observation.get("recognition") if isinstance(observation.get("recognition"), dict) else {}
+    merged = {**value, **runtime}
+    allowed = {
+        "mode",
+        "model_id",
+        "status",
+        "document_count",
+        "call_count",
+        "retry_count",
+        "fallback_count",
+        "conflict_count",
+        "duration_ms",
+        "prompt_token_count",
+        "completion_token_count",
+        "total_token_count",
+        "reason",
+        "category_counts",
+        "json_request_count",
+        "json_success_count",
+        "json_parse_failure_count",
+        "transport_failure_count",
+    }
+    return {key: merged.get(key) for key in allowed if key in merged}
 
 
 def _project_quality(report: dict[str, Any]) -> dict[str, Any]:
@@ -431,11 +471,18 @@ def _quality_regressions(baseline: dict[str, Any], candidates: Sequence[dict[str
         for field in ("precision", "recall", "f1"):
             if _is_regression(candidate["quality"].get(field), baseline["quality"].get(field)):
                 fields.append(field)
+        for field in ("high_risk_miss_count", "wrong_merge_count", "wrong_split_count"):
+            if _is_optional_count_regression(
+                candidate["quality"].get(field),
+                baseline["quality"].get(field),
+            ):
+                fields.append(field)
         for field in (
             "manual_corrections",
             "false_positive_deletes",
             "missing_adds",
             "suppressed_risky_entry_count",
+            "review_action_total",
         ):
             if _is_count_regression(candidate["workflow"].get(field), baseline["workflow"].get(field)):
                 fields.append(field)

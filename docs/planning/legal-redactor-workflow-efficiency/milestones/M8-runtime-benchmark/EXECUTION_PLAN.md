@@ -1,7 +1,7 @@
 # M8-runtime-benchmark · runtime-benchmark · execution plan
 
 > **Basis**: [README.md](README.md), [../../REQUIREMENTS.md](../../REQUIREMENTS.md), [../M6-regression-measurement/README.md](../M6-regression-measurement/README.md)
-> **Schema reference**: `/Users/jannerchang/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.1.14/templates/gate.schema.md`
+> **Schema reference**: `/Users/example/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.1.14/templates/gate.schema.md`
 > **Update rhythm**: synchronize this file and [_progress.md](_progress.md) at each step/gate
 > **Version**: v1.0 · 2026-07-03
 

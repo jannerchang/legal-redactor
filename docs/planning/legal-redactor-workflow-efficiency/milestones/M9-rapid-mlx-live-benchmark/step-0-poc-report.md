@@ -46,7 +46,7 @@ PASS · 2026-07-06:
 - `/v1/models` returned a model list containing
   `mlx-community/Qwen3.5-9B-MLX-4bit`.
 - `ps -p 97450 -o pid,ppid,command=` identified
-  `/Users/jannerchang/.local/bin/mlx_lm.server --model mlx-community/Qwen3.5-9B-MLX-4bit ... --port 18080`.
+  `/Users/example/.local/bin/mlx_lm.server --model mlx-community/Qwen3.5-9B-MLX-4bit ... --port 18080`.
 
 ### Fallback
 
@@ -80,7 +80,7 @@ rapid-mlx info qwen3.5-9b-4bit
 
 PASS · 2026-07-06:
 
-- `command -v rapid-mlx` returned `/Users/jannerchang/.local/bin/rapid-mlx`.
+- `command -v rapid-mlx` returned `/Users/example/.local/bin/rapid-mlx`.
 - `rapid-mlx ps` reported no Rapid-MLX servers running.
 - `rapid-mlx info qwen3.5-9b-4bit` resolved
   `mlx-community/Qwen3.5-9B-4bit`.
@@ -159,7 +159,7 @@ PASS · 2026-07-06:
 ### Script
 
 ```bash
-node /Users/jannerchang/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.1.14/lib/milestone-doc-check.mjs --dir docs/planning/legal-redactor-workflow-efficiency/milestones/M9-rapid-mlx-live-benchmark
+node /Users/example/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.1.14/lib/milestone-doc-check.mjs --dir docs/planning/legal-redactor-workflow-efficiency/milestones/M9-rapid-mlx-live-benchmark
 ```
 
 ### Validation

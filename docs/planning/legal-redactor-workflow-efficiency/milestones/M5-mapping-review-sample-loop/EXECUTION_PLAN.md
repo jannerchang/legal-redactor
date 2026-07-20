@@ -2,7 +2,7 @@
 
 > **依据**:[README.md](README.md), [../../REQUIREMENTS.md](../../REQUIREMENTS.md) §6.3, [../../SPLIT.md](../../SPLIT.md)
 > **格式**:七层硬门槛 + 决策表 + Step 顺序 + 时间盒 + 跨模块签字 + 服务端权威重算 + 文档维护扫
-> **schema 引用**:/Users/jannerchang/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.123/templates/gate.schema.md
+> **schema 引用**:/Users/example/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.123/templates/gate.schema.md
 > **更新节奏**:Step 进 / 出时同步本文件 + [_progress.md](_progress.md)
 > **版本**:v1.0 · 2026-06-29
 
@@ -73,7 +73,7 @@
 | D-06 | Review context is the active work state; navigation or reload loses row edits, filters, and reasons. | v1.0 | [../../REQUIREMENTS.md](../../REQUIREMENTS.md) §6.3 |
 | D-07 | Sample files can contain sensitive originals/corrections and are intentionally ignored by Git. | v1.0 | `.gitignore` |
 | D-08 | M6 needs correction counts, newest-sample signals, and restore placeholder counts; M5 should provide stable summary keys at source. | v1.0 | [../../SPLIT.md](../../SPLIT.md) M5/M6 dependency |
-| D-09 | Filter/status/risk labels are decision-like and must not be trusted from stale browser state. | v1.0 | /Users/jannerchang/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.123/templates/authoritative-recompute.md |
+| D-09 | Filter/status/risk labels are decision-like and must not be trusted from stale browser state. | v1.0 | /Users/example/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.123/templates/authoritative-recompute.md |
 
 ## §3 · Step 顺序
 

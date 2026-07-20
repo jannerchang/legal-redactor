@@ -13,7 +13,7 @@ from unittest.mock import patch
 try:
     from legal_redactor.cases import create_or_update_manifest, load_manifest, record_hermes_thread_request, write_last_restore_metadata
     from legal_redactor.io import redaction_map_to_json, save_redaction_map
-    from legal_redactor.models import MappingEntry, RedactedDocument, RedactionMap, RedactionResult
+    from legal_redactor.models import MappingEntry, RecognitionRunStats, RedactedDocument, RedactionMap, RedactionResult
     from legal_redactor.web_app import (
         _case_creation_command,
         _find_discord_thread_for_case,
@@ -185,6 +185,11 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertIn('id="model-choice"', page)
         self.assertIn('name="model"', page)
         self.assertIn("每次处理都可重新选择", page)
+        self.assertIn('id="recognition-mode-choice"', page)
+        self.assertIn('name="recognition_mode"', page)
+        self.assertIn('<option value="sentence_windows" selected>逐句窗口（稳定）</option>', page)
+        self.assertIn('<option value="full_document">整篇文书（实验）</option>', page)
+        self.assertIn("单篇最多 120000 字符", page)
         self.assertIn("/api/model-status", page)
         self.assertIn("已用时", page)
         self.assertNotIn("super-secret-token", page)
@@ -799,14 +804,33 @@ class WebAppUploadTests(unittest.TestCase):
                         }
                     ],
                     "locations": [],
+                    "recognition_stats": RecognitionRunStats(
+                        mode="full_document",
+                        model_id="bonsai-27b",
+                        status="success",
+                        call_count=1,
+                        duration_ms=125,
+                    ).to_dict(),
                 }
 
-        with patch("legal_redactor.web_app.RedactionPipeline", FakePipeline):
-            response = TestClient(app).post("/analyze", data={"text": "张三"})
+        ready = SimpleNamespace(state="ready", details={"model_ids": ["bonsai-27b"]})
+        with (
+            patch("legal_redactor.web_app.probe_model_manager", return_value=ready),
+            patch(
+                "legal_redactor.web_app._available_model_options",
+                return_value=[{"id": "bonsai-27b", "label": "Bonsai"}],
+            ),
+            patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
+        ):
+            response = TestClient(app).post(
+                "/analyze",
+                data={"text": "张三", "recognition_mode": "full_document"},
+            )
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("分级确认", response.text)
         self.assertIn("张三", response.text)
+        self.assertIn('name="recognition_mode" value="full_document"', response.text)
 
     def test_apply_edited_map_rejects_forged_workflow_state(self) -> None:
         from fastapi.testclient import TestClient
@@ -970,12 +994,188 @@ class WebAppUploadTests(unittest.TestCase):
                     "action": "continue",
                     "previous_map_json": "{}",
                     "previous_deselected_json": "[]",
+                    "recognition_mode": "full_document",
                 },
             )
 
         self.assertEqual(response.status_code, 200)
         self.assertGreaterEqual(len(configs), 2)
         self.assertTrue(all(cfg.enable_llm is False for cfg in configs))
+        self.assertEqual(configs[-1].llm.recognition_mode, "sentence_windows")
+
+    def test_redact_confirmed_preserves_full_document_mode_when_manager_is_ready(self) -> None:
+        from fastapi.testclient import TestClient
+
+        configs = []
+
+        class FakePipeline:
+            def __init__(self, config) -> None:
+                self.config = config
+                configs.append(config)
+
+            def apply_redaction_map(self, text, redaction_map):
+                return text.replace("张三", "张某1")
+
+            def scan_high_risk_leaks(self, text):
+                return []
+
+            def analyze(self, text):
+                return {"entity_groups": [], "locations": [], "warnings": []}
+
+        bundle = json.dumps([{"source_file": "a.txt", "text": "原告张三。"}], ensure_ascii=False)
+        analysis = json.dumps(
+            {
+                "entity_groups": [
+                    {
+                        "id": "g1",
+                        "type": "person",
+                        "full_name": "张三",
+                        "aliases": [],
+                        "role": "原告",
+                    }
+                ],
+                "locations": [],
+            },
+            ensure_ascii=False,
+        )
+        ready = SimpleNamespace(state="ready", details={"model_ids": ["bonsai-27b"]})
+        with (
+            patch("legal_redactor.web_app.probe_model_manager", return_value=ready),
+            patch(
+                "legal_redactor.web_app._available_model_options",
+                return_value=[{"id": "bonsai-27b", "label": "Bonsai"}],
+            ),
+            patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
+        ):
+            response = TestClient(app).post(
+                "/redact/confirmed",
+                data={
+                    "bundle_json": bundle,
+                    "analysis_json": analysis,
+                    "group_g1_enabled": "1",
+                    "round": "0",
+                    "action": "continue",
+                    "previous_map_json": "{}",
+                    "previous_deselected_json": "[]",
+                    "recognition_mode": "full_document",
+                    "model": "bonsai-27b",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(len(configs), 2)
+        self.assertFalse(configs[0].enable_llm)
+        self.assertTrue(configs[-1].enable_llm)
+        self.assertEqual(configs[-1].llm.recognition_mode, "full_document")
+
+    def test_redact_confirmed_finish_renders_preserved_recognition_stats(self) -> None:
+        from fastapi.testclient import TestClient
+
+        class FakePipeline:
+            def __init__(self, config) -> None:
+                self.config = config
+
+            def apply_redaction_map(self, text, redaction_map):
+                return text.replace("张三", "张某1")
+
+            def scan_high_risk_leaks(self, text):
+                return []
+
+        bundle = json.dumps([{"source_file": "a.txt", "text": "原告张三。"}], ensure_ascii=False)
+        analysis = json.dumps(
+            {
+                "entity_groups": [
+                    {
+                        "id": "g1",
+                        "type": "person",
+                        "full_name": "张三",
+                        "aliases": [],
+                        "role": "原告",
+                    }
+                ],
+                "locations": [],
+                "recognition_stats": RecognitionRunStats(
+                    mode="full_document",
+                    model_id="bonsai-27b",
+                    status="success",
+                    call_count=1,
+                    conflict_count=1,
+                    duration_ms=500,
+                ).to_dict(),
+            },
+            ensure_ascii=False,
+        )
+        with patch("legal_redactor.web_app.RedactionPipeline", FakePipeline):
+            response = TestClient(app).post(
+                "/redact/confirmed",
+                data={
+                    "bundle_json": bundle,
+                    "analysis_json": analysis,
+                    "group_g1_enabled": "1",
+                    "round": "0",
+                    "action": "finish",
+                    "previous_map_json": "{}",
+                    "previous_deselected_json": "[]",
+                    "recognition_mode": "full_document",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("模式：整篇文书（实验）", response.text)
+        self.assertIn("调用数：1", response.text)
+        self.assertIn("冲突数：1", response.text)
+
+    def test_runtime_fallback_stats_are_distinct_from_manager_unavailable(self) -> None:
+        from fastapi.testclient import TestClient
+
+        class FakePipeline:
+            def __init__(self, config) -> None:
+                self.config = config
+
+            def redact(self, text, source_file=None, base_redaction_map=None):
+                return RedactionResult(
+                    original_text=text,
+                    redacted_text=text,
+                    redaction_map=RedactionMap.create([]),
+                    candidates=[],
+                    review_candidates=[],
+                    leaks=[],
+                    mode="test",
+                    warnings=["整篇 LLM 识别失败，已回退逐句窗口"],
+                    recognition_stats=RecognitionRunStats(
+                        mode="sentence_windows",
+                        model_id="bonsai-27b",
+                        status="success",
+                        call_count=1,
+                        fallback_count=1,
+                        duration_ms=800,
+                        reason="invalid_registry",
+                    ),
+                )
+
+        ready = SimpleNamespace(state="ready", details={"model_ids": ["bonsai-27b"]})
+        with (
+            patch("legal_redactor.web_app.probe_model_manager", return_value=ready),
+            patch(
+                "legal_redactor.web_app._available_model_options",
+                return_value=[{"id": "bonsai-27b", "label": "Bonsai"}],
+            ),
+            patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
+        ):
+            response = TestClient(app).post(
+                "/redact",
+                data={
+                    "text": "原告张三。",
+                    "recognition_mode": "full_document",
+                    "model": "bonsai-27b",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("模式：逐句窗口（稳定）", response.text)
+        self.assertIn("状态：成功", response.text)
+        self.assertIn("降级：是", response.text)
+        self.assertNotIn("本地模型 API 未就绪，已降级为纯规则模式。", response.text)
 
     def test_redact_route_uses_selected_manager_model_and_reports_duration(self) -> None:
         from fastapi.testclient import TestClient
@@ -996,6 +1196,16 @@ class WebAppUploadTests(unittest.TestCase):
                     leaks=[],
                     mode="test",
                     warnings=[],
+                    recognition_stats=RecognitionRunStats(
+                        mode="full_document",
+                        model_id="qwen3.5-9b",
+                        status="success",
+                        call_count=1,
+                        retry_count=0,
+                        fallback_count=0,
+                        conflict_count=2,
+                        duration_ms=1250,
+                    ),
                 )
 
         ready = SimpleNamespace(
@@ -1008,7 +1218,14 @@ class WebAppUploadTests(unittest.TestCase):
             patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
         ):
             client = TestClient(app)
-            response = client.post("/redact", data={"text": "原告张三。", "model": "qwen3.5-9b"})
+            response = client.post(
+                "/redact",
+                data={
+                    "text": "原告张三。",
+                    "model": "qwen3.5-9b",
+                    "recognition_mode": "full_document",
+                },
+            )
             home = client.get("/")
 
         self.assertEqual(response.status_code, 200)
@@ -1016,9 +1233,208 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertEqual(len(configs), 1)
         self.assertTrue(configs[0].enable_llm)
         self.assertEqual(configs[0].llm.model, "qwen3.5-9b")
-        self.assertIn("本次脱敏模型：Qwen3.5 9B（MLX 4-bit）", response.text)
-        self.assertIn("服务端处理用时：", response.text)
+        self.assertEqual(configs[0].llm.recognition_mode, "full_document")
+        self.assertIn("识别运行摘要", response.text)
+        self.assertIn("模式：整篇文书（实验）", response.text)
+        self.assertIn("逻辑模型：qwen3.5-9b", response.text)
+        self.assertIn("状态：成功", response.text)
+        self.assertIn("文档数：1", response.text)
+        self.assertIn("调用数：1", response.text)
+        self.assertIn("识别耗时：1.25 秒", response.text)
+        self.assertIn("降级：否", response.text)
+        self.assertIn("冲突数：2", response.text)
+        self.assertNotIn("invalid_registry", response.text)
+        self.assertNotIn("prompt", response.text.lower())
+        self.assertNotIn("response", response.text.lower())
+        self.assertNotIn("registry_payload", response.text)
+        self.assertNotIn("/Users/", response.text)
+        self.assertNotIn("/Volumes/", response.text)
         self.assertIn("model-choice", home.text)
+
+
+    def test_model_registry_remains_available_during_recoverable_worker_error(self) -> None:
+        from fastapi.testclient import TestClient
+
+        worker_error = SimpleNamespace(
+            state="error",
+            details={"reason": "worker_error", "host": "manager.example.test", "port": 18080},
+        )
+        payload = {"object": "list", "data": [{"id": "bonsai-27b", "name": "Bonsai"}]}
+
+        class FakeResponse:
+            status = 200
+
+            def read(self) -> bytes:
+                return json.dumps(payload).encode("utf-8")
+
+        class FakeConnection:
+            def __init__(self, host: str, port: int, timeout: float) -> None:
+                self.args = (host, port, timeout)
+
+            def request(self, method: str, path: str) -> None:
+                self.request_args = (method, path)
+
+            def getresponse(self) -> FakeResponse:
+                return FakeResponse()
+
+            def close(self) -> None:
+                return None
+
+        with (
+            patch("legal_redactor.web_app.probe_model_manager", return_value=worker_error),
+            patch("legal_redactor.web_app.http.client.HTTPConnection", FakeConnection),
+        ):
+            response = TestClient(app).get("/api/models")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), payload)
+
+    def test_recoverable_worker_error_retries_selected_model_instead_of_forcing_offline(self) -> None:
+        import legal_redactor.web_app as web_app_module
+
+        worker_error = SimpleNamespace(state="error", details={"reason": "worker_error"})
+        with (
+            patch("legal_redactor.web_app.probe_model_manager", return_value=worker_error),
+            patch(
+                "legal_redactor.web_app._available_model_options",
+                return_value=[{"id": "bonsai-27b", "label": "Bonsai"}],
+            ),
+        ):
+            config, warnings = web_app_module._pipeline_config_for_model_status(model="bonsai-27b")
+
+        self.assertTrue(config.enable_llm)
+        self.assertEqual(config.llm.model, "bonsai-27b")
+        self.assertEqual(warnings, [])
+
+    def test_selected_model_validation_uses_complete_manager_registry(self) -> None:
+        import legal_redactor.web_app as web_app_module
+
+        ready = SimpleNamespace(state="ready", details={"model_ids": [f"model-{index}" for index in range(8)]})
+        options = [{"id": f"model-{index}", "label": f"Model {index}"} for index in range(9)]
+        with (
+            patch("legal_redactor.web_app.probe_model_manager", return_value=ready),
+            patch("legal_redactor.web_app._available_model_options", return_value=options),
+        ):
+            config, warnings = web_app_module._pipeline_config_for_model_status(model="model-8")
+
+        self.assertTrue(config.enable_llm)
+        self.assertEqual(config.llm.model, "model-8")
+        self.assertEqual(warnings, [])
+
+    def test_pipeline_config_rejects_invalid_recognition_mode_and_llm_mode(self) -> None:
+        import legal_redactor.web_app as web_app_module
+
+        ready = SimpleNamespace(state="ready", details={"model_ids": ["bonsai-27b"]})
+        with (
+            patch("legal_redactor.web_app.probe_model_manager", return_value=ready),
+            patch(
+                "legal_redactor.web_app._available_model_options",
+                return_value=[{"id": "bonsai-27b", "label": "Bonsai"}],
+            ),
+        ):
+            bad_recognition, recognition_warnings = web_app_module._pipeline_config_for_model_status(
+                model="bonsai-27b",
+                recognition_mode="../../weights",
+            )
+            bad_llm, llm_warnings = web_app_module._pipeline_config_for_model_status(
+                model="bonsai-27b",
+                llm_mode="arbitrary",
+            )
+
+        self.assertFalse(bad_recognition.enable_llm)
+        self.assertFalse(bad_llm.enable_llm)
+        self.assertIn("配置无效", recognition_warnings[0])
+        self.assertIn("配置无效", llm_warnings[0])
+
+    def test_batch_result_renders_aggregated_recognition_stats(self) -> None:
+        from fastapi.testclient import TestClient
+
+        class FakePipeline:
+            def __init__(self, config) -> None:
+                self.config = config
+
+            def redact_many(self, documents, base_redaction_map=None):
+                from legal_redactor.models import BatchRedactionResult
+
+                rendered = [
+                    RedactedDocument(
+                        source_file=name,
+                        original_text=text,
+                        redacted_text=text,
+                        leaks=[],
+                    )
+                    for name, text in documents
+                ]
+                return BatchRedactionResult(
+                    documents=rendered,
+                    redaction_map=RedactionMap.create([]),
+                    candidates=[],
+                    review_candidates=[],
+                    leaks=[],
+                    mode="test",
+                    warnings=[],
+                    recognition_stats=RecognitionRunStats(
+                        mode="full_document",
+                        model_id="bonsai-27b",
+                        status="partial",
+                        document_count=2,
+                        call_count=2,
+                        fallback_count=1,
+                        conflict_count=3,
+                        duration_ms=2400,
+                    ),
+                )
+
+        ready = SimpleNamespace(state="ready", details={"model_ids": ["bonsai-27b"]})
+        with (
+            patch("legal_redactor.web_app.probe_model_manager", return_value=ready),
+            patch(
+                "legal_redactor.web_app._available_model_options",
+                return_value=[{"id": "bonsai-27b", "label": "Bonsai"}],
+            ),
+            patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
+        ):
+            response = TestClient(app).post(
+                "/redact",
+                data={"recognition_mode": "full_document"},
+                files=[
+                    ("files", ("a.txt", "张三", "text/plain")),
+                    ("files", ("b.txt", "李四", "text/plain")),
+                ],
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("文档数：2", response.text)
+        self.assertIn("调用数：2", response.text)
+        self.assertIn("降级：是", response.text)
+        self.assertIn("冲突数：3", response.text)
+        self.assertIn("识别耗时：2.40 秒", response.text)
+
+    def test_apply_routes_remain_offline_after_recognition_mode_added(self) -> None:
+        from fastapi.testclient import TestClient
+
+        configs = []
+
+        class FakePipeline:
+            def __init__(self, config) -> None:
+                configs.append(config)
+
+            def apply_redaction_map(self, text, redaction_map):
+                return text
+
+            def scan_high_risk_leaks(self, text):
+                return []
+
+        map_json = redaction_map_to_json(RedactionMap.create([]))
+        with patch("legal_redactor.web_app.RedactionPipeline", FakePipeline):
+            response = TestClient(app).post(
+                "/redact/apply-map",
+                data={"original_text": "张三", "map_json": map_json},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(configs), 1)
+        self.assertFalse(configs[0].enable_llm)
 
     def test_clear_samples_api_returns_delete_stats_and_rebuilds_auto_file(self) -> None:
         from pathlib import Path
@@ -1304,6 +1720,36 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertIn("已按当前保留的映射重新排列占位符", response.text)
         self.assertNotIn("丁公司与张某丁签订合同", response.text)
 
+    def test_apply_edited_map_preserves_registry_identity_metadata(self) -> None:
+        from fastapi.testclient import TestClient
+
+        response = TestClient(app).post(
+            "/redact/apply-edited-map",
+            data={
+                "original_text": "星河建设有限公司（以下简称星河公司）。",
+                "map_version": "1.0",
+                "map_created_at": "2026-07-19T10:00:00+08:00",
+                "map_mode": "normal",
+                "map_source_file": "",
+                "map_type": ["organization", "organization"],
+                "map_original": ["星河建设有限公司", "星河公司"],
+                "map_masked": ["甲公司", "甲公司"],
+                "map_role": ["", ""],
+                "map_source": ["linear:full_document_llm", "linear:full_document_llm"],
+                "map_confidence": ["0.9", "0.9"],
+                "map_reason": ["", ""],
+                "map_restore_by_default": ["1", "1"],
+                "map_entity_id": ["org-1", "org-1"],
+                "map_do_not_merge": ['["org-2"]', '["org-2"]'],
+                "map_restore_original": ["星河建设有限公司", "星河建设有限公司"],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('name="map_entity_id" value="org-1"', response.text)
+        self.assertIn('name="map_restore_original" value="星河建设有限公司"', response.text)
+        self.assertIn('name="map_do_not_merge" value="[&quot;org-2&quot;]"', response.text)
+
     def test_case_creation_command_formats_case_folder_for_hermes(self) -> None:
         command = _case_creation_command("2026 5987 劳动争议纠纷", "lr_test")
 
@@ -1325,7 +1771,7 @@ class WebAppUploadTests(unittest.TestCase):
             "2026 5987",
             "lr_test",
             "劳动争议纠纷",
-            case_root="/Users/jannerchang/Documents/legal-redactor-cases",
+            case_root="/Users/example/Documents/legal-redactor-cases",
             source_dir="/Volumes/案件资料/2026 5987",
         )
 
@@ -1348,7 +1794,7 @@ class WebAppUploadTests(unittest.TestCase):
             return {"message_id": "m1", "channel_id": channel_id}
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("legal_redactor.web_app._discord_command_channel_id", return_value="1501248343823880345"):
+            with patch("legal_redactor.web_app._discord_command_channel_id", return_value="command-channel"):
                 with patch("legal_redactor.web_app._post_discord_channel_message", side_effect=fake_post):
                     response = asyncio.run(
                         create_discord_thread(
@@ -1371,11 +1817,11 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertEqual(data["request_id"], "lr_test")
         self.assertEqual(manifest.hermes_request_id, "lr_test")
         self.assertEqual(manifest.hermes_command_message_id, "m1")
-        self.assertEqual(calls, [("1501248343823880345", _case_creation_command("2026 5987", "lr_test", "劳动争议纠纷"))])
+        self.assertEqual(calls, [("command-channel", _case_creation_command("2026 5987", "lr_test", "劳动争议纠纷"))])
 
     def test_find_discord_thread_for_case_matches_case_number(self) -> None:
         responses = [
-            {"guild_id": "1498679306967056394"},
+            {"guild_id": "guild-1"},
             {
                 "threads": [
                     {"id": "111", "name": "【案件】劳动争议｜（2026）5987号"},
@@ -1388,12 +1834,12 @@ class WebAppUploadTests(unittest.TestCase):
             with patch("legal_redactor.web_app._get_discord_json", side_effect=responses):
                 thread_url = _find_discord_thread_for_case("2026 4343", "房屋买卖合同纠纷")
 
-        self.assertEqual(thread_url, "https://discord.com/channels/1498679306967056394/222")
+        self.assertEqual(thread_url, "https://discord.com/channels/guild-1/222")
 
     def test_create_discord_thread_recovers_existing_hermes_thread_without_mcp_callback(self) -> None:
         import asyncio
 
-        thread_url = "https://discord.com/channels/1/2/1525400368069087332"
+        thread_url = "https://discord.com/channels/1/2/333"
         with tempfile.TemporaryDirectory() as tmpdir:
             record_hermes_thread_request(
                 tmpdir,
@@ -1434,7 +1880,7 @@ class WebAppUploadTests(unittest.TestCase):
             return {"message_id": "m1", "channel_id": channel_id}
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("legal_redactor.web_app._discord_command_channel_id", return_value="1501248343823880345"):
+            with patch("legal_redactor.web_app._discord_command_channel_id", return_value="command-channel"):
                 with patch("legal_redactor.web_app._post_discord_channel_message", side_effect=fake_post):
                     with patch("legal_redactor.web_app._find_discord_thread_for_case", return_value=""):
                         first = asyncio.run(
@@ -1499,7 +1945,7 @@ class WebAppUploadTests(unittest.TestCase):
                 403,
                 "Forbidden",
                 {},
-                io.BytesIO(b'{"message":"/Users/jannerchang/private secret-token-value"}'),
+                io.BytesIO(b'{"message":"/Users/example/private secret-token-value"}'),
             )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1586,7 +2032,7 @@ class WebAppUploadTests(unittest.TestCase):
                             "discord_thread_url": "https://discord.com/channels/1/2/3",
                             "filename": "redacted.txt",
                             "content": "脱敏内容",
-                            "message": "请看 /Users/jannerchang/private/case.docx",
+                            "message": "请看 /Users/example/private/case.docx",
                         }
                     )
                 )
@@ -2043,7 +2489,7 @@ class WebAppUploadTests(unittest.TestCase):
         command = _case_creation_command(
             "2026 3624",
             "req-1",
-            "/Users/jannerchang/private /Volumes/cases",
+            "/Users/example/private /Volumes/cases",
         )
 
         self.assertIn("案件目录：2026 3624", command)
@@ -2058,7 +2504,7 @@ class WebAppUploadTests(unittest.TestCase):
                 create_discord_thread(
                     MockJsonRequest(
                         {
-                            "case_folder": "/Users/jannerchang/cases/2026 3624",
+                            "case_folder": "/Users/example/cases/2026 3624",
                             "case_cause": "劳动争议",
                         }
                     )
@@ -2090,6 +2536,9 @@ def test_mapping_edit_rows_include_immutable_pre_edit_original():
 
     assert 'name="map_original_before" value="河北华鹏建筑安装工程有限公司"' in existing_row
     assert 'name="map_original_before" value=""' in blank_row
+    assert 'name="map_entity_id" value=""' in existing_row
+    assert 'name="map_do_not_merge" value="[]"' in existing_row
+    assert 'name="map_restore_original" value=""' in existing_row
 # ── Security: XSS prevention in _diagnose_sample_entry ──────────────────
 
 class TestDiagnoseSampleEntryXSS:

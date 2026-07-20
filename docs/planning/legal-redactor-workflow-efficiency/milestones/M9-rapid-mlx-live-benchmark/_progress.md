@@ -133,7 +133,7 @@ Any default runtime/model switch stays outside automatic M9 delivery.
 | 2 | `M6-regression-report/v1` | upstream quality report | implemented in M6 | `legal_redactor/regression.py`, `tests/test_regression.py` | consume as privacy boundary |
 | 3 | `/v1/models` | runtime identity probe | startup/status hard gate | `scripts/start_mlx9b_server.sh`, `legal_redactor/status.py` | reuse as model identity evidence |
 | 4 | `mlx-community/Qwen3.5-9B-MLX-4bit` | fixed current model | baseline runtime | `scripts/start_mlx9b_server.sh`, `legal_redactor/status.py` | require for comparable endpoints |
-| 5 | `rapid-mlx` | candidate runtime CLI | local executable | `/Users/jannerchang/.local/bin/rapid-mlx` | probe candidate when available |
+| 5 | `rapid-mlx` | candidate runtime CLI | local executable | `/Users/example/.local/bin/rapid-mlx` | probe candidate when available |
 | 6 | public SPC samples | approved input fixture class | existing sample documents | `samples/01_*`, `samples/02_*`, `samples/03_*`, `samples/最高人民法院民事判决书（样本）.docx` | may use by path/category only |
 
 ## §7 · Blockers

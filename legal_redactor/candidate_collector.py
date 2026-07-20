@@ -23,6 +23,7 @@ from .filters import clean_organization_text as _clean_organization_text
 from .filters import is_false_org as _is_false_org
 from .lexicon import BARE_COMPANY_ALIAS_RE, INSTITUTION_SUFFIXES, LEGAL_SUFFIXES, ORG_FULL_RE
 from .llm import is_noise_entity_text, _is_valid_company_variant
+from .entity_registry import RegistryMaterialization
 from .models import Candidate
 
 
@@ -37,11 +38,13 @@ class CandidateCollectionContext:
     llm_primary_discovery: bool = False
     use_semantic_rules: bool = True
     use_china_admin_rules: bool = True
+    registry_materialization: RegistryMaterialization | None = None
 
 
 @dataclass(frozen=True)
 class CandidateCollectionResult:
     candidates: list[Candidate]
+    review_candidates: list[Candidate] = field(default_factory=list)
 
     def with_llm_analysis(
         self,
@@ -52,7 +55,8 @@ class CandidateCollectionResult:
         return CandidateCollectionResult(
             candidates=collector._deduplicate_candidates(
                 [*self.candidates, *collector._llm_candidates(text, analysis)]
-            )
+            ),
+            review_candidates=list(self.review_candidates),
         )
 
 
@@ -61,9 +65,16 @@ class CandidateCollector:
 
     def collect(self, context: CandidateCollectionContext) -> CandidateCollectionResult:
         candidates = list(context.seed_candidates)
+        registry_review_candidates: list[Candidate] = []
+        if context.registry_materialization is not None:
+            candidates.extend(context.registry_materialization.candidates)
+            registry_review_candidates.extend(context.registry_materialization.review_candidates)
         if context.llm_primary_discovery:
             candidates.extend(self._llm_candidates(context.text, context.llm_analysis))
-            return CandidateCollectionResult(candidates=self._deduplicate_candidates(candidates))
+            return CandidateCollectionResult(
+                candidates=self._deduplicate_candidates(candidates),
+                review_candidates=registry_review_candidates,
+            )
 
         candidates.extend(detect_title_candidates(context.text))
         candidates.extend(detect_inline_party_person_list_candidates(context.text))
@@ -90,7 +101,10 @@ class CandidateCollector:
             candidates.extend(local_orgs)
 
         candidates.extend(self._llm_candidates(context.text, context.llm_analysis))
-        return CandidateCollectionResult(candidates=self._deduplicate_candidates(candidates))
+        return CandidateCollectionResult(
+            candidates=self._deduplicate_candidates(candidates),
+            review_candidates=registry_review_candidates,
+        )
 
     @staticmethod
     def _sentence_spans(text: str) -> list[tuple[str, int]]:
@@ -255,8 +269,27 @@ class CandidateCollector:
         for candidate in candidates:
             key = (candidate.type, candidate.text, candidate.start)
             previous = best.get(key)
-            if previous is None or candidate.confidence > previous.confidence:
+            if previous is None:
                 best[key] = candidate
+                continue
+            metadata = dict(previous.metadata)
+            metadata.update(candidate.metadata)
+            sources = []
+            for source in (
+                previous.metadata.get("provenance_sources", [previous.source]),
+                candidate.metadata.get("provenance_sources", [candidate.source]),
+            ):
+                values = source if isinstance(source, list) else [source]
+                for value in values:
+                    if isinstance(value, str) and value not in sources:
+                        sources.append(value)
+            metadata["provenance_sources"] = sources
+            preferred = candidate if candidate.confidence > previous.confidence else previous
+            best[key] = replace(
+                preferred,
+                metadata=metadata,
+                needs_review=previous.needs_review or candidate.needs_review,
+            )
         return list(best.values())
 
 

@@ -165,7 +165,7 @@ def _page(title: str, body: str) -> str:
         ['漏识别新增',summary.missing_adds||0]
       ];content.innerHTML=rows.map(function(item){{return '<span><b>'+item[0]+'</b>: '+item[1]+'</span>';}}).join('');panel.hidden=false;}}
       function mappingRowValue(row,name){{var el=row.querySelector('[name="'+name+'"]');if(!el)return '';if(el.type==='checkbox')return el.checked?el.value:'';return el.value||'';}}
-      function readCurrentMappingJson(){{var form=document.getElementById('mapping-edit-form');var mapEl=document.getElementById('mapping-json-output');if(!mapEl)return'{{}}';if(!form)return mapEl.value||'{{}}';var base={{}};try{{base=JSON.parse(mapEl.value||'{{}}');}}catch(_err){{base={{}};}}var mappings=[];form.querySelectorAll('tbody tr').forEach(function(row){{var deleted=row.querySelector('input[name="row_delete"]');if(deleted&&deleted.checked)return;var original=mappingRowValue(row,'map_original').trim();var masked=mappingRowValue(row,'map_masked').trim();if(!original||!masked)return;var confidence=parseFloat(mappingRowValue(row,'map_confidence')||'1.0');mappings.push({{type:mappingRowValue(row,'map_type').trim()||'manual',original:original,masked:masked,role:mappingRowValue(row,'map_role').trim()||null,source:mappingRowValue(row,'map_source').trim()||'manual',confidence:isNaN(confidence)?1.0:confidence,restore_by_default:mappingRowValue(row,'map_restore_by_default')!=='0',reason:mappingRowValue(row,'map_reason').trim()||null}});}});base.mappings=mappings;return JSON.stringify(base);}}
+      function readCurrentMappingJson(){{var form=document.getElementById('mapping-edit-form');var mapEl=document.getElementById('mapping-json-output');if(!mapEl)return'{{}}';if(!form)return mapEl.value||'{{}}';var base={{}};try{{base=JSON.parse(mapEl.value||'{{}}');}}catch(_err){{base={{}};}}var mappings=[];form.querySelectorAll('tbody tr').forEach(function(row){{var deleted=row.querySelector('input[name="row_delete"]');if(deleted&&deleted.checked)return;var original=mappingRowValue(row,'map_original').trim();var masked=mappingRowValue(row,'map_masked').trim();if(!original||!masked)return;var confidence=parseFloat(mappingRowValue(row,'map_confidence')||'1.0');var doNotMerge=[];try{{doNotMerge=JSON.parse(mappingRowValue(row,'map_do_not_merge')||'[]');}}catch(_err){{doNotMerge=[];}}if(!Array.isArray(doNotMerge))doNotMerge=[];mappings.push({{type:mappingRowValue(row,'map_type').trim()||'manual',original:original,masked:masked,role:mappingRowValue(row,'map_role').trim()||null,source:mappingRowValue(row,'map_source').trim()||'manual',confidence:isNaN(confidence)?1.0:confidence,restore_by_default:mappingRowValue(row,'map_restore_by_default')!=='0',reason:mappingRowValue(row,'map_reason').trim()||null,entity_id:mappingRowValue(row,'map_entity_id').trim()||null,do_not_merge:doNotMerge,restore_original:mappingRowValue(row,'map_restore_original').trim()||null}});}});base.mappings=mappings;return JSON.stringify(base);}}
       function replacementSignatureFromMapJson(mapJson){{var parsed={{}};try{{parsed=JSON.parse(mapJson||'{{}}');}}catch(_err){{parsed={{}};}}return JSON.stringify((parsed.mappings||[]).map(function(item){{return [String((item&&item.original)||'').trim(),String((item&&item.masked)||'').trim()];}}).filter(function(pair){{return pair[0]&&pair[1];}}));}}
       function hasUnappliedMappingReplacementEdits(){{var mapEl=document.getElementById('mapping-json-output');if(!mapEl)return false;return replacementSignatureFromMapJson(mapEl.value||'{{}}')!==replacementSignatureFromMapJson(readCurrentMappingJson());}}
       function ensureAppliedMappingForText(){{if(!hasUnappliedMappingReplacementEdits())return true;toast('映射表替换关系已修改，请先点「应用表格修改」重新生成脱敏文本', 'warn');return false;}}
@@ -417,7 +417,7 @@ def _page(title: str, body: str) -> str:
         var dirInput=document.getElementById('source-directory-files');
         if(dirInput)dirInput.addEventListener('change',function(){{setUploadFromInput(dirInput,true);}});
       }})();
-      function addBlankRow(btn){{var tb=btn.parentElement.querySelector('tbody');if(!tb)return;var rows=tb.querySelectorAll('tr');var last=rows[rows.length-1];var c=last.cloneNode(true);var n=rows.length;c.dataset.mapRow=String(n);c.dataset.categories='';c.querySelectorAll('input,textarea').forEach(function(e){{if(e.name==='row_delete')e.value=n;if(e.name==='map_type')e.value='manual';if(e.name==='map_original'||e.name==='map_original_before'||e.name==='map_masked'||e.name==='map_role'||e.name==='map_reason')e.value='';if(e.name==='map_source')e.value='manual';if(e.name==='map_confidence')e.value='1.0';if(e.name==='map_restore_by_default')e.value='1';e.checked=false;}});tb.appendChild(c);filterMappingRows(activeMappingFilter());}}
+      function addBlankRow(btn){{var tb=btn.parentElement.querySelector('tbody');if(!tb)return;var rows=tb.querySelectorAll('tr');var last=rows[rows.length-1];var c=last.cloneNode(true);var n=rows.length;c.dataset.mapRow=String(n);c.dataset.categories='';c.querySelectorAll('input,textarea').forEach(function(e){{if(e.name==='row_delete')e.value=n;if(e.name==='map_type')e.value='manual';if(e.name==='map_original'||e.name==='map_original_before'||e.name==='map_masked'||e.name==='map_role'||e.name==='map_reason'||e.name==='map_entity_id'||e.name==='map_restore_original')e.value='';if(e.name==='map_do_not_merge')e.value='[]';if(e.name==='map_source')e.value='manual';if(e.name==='map_confidence')e.value='1.0';if(e.name==='map_restore_by_default')e.value='1';e.checked=false;}});tb.appendChild(c);filterMappingRows(activeMappingFilter());}}
       function saveRow(idx,btn){{var row=btn.closest('tr');var orig=row.querySelector('[name^=orig_]').value;var masked=row.querySelector('[name^=masked_]').value;var reasonEl=row.querySelector('[name^=reason_]');var reason=reasonEl?reasonEl.value:'';fetch('/samples/update/'+idx,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{original:orig,masked:masked,reason:reason}})}}).then(function(r){{return r.json();}}).then(function(d){{toast(d.msg);}});}}
 	      function saveNewRow(total,btn){{var act=document.getElementById('new-action').value;var orig=document.getElementById('new-orig').value;var masked=document.getElementById('new-masked').value;var reasonEl=document.getElementById('new-reason');var reason=reasonEl?reasonEl.value:'';if(!orig||(act!=='delete'&&!masked)){{toast(act==='delete'?'请填写原文':'请填写原文和替换为','warn');return;}}fetch('/samples/add',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:act,original:orig,masked:masked,reason:reason}})}}).then(function(r){{return r.json();}}).then(function(d){{toast(d.msg);setTimeout(function(){{location.reload();}},1000);}});}}
 
@@ -921,6 +921,12 @@ def render_home_page(
               <p class="hint">统一标准脱敏：人名、地名、机构名称及敏感编号按同一套规则处理。</p>
               <p class="hint">{html.escape(model_hint)}</p>
             </div>
+            <label for="recognition-mode-choice">本次处理使用的识别模式</label>
+            <select id="recognition-mode-choice" name="recognition_mode" style="min-width:320px">
+              <option value="sentence_windows" selected>逐句窗口（稳定）</option>
+              <option value="full_document">整篇文书（实验）</option>
+            </select>
+            <p class="hint">整篇文书模式单篇最多 120000 字符；超限或模型调用失败会明确降级，且不会截断原文。</p>
             <label for="model-choice">本次处理使用的模型</label>
             <select id="model-choice" name="model" style="min-width:320px">
               {model_options_html}
@@ -980,16 +986,6 @@ def render_home_page(
 
         """,
     )
-def _redaction_timing_summary(model_label: str, duration_ms: int | None) -> str:
-    if duration_ms is None:
-        return ""
-    seconds = max(0, duration_ms) / 1000
-    return (
-        '<p class="hint">'
-        f'本次脱敏模型：{html.escape(model_label or "未记录")}；'
-        f'服务端处理用时：{seconds:.2f} 秒'
-        '</p>'
-    )
 
 
 def render_redaction_result_page(
@@ -1006,6 +1002,7 @@ def render_redaction_result_page(
     discord_section,
     leaks_html,
     warnings_html,
+    recognition_summary,
     original_highlight,
     redacted_text,
     redacted_highlight,
@@ -1022,8 +1019,6 @@ def render_redaction_result_page(
     redaction_map,
     mapping_edit_rows,
     review_html,
-    model_label="",
-    duration_ms=None,
 ):
     return _page(
         title,
@@ -1035,7 +1030,7 @@ def render_redaction_result_page(
           <a download="debug_trace.json" href="{debug_url}" class="btn btn-secondary">下载 debug_trace</a>
           <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制脱敏文本</button>
         </div>
-        {_redaction_timing_summary(model_label, duration_ms)}
+        {recognition_summary}
 
         {workflow_panel}
 
@@ -1109,6 +1104,7 @@ def render_batch_redaction_result_page(
     discord_section,
     leaks_html,
     warnings_html,
+    recognition_summary,
     doc_sections,
     mapping_review_toolbar,
     sample_summary_panel,
@@ -1122,8 +1118,6 @@ def render_batch_redaction_result_page(
     source_dir,
     redaction_map,
     mapping_edit_rows,
-    model_label="",
-    duration_ms=None,
 ):
     return _page(
         title,
@@ -1135,7 +1129,7 @@ def render_batch_redaction_result_page(
           <a download="debug_trace.json" href="{debug_url}" class="btn btn-secondary">下载 debug_trace</a>
           <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制合并文本</button>
         </div>
-        {_redaction_timing_summary(model_label, duration_ms)}
+        {recognition_summary}
 
         <textarea id="redacted-output" class="hidden-raw">{html.escape(combined_redacted)}</textarea>
 

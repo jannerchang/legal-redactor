@@ -14,6 +14,7 @@ from typing import Callable, Iterable
 
 from .candidate_resolution import is_noisy_org_capture, resolve_candidate_overlaps
 from .filters import clean_organization_text as _clean_organization_text
+from .entity_registry import FullDocumentEntityRegistry
 from .config import RedactionProfile
 from .filters import is_false_org as _is_false_org
 from .counters import TypeCounters
@@ -62,6 +63,9 @@ class LinearRuleEngine:
     source_text: str = ""
     _alias_cores_cache: dict[str, frozenset[str]] = field(default_factory=dict, repr=False)
     _organization_plans: dict[str, CompanyMaskPlan] = field(default_factory=dict, repr=False)
+    _registry_constraints: FullDocumentEntityRegistry | None = field(default=None, repr=False)
+    _entity_masks: dict[str, str] = field(default_factory=dict, repr=False)
+    _entity_org_plans: dict[str, CompanyMaskPlan] = field(default_factory=dict, repr=False)
 
     def discover(
         self,
@@ -70,6 +74,7 @@ class LinearRuleEngine:
         llm_analysis: dict | None = None,
         *,
         respect_fact_section_boundary: bool = True,
+        registry_constraints: FullDocumentEntityRegistry | None = None,
     ) -> list[MappingEntry]:
         scan_text = text
         if respect_fact_section_boundary:
@@ -78,6 +83,7 @@ class LinearRuleEngine:
                 scan_text = text[: boundary_match.start()]
 
         self.source_text = scan_text
+        self._registry_constraints = registry_constraints
         accepted_candidates = self._apply_llm_verdicts(list(candidates), scan_text, llm_analysis or {})
         accepted_candidates = resolve_candidate_overlaps(accepted_candidates)
 
@@ -196,7 +202,14 @@ class LinearRuleEngine:
         ):
             return
         self.known_people.add(value)
+        entity_id = self._candidate_entity_id(candidate)
+        if entity_id and entity_id in self._entity_masks:
+            self.known_people.add(value)
+            self._add("person", value, self._entity_masks[entity_id], candidate)
+            return
         masked = f"{value[0]}某{self.counters.next(f'person_{value[0]}')}"
+        if entity_id:
+            self._entity_masks[entity_id] = masked
         self._add("person", value, masked, candidate)
 
     def accept_organization(self, candidate: Candidate) -> None:
@@ -204,11 +217,21 @@ class LinearRuleEngine:
             return
         raw_value = candidate.text.strip(" ：:，,。；;\n\t")
         value = _clean_organization_text(raw_value)
-        if not value and candidate.source.startswith("linear_llm"):
+        if not value and candidate.source.startswith(("linear_llm", "full_document_llm")):
             value = raw_value
         if not value or value in self.known_organizations:
             return
-        if not candidate.source.startswith("linear_llm") and (
+        entity_id = self._candidate_entity_id(candidate)
+        if entity_id and entity_id in self._entity_masks:
+            plan = self._entity_org_plans.get(entity_id)
+            masked = organization_mask_for_surface(value, plan) if plan is not None else self._entity_masks[entity_id]
+            self.known_organizations.add(value)
+            if plan is not None:
+                self._organization_plans[value] = plan
+                self._alias_cores_cache[value] = derived_organization_alias_cores(value)
+            self._add("organization", value, masked, candidate)
+            return
+        if not candidate.source.startswith(("linear_llm", "full_document_llm")) and (
             _is_false_org(value) or is_noisy_org_capture(value)
         ):
             return
@@ -223,7 +246,7 @@ class LinearRuleEngine:
 
         legal_suffix = next((suffix for suffix in LEGAL_SUFFIXES if value.endswith(suffix)), "")
         if not legal_suffix:
-            if candidate.source.startswith("linear_llm") and len(value) >= 2 and not _is_false_org(f"{value}公司"):
+            if candidate.source.startswith(("linear_llm", "full_document_llm")) and len(value) >= 2 and not _is_false_org(f"{value}公司"):
                 suffix = "局" if value.endswith("局") else "机构"
                 self._add("organization", value, f"{self.counters.next('group_prefix')}{suffix}", candidate)
             return
@@ -240,12 +263,23 @@ class LinearRuleEngine:
         ):
             return
 
-        related_plan = find_related_company_plan(
-            value,
-            self._organization_plans,
-            self._alias_cores_cache,
-            source_text=self.source_text,
-        )
+        if entity_id and entity_id in self._entity_org_plans:
+            plan = self._entity_org_plans[entity_id]
+            masked = organization_mask_for_surface(value, plan)
+            self.known_organizations.add(value)
+            self._organization_plans[value] = plan
+            self._alias_cores_cache[value] = derived_organization_alias_cores(value)
+            self._entity_masks[entity_id] = masked
+            self._add("organization", value, masked, candidate)
+            return
+        related_plan = None
+        if not entity_id:
+            related_plan = find_related_company_plan(
+                value,
+                self._organization_plans,
+                self._alias_cores_cache,
+                source_text=self.source_text,
+            )
         if related_plan is not None:
             location_updates: tuple[tuple[str, str], ...] = ()
             if is_short_company_surface(value, brand=related_plan.brand):
@@ -271,6 +305,9 @@ class LinearRuleEngine:
                 aliases=related_plan.aliases,
             )
             self._alias_cores_cache[value] = derived_organization_alias_cores(value)
+            if entity_id:
+                self._entity_org_plans[entity_id] = self._organization_plans[value]
+                self._entity_masks[entity_id] = masked
             self._add("organization", value, masked, candidate)
             return
 
@@ -291,6 +328,9 @@ class LinearRuleEngine:
         self.known_organizations.add(value)
         self._alias_cores_cache[value] = derived_organization_alias_cores(value)
         self._organization_plans[value] = plan
+        if entity_id:
+            self._entity_org_plans[entity_id] = plan
+            self._entity_masks[entity_id] = plan.full_mask
         self._add("organization", value, plan.full_mask, candidate)
 
         for alias in plan.aliases:
@@ -330,6 +370,27 @@ class LinearRuleEngine:
             if alias_core in cores:
                 return True
         return False
+
+    @staticmethod
+    def _candidate_entity_id(candidate: Candidate) -> str | None:
+        value = candidate.metadata.get("registry_entity_id") if isinstance(candidate.metadata, dict) else None
+        return value if isinstance(value, str) and value else None
+
+    @staticmethod
+    def _candidate_restore_original(candidate: Candidate) -> str | None:
+        value = candidate.metadata.get("registry_primary_text") if isinstance(candidate.metadata, dict) else None
+        return value if isinstance(value, str) and value else None
+
+    def _entity_do_not_merge_ids(self, entity_id: str | None) -> tuple[str, ...]:
+        if not entity_id or self._registry_constraints is None:
+            return ()
+        blocked: list[str] = []
+        for pair in self._registry_constraints.do_not_merge:
+            if pair.left_id == entity_id:
+                blocked.append(pair.right_id)
+            elif pair.right_id == entity_id:
+                blocked.append(pair.left_id)
+        return tuple(blocked)
 
     def _expand_discovered_aliases(self) -> None:
         for organization in list(self.known_organizations):
@@ -405,5 +466,8 @@ class LinearRuleEngine:
                 source=f"linear:{candidate.source}",
                 confidence=candidate.confidence,
                 restore_by_default=True,
+                entity_id=self._candidate_entity_id(candidate),
+                do_not_merge=self._entity_do_not_merge_ids(self._candidate_entity_id(candidate)),
+                restore_original=self._candidate_restore_original(candidate),
             )
         )

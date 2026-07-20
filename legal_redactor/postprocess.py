@@ -570,6 +570,12 @@ def _organization_canonical_score(mapping: MappingEntry) -> tuple[int, int, str]
     return score, len(original), original
 
 
+def _mapping_merge_blocked(left: MappingEntry, right: MappingEntry) -> bool:
+    if not left.entity_id or not right.entity_id:
+        return False
+    return right.entity_id in left.do_not_merge or left.entity_id in right.do_not_merge
+
+
 def _merge_organization_alias_mappings(mappings: list[MappingEntry]) -> list[MappingEntry]:
     """Make same-subject organization variants share one mask inside a batch map."""
     from .lexicon import PROVINCE_NAMES
@@ -627,6 +633,8 @@ def _merge_organization_alias_mappings(mappings: list[MappingEntry]) -> list[Map
             continue
         first = indices[0]
         for index in indices[1:]:
+            if _mapping_merge_blocked(mappings[first], mappings[index]):
+                continue
             if _organization_profiles_same_subject(
                 profiles[first],
                 profiles[index],
@@ -638,6 +646,8 @@ def _merge_organization_alias_mappings(mappings: list[MappingEntry]) -> list[Map
 
     for position, left in enumerate(org_indices):
         for right in org_indices[position + 1 :]:
+            if _mapping_merge_blocked(mappings[left], mappings[right]):
+                continue
             if _organization_profiles_same_subject(
                 profiles[left],
                 profiles[right],

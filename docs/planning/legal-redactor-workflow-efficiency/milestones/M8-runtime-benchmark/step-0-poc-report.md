@@ -225,7 +225,7 @@ find samples -maxdepth 1 -type f \( -name '*最高*' -o -name '0[123]_*' \) | so
 ### Script
 
 ```bash
-node /Users/jannerchang/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.1.14/lib/milestone-doc-check.mjs --dir docs/planning/legal-redactor-workflow-efficiency/milestones/M8-runtime-benchmark
+node /Users/example/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.1.14/lib/milestone-doc-check.mjs --dir docs/planning/legal-redactor-workflow-efficiency/milestones/M8-runtime-benchmark
 ```
 
 ### Validation

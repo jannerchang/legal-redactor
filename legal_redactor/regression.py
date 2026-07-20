@@ -10,7 +10,8 @@ from typing import Any
 from .cases import invalid_workflow_decision_fields
 from .models import RedactionMap
 
-SCHEMA_VERSION = "M6-regression-report/v1"
+SCHEMA_VERSION = "M6-regression-report/v2"
+LEGACY_SCHEMA_VERSION = "M6-regression-report/v1"
 
 _METRIC_FIELDS = (
     "case_count",
@@ -20,6 +21,9 @@ _METRIC_FIELDS = (
     "precision",
     "recall",
     "f1",
+    "high_risk_miss_count",
+    "wrong_merge_count",
+    "wrong_split_count",
 )
 _CASE_FIELDS = (
     "name",
@@ -66,11 +70,20 @@ def project_gold_report(report: dict[str, Any] | None) -> dict[str, Any]:
             "recall": None,
             "f1": None,
             "cases": [],
+            "by_type": {},
+            "high_risk_miss_count": None,
+            "high_risk_miss_reason": "missing_gold_evidence",
+            "wrong_merge_count": None,
+            "wrong_split_count": None,
+            "identity_metric_reason": "missing_gold_evidence",
         }
 
     projected: dict[str, Any] = {"available": True}
     for field in _METRIC_FIELDS:
         projected[field] = report.get(field)
+    projected["by_type"] = report.get("by_type", {}) if isinstance(report.get("by_type"), dict) else {}
+    projected["high_risk_miss_reason"] = report.get("high_risk_miss_reason")
+    projected["identity_metric_reason"] = report.get("identity_metric_reason")
 
     projected_cases: list[dict[str, Any]] = []
     cases = report.get("cases", [])
@@ -97,6 +110,12 @@ def aggregate_sample_summaries(summaries: list[dict[str, Any]] | None) -> dict[s
         "manual_corrections": 0,
         "false_positive_deletes": 0,
         "missing_adds": 0,
+        "manual_add_count": 0,
+        "manual_delete_count": 0,
+        "manual_modify_count": None,
+        "manual_modify_reason": "missing_manual_modify_evidence",
+        "review_action_total": None,
+        "review_action_total_reason": "missing_manual_modify_evidence",
         "lookup_entry_count": 0,
         "delete_blacklist_candidate_count": 0,
         "suppressed_risky_entry_count": 0,
@@ -116,6 +135,13 @@ def aggregate_sample_summaries(summaries: list[dict[str, Any]] | None) -> dict[s
         totals["manual_corrections"] += _int_value(summary.get("manual_corrections"))
         totals["false_positive_deletes"] += _int_value(summary.get("false_positive_deletes"))
         totals["missing_adds"] += _int_value(summary.get("missing_adds"))
+        totals["manual_add_count"] += _int_value(summary.get("missing_adds"))
+        totals["manual_delete_count"] += _int_value(summary.get("false_positive_deletes"))
+        manual_modify = summary.get("manual_modify_count")
+        if isinstance(manual_modify, int) and not isinstance(manual_modify, bool):
+            if totals["manual_modify_count"] is None:
+                totals["manual_modify_count"] = 0
+            totals["manual_modify_count"] += max(0, manual_modify)
         totals["lookup_entry_count"] += _list_count(summary.get("lookup_entries"))
         totals["delete_blacklist_candidate_count"] += _list_count(summary.get("delete_blacklist_candidates"))
         totals["suppressed_risky_entry_count"] += _list_count(summary.get("suppressed_risky_entries"))
@@ -130,6 +156,14 @@ def aggregate_sample_summaries(summaries: list[dict[str, Any]] | None) -> dict[s
         if isinstance(raw_suggestions, list):
             suggestions.extend(str(item) for item in raw_suggestions if item)
 
+    if totals["manual_modify_count"] is not None:
+        totals["manual_modify_reason"] = None
+        totals["review_action_total"] = (
+            totals["manual_add_count"]
+            + totals["manual_delete_count"]
+            + totals["manual_modify_count"]
+        )
+        totals["review_action_total_reason"] = None
     if unresolved_seen:
         totals["restore_unresolved_placeholder_count"] = unresolved_total
     totals["ignored_browser_fields"] = sorted(ignored_fields)
@@ -263,6 +297,7 @@ def build_regression_report(
     document_input_at: str | None = None,
     saved_case_at: str | None = None,
     gold_evaluation_ms: int | None = None,
+    recognition: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     workflow = aggregate_sample_summaries(sample_summaries)
     gold = project_gold_report(gold_report)
@@ -285,6 +320,7 @@ def build_regression_report(
             saved_case_at=saved_case_at,
             gold_evaluation_ms=gold_evaluation_ms,
         ),
+        "recognition": _project_recognition(recognition),
         "privacy": {
             "safe_by_default": True,
             "gold_raw_diagnostics": "omitted",
@@ -297,6 +333,27 @@ def build_regression_report(
     }
     assert_privacy_safe_report(report)
     return report
+
+
+def _project_recognition(recognition: dict[str, Any] | None) -> dict[str, Any]:
+    recognition = recognition if isinstance(recognition, dict) else {}
+    allowed = {
+        "mode",
+        "model_id",
+        "status",
+        "document_count",
+        "call_count",
+        "retry_count",
+        "fallback_count",
+        "conflict_count",
+        "duration_ms",
+        "prompt_token_count",
+        "completion_token_count",
+        "total_token_count",
+        "reason",
+        "category_counts",
+    }
+    return {key: recognition.get(key) for key in allowed if key in recognition}
 
 
 def regression_report_to_json(report: dict[str, Any]) -> str:

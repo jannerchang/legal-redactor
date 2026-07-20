@@ -3,15 +3,17 @@ from __future__ import annotations
 import re
 import random
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from typing import Any
 
 from .candidate_collector import (
     CandidateCollectionContext,
-    CandidateCollectionResult,
     CandidateCollector,
     candidate_needs_llm_review,
+    CandidateCollectionResult,
 )
 from .config import HIGH_RISK_TYPES, PipelineConfig, RedactionProfile
+from .entity_registry import FullDocumentEntityRegistry, RegistryMaterialization, materialize_registry_candidates
 from .counters import TypeCounters
 from .detectors import (
     detect_standard_regex_candidates,
@@ -22,8 +24,9 @@ from .china_admin_rules import detect_china_admin_rule_candidates
 from .hebei_admin import HebeiAdminDivisionDetector
 from .linear_engine import LinearRuleEngine
 from .location_utils import get_location_core
-from .models import BatchRedactionResult, Candidate, Leak, MappingEntry, RedactedDocument, RedactionMap, RedactionResult
+from .models import BatchRedactionResult, Candidate, Leak, MappingEntry, RecognitionRunStats, RedactedDocument, RedactionMap, RedactionResult
 from .postprocess import PostprocessConfig, apply_postprocess
+from .recognition_audit import audit_recognition
 
 
 _COMPANY_SUFFIXES_FOR_ALIAS_BOUNDARY = (
@@ -361,6 +364,15 @@ def _should_skip_short_org_alias_replacement(
 
 
 
+class _RecognitionState(str, Enum):
+    NOT_REQUESTED = "not_requested"
+    SUCCESS = "success"
+    PARTIAL = "partial"
+    NO_TARGETS = "no_targets"
+    FALLBACK = "fallback"
+    HARD_FAILURE = "hard_failure"
+
+
 @dataclass
 class _RedactionContext:
     """Mutable state for the linear redaction path.
@@ -390,9 +402,10 @@ class _RedactionContext:
     admin_spans: list[tuple[int, int, str]] = field(default_factory=list)
     hanlp_candidates: list[Candidate] = field(default_factory=list)
     review_candidates: list[Candidate] = field(default_factory=list)
-    sentence_extraction_mode: bool = False
-    sentence_extraction_success: bool = False
-    llm_extraction_failed: bool = False
+    recognition_state: _RecognitionState = _RecognitionState.NOT_REQUESTED
+    registry_materialization: RegistryMaterialization | None = None
+    registry_constraints: FullDocumentEntityRegistry | None = None
+    recognition_stats: RecognitionRunStats | None = None
 
     def get_location_prefix(self, name: str) -> str:
         core = get_location_core(name)
@@ -546,32 +559,8 @@ def _linear_collect_hanlp_candidates(pipeline, ctx) -> None:
             ctx.hanlp_candidates.append(candidate)
 
 
-def _linear_run_sentence_extraction(pipeline, ctx, text):
-    """Run LLM sentence-entity extraction when enabled.
-
-    Returns a ``RedactionResult`` when the fail-open fallback short-circuits the
-    whole redaction (``fail_open`` disabled); otherwise returns ``None`` and the
-    caller proceeds with the rule engine.
-    """
-
-    def collect_heuristic_location_candidates() -> None:
-        # Heuristic location guesses lack the administrative level evidence
-        # required for the narrow automatic scope. Users can add such text
-        # from the mapping-review selection UI when needed.
-        return
-
-    ctx.sentence_extraction_mode = (
-        pipeline.config.enable_llm
-        and pipeline.config.llm.enabled
-        and (
-            pipeline.config.llm.role == "sentence_entity_extraction"
-            or (
-                pipeline.config.semantic_llm_first
-                and pipeline.config.llm.mode == "max-effect"
-            )
-        )
-    )
-    ctx.sentence_extraction_success = False
+def _linear_run_recognition(pipeline, ctx, text):
+    """Dispatch configured recognition and preserve the fixed fallback ladder."""
     ctx.review_candidates = []
     ctx.analysis = {
         "locations": [],
@@ -581,81 +570,209 @@ def _linear_run_sentence_extraction(pipeline, ctx, text):
         "reject": [],
         "calibrate": {},
     }
-    ctx.llm_extraction_failed = False
-
-    if ctx.sentence_extraction_mode:
-        from .llm import LegalEntityAuditor
-
-        auditor = LegalEntityAuditor(pipeline.config.llm)
-        ctx.analysis = auditor.extract_sentence_entities(
-            ctx.scan_text,
-            enable_samples=False,
+    llm_requested = pipeline.config.enable_llm and pipeline.config.llm.enabled
+    if not llm_requested:
+        ctx.recognition_state = _RecognitionState.NOT_REQUESTED
+        ctx.recognition_stats = RecognitionRunStats(
+            mode="rules_ner",
+            model_id=None,
+            status=ctx.recognition_state.value,
         )
-        if ctx.analysis.get("error"):
-            ctx.llm_extraction_failed = True
-            if not pipeline.config.llm.fail_open:
-                ctx.warnings.append(
-                    f"整句 LLM 识别失败，已仅保留固定结构化正则脱敏：{ctx.analysis['error']}"
-                )
-                unique_mappings: list[MappingEntry] = []
-                seen_originals: set[str] = set()
-                for mapping in ctx.base_mappings:
-                    if mapping.original in seen_originals:
-                        continue
-                    seen_originals.add(mapping.original)
-                    unique_mappings.append(mapping)
-                for mapping in sorted(ctx.fixed_regex_mappings, key=lambda item: len(item.original), reverse=True):
-                    if mapping.original in seen_originals:
-                        continue
-                    seen_originals.add(mapping.original)
-                    unique_mappings.append(mapping)
+        return None
+    sentence_extraction_enabled = (
+        pipeline.config.llm.role == "sentence_entity_extraction"
+        or (
+            pipeline.config.semantic_llm_first
+            and pipeline.config.llm.mode == "max-effect"
+        )
+    )
+    if not sentence_extraction_enabled:
+        ctx.recognition_state = _RecognitionState.NOT_REQUESTED
+        ctx.recognition_stats = RecognitionRunStats(
+            mode="candidate_review",
+            model_id=pipeline.config.llm.model,
+            status=ctx.recognition_state.value,
+        )
+        return None
 
-                unique_mappings = apply_postprocess(
-                    text,
-                    unique_mappings,
-                    PostprocessConfig(),
-                )
 
-                redacted_text = remove_court_signatures(pipeline.apply_mappings(text, unique_mappings))
-                leaks = pipeline.scan_high_risk_leaks(redacted_text)
-                return RedactionResult(
-                    original_text=text,
-                    redacted_text=redacted_text,
-                    redaction_map=RedactionMap.create(
-                        mappings=unique_mappings,
-                        mode=ctx.profile.name,
-                        source_file=ctx.source_file,
-                    ),
-                    candidates=[],
-                    review_candidates=[],
-                    leaks=leaks,
-                    mode=ctx.profile.name,
-                    warnings=ctx.warnings,
-                )
-            ctx.warnings.append(
-                f"整句 LLM 识别失败，已降级为规则模式：{ctx.analysis['error']}"
+    if pipeline.config.llm.recognition_mode == "full_document":
+        early = _linear_run_full_document_recognition(pipeline, ctx, text)
+        if early is not None or ctx.recognition_state == _RecognitionState.SUCCESS:
+            return early
+        ctx.warnings.append(
+            f"整篇 LLM 识别失败，已回退逐句窗口：{ctx.recognition_stats.reason if ctx.recognition_stats else 'unknown'}"
+        )
+
+    return _linear_run_sentence_windows(pipeline, ctx, text)
+
+
+def _linear_run_full_document_recognition(pipeline, ctx, text):
+    from .llm import LegalEntityAuditor
+
+    extraction = LegalEntityAuditor(pipeline.config.llm).extract_full_document_registry(
+        ctx.scan_text,
+        enable_samples=False,
+    )
+    metadata = extraction.metadata
+    if extraction.status != "success":
+        ctx.recognition_state = _RecognitionState.FALLBACK
+        ctx.recognition_stats = RecognitionRunStats(
+            mode="full_document",
+            model_id=pipeline.config.llm.model,
+            status=ctx.recognition_state.value,
+            call_count=metadata.call_count,
+            retry_count=metadata.retry_count,
+            fallback_count=1,
+            duration_ms=metadata.duration_ms,
+            prompt_token_count=metadata.prompt_token_count,
+            completion_token_count=metadata.completion_token_count,
+            total_token_count=metadata.total_token_count,
+            reason=extraction.reason,
+        )
+        return None
+
+    materialization = materialize_registry_candidates(ctx.scan_text, extraction.validation)
+    ctx.registry_materialization = materialization
+    ctx.registry_constraints = materialization.constraints
+    ctx.review_candidates.extend(materialization.review_candidates)
+    detector_candidates = CandidateCollector().collect(
+        CandidateCollectionContext(
+            text=ctx.scan_text,
+            seed_candidates=[*ctx.admin_candidates, *ctx.hanlp_candidates],
+            llm_analysis={},
+            llm_primary_discovery=False,
+            use_semantic_rules=True,
+            use_china_admin_rules=pipeline.config.enable_china_admin_rules,
+        )
+    ).candidates
+    audit_result = audit_recognition(
+        detector_candidates,
+        materialization,
+        materialization.constraints,
+    )
+    ctx.review_candidates.extend(audit_result.review_candidates)
+    ctx.warnings.extend(extraction.validation.warnings)
+    ctx.recognition_state = _RecognitionState.SUCCESS
+    ctx.recognition_stats = RecognitionRunStats(
+        mode="full_document",
+        model_id=pipeline.config.llm.model,
+        status=ctx.recognition_state.value,
+        call_count=metadata.call_count,
+        retry_count=metadata.retry_count,
+        conflict_count=sum(
+            audit_result.category_counts.get(category, 0)
+            for category in (
+                "type_conflict",
+                "grouping_conflict",
+                "merge_conflict",
+                "split_conflict",
+                "uncertain",
             )
-            ctx.analysis = {
-                "locations": [],
-                "companies": [],
-                "persons": [],
-                "projects": [],
-                "reject": [],
-                "calibrate": {},
-            }
-            collect_heuristic_location_candidates()
-        elif ctx.analysis.get("_no_target_windows"):
-            collect_heuristic_location_candidates()
-        else:
-            ctx.sentence_extraction_success = True
-            batch_failures = ctx.analysis.get("_batch_failures")
-            if isinstance(batch_failures, list) and batch_failures:
-                ctx.warnings.append(
-                    f"部分批次 LLM 识别失败（{len(batch_failures)} 批），已使用其余批次结果编排。"
-                )
-    else:
-        collect_heuristic_location_candidates()
+        ),
+        duration_ms=metadata.duration_ms,
+        prompt_token_count=metadata.prompt_token_count,
+        completion_token_count=metadata.completion_token_count,
+        total_token_count=metadata.total_token_count,
+        category_counts=audit_result.category_counts,
+    )
     return None
+
+
+def _linear_run_sentence_windows(pipeline, ctx, text):
+    """Run the stable sentence-window baseline, including fail-open behavior."""
+    from .llm import LegalEntityAuditor
+
+    prior_stats = ctx.recognition_stats
+    ctx.analysis = LegalEntityAuditor(pipeline.config.llm).extract_sentence_entities(
+        ctx.scan_text,
+        enable_samples=False,
+    )
+    if ctx.analysis.get("error"):
+        reason = str(ctx.analysis["error"])
+        call_count = prior_stats.call_count if prior_stats else 0
+        retry_count = prior_stats.retry_count if prior_stats else 0
+        duration_ms = prior_stats.duration_ms if prior_stats else 0
+        fallback_count = (prior_stats.fallback_count if prior_stats else 0) + 1
+        if not pipeline.config.llm.fail_open:
+            ctx.recognition_state = _RecognitionState.HARD_FAILURE
+            ctx.recognition_stats = RecognitionRunStats(
+                mode=pipeline.config.llm.recognition_mode,
+                model_id=pipeline.config.llm.model,
+                status=ctx.recognition_state.value,
+                call_count=call_count,
+                retry_count=retry_count,
+                fallback_count=fallback_count,
+                duration_ms=duration_ms,
+                reason=reason,
+            )
+            ctx.warnings.append(f"整句 LLM 识别失败，已仅保留固定结构化正则脱敏：{reason}")
+            return _structured_regex_early_result(pipeline, ctx, text)
+        ctx.recognition_state = _RecognitionState.FALLBACK
+        ctx.recognition_stats = RecognitionRunStats(
+            mode=pipeline.config.llm.recognition_mode,
+            model_id=pipeline.config.llm.model,
+            status=ctx.recognition_state.value,
+            call_count=call_count,
+            retry_count=retry_count,
+            fallback_count=fallback_count,
+            duration_ms=duration_ms,
+            reason=reason,
+        )
+        ctx.warnings.append(f"整句 LLM 识别失败，已降级为规则模式：{reason}")
+        ctx.analysis = {
+            "locations": [],
+            "companies": [],
+            "persons": [],
+            "projects": [],
+            "reject": [],
+            "calibrate": {},
+        }
+        return None
+
+    if ctx.analysis.get("_no_target_windows"):
+        ctx.recognition_state = _RecognitionState.NO_TARGETS
+    elif ctx.analysis.get("_batch_failures"):
+        failures = ctx.analysis.get("_batch_failures", [])
+        ctx.recognition_state = _RecognitionState.PARTIAL
+        ctx.warnings.append(f"部分批次 LLM 识别失败（{len(failures)} 批），已使用其余批次结果编排。")
+    else:
+        ctx.recognition_state = _RecognitionState.SUCCESS
+    ctx.recognition_stats = RecognitionRunStats(
+        mode="sentence_windows",
+        model_id=pipeline.config.llm.model,
+        status=ctx.recognition_state.value,
+        fallback_count=prior_stats.fallback_count if prior_stats else 0,
+        reason=prior_stats.reason if prior_stats and prior_stats.fallback_count else None,
+    )
+    return None
+
+
+def _structured_regex_early_result(pipeline, ctx, text) -> RedactionResult:
+    unique_mappings: list[MappingEntry] = []
+    seen_originals: set[str] = set()
+    for mapping in [*ctx.base_mappings, *sorted(ctx.fixed_regex_mappings, key=lambda item: len(item.original), reverse=True)]:
+        if mapping.original in seen_originals:
+            continue
+        seen_originals.add(mapping.original)
+        unique_mappings.append(mapping)
+    unique_mappings = apply_postprocess(text, unique_mappings, PostprocessConfig())
+    redacted_text = remove_court_signatures(pipeline.apply_mappings(text, unique_mappings))
+    return RedactionResult(
+        original_text=text,
+        redacted_text=redacted_text,
+        redaction_map=RedactionMap.create(
+            mappings=unique_mappings,
+            mode=ctx.profile.name,
+            source_file=ctx.source_file,
+        ),
+        candidates=[],
+        review_candidates=[],
+        leaks=pipeline.scan_high_risk_leaks(redacted_text),
+        mode=ctx.profile.name,
+        warnings=ctx.warnings,
+        recognition_stats=ctx.recognition_stats,
+    )
 
 
 def _linear_run_engine(pipeline, ctx) -> None:
@@ -672,7 +789,27 @@ def _linear_run_engine(pipeline, ctx) -> None:
     }
     seed_candidates = [*ctx.admin_candidates, *ctx.hanlp_candidates]
 
-    if ctx.sentence_extraction_success:
+    if ctx.registry_materialization is not None and ctx.recognition_state == _RecognitionState.SUCCESS:
+        collected = collector.collect(
+            CandidateCollectionContext(
+                text=ctx.scan_text,
+                seed_candidates=seed_candidates,
+                llm_analysis={},
+                llm_primary_discovery=False,
+                use_semantic_rules=True,
+                use_china_admin_rules=pipeline.config.enable_china_admin_rules,
+                registry_materialization=ctx.registry_materialization,
+            )
+        )
+        final_candidates = collected.candidates
+        ctx.review_candidates = _dedupe_review_candidates(
+            [*ctx.review_candidates, *collected.review_candidates]
+        )
+    elif ctx.recognition_state in {
+        _RecognitionState.SUCCESS,
+        _RecognitionState.PARTIAL,
+        _RecognitionState.NO_TARGETS,
+    } and pipeline.config.llm.recognition_mode == "sentence_windows":
         final_candidates = collector.collect(
             CandidateCollectionContext(
                 text=ctx.scan_text,
@@ -694,30 +831,17 @@ def _linear_run_engine(pipeline, ctx) -> None:
                 use_china_admin_rules=pipeline.config.enable_china_admin_rules,
             )
         ).candidates
-        review_candidates = [
-            candidate
-            for candidate in rule_candidates
-            if candidate_needs_llm_review(candidate)
-        ]
-        deduped_review_candidates: list[Candidate] = []
-        seen_review_keys: set[tuple[str, str]] = set()
-        for candidate in review_candidates:
-            key = (candidate.type, candidate.text)
-            if key in seen_review_keys:
-                continue
-            seen_review_keys.add(key)
-            deduped_review_candidates.append(candidate)
-        ctx.review_candidates = deduped_review_candidates[:80]
-
+        ctx.review_candidates = _dedupe_review_candidates(
+            [candidate for candidate in rule_candidates if candidate_needs_llm_review(candidate)]
+        )
         if (
             pipeline.config.enable_llm
             and pipeline.config.llm.enabled
             and ctx.review_candidates
-            and not ctx.llm_extraction_failed
+            and pipeline.config.llm.role != "sentence_entity_extraction"
         ):
             from .llm import LegalEntityAuditor
 
-            auditor = LegalEntityAuditor(pipeline.config.llm)
             verify_list = [
                 {
                     "text": candidate.text,
@@ -725,26 +849,45 @@ def _linear_run_engine(pipeline, ctx) -> None:
                     "context": candidate.metadata.get(
                         "context",
                         ctx.scan_text[
-                            max(0, candidate.start - 60):
-                            min(len(ctx.scan_text), candidate.end + 60)
+                            max(0, candidate.start - 60):min(len(ctx.scan_text), candidate.end + 60)
                         ],
                     ),
                 }
                 for candidate in ctx.review_candidates
             ]
-            ctx.analysis = auditor.audit_and_verify(
+            ctx.analysis = LegalEntityAuditor(pipeline.config.llm).audit_and_verify(
                 ctx.scan_text,
                 verify_list,
                 enable_samples=False,
             )
             if ctx.analysis.get("error"):
                 ctx.warnings.append(str(ctx.analysis["error"]))
+            final_candidates = CandidateCollectionResult(
+                candidates=rule_candidates
+            ).with_llm_analysis(collector, ctx.scan_text, ctx.analysis).candidates
+        else:
+            final_candidates = rule_candidates
 
-        final_candidates = CandidateCollectionResult(
-            candidates=rule_candidates
-        ).with_llm_analysis(collector, ctx.scan_text, ctx.analysis).candidates
+    ctx.mappings.extend(
+        engine.discover(
+            ctx.scan_text,
+            final_candidates,
+            ctx.analysis,
+            registry_constraints=ctx.registry_constraints,
+        )
+    )
 
-    ctx.mappings.extend(engine.discover(ctx.scan_text, final_candidates, ctx.analysis))
+
+def _dedupe_review_candidates(candidates: list[Candidate]) -> list[Candidate]:
+    deduped: list[Candidate] = []
+    seen: set[tuple[str, str, int]] = set()
+    for candidate in candidates:
+        key = (candidate.type, candidate.text, candidate.start)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped[:80]
 
 
 def _linear_finalize(pipeline, ctx, text) -> RedactionResult:
@@ -782,7 +925,41 @@ def _linear_finalize(pipeline, ctx, text) -> RedactionResult:
         leaks=leaks,
         mode=ctx.profile.name,
         warnings=ctx.warnings,
+        recognition_stats=ctx.recognition_stats,
     )
+
+
+def _aggregate_recognition_stats(
+    stats: list[RecognitionRunStats],
+    document_count: int,
+) -> RecognitionRunStats | None:
+    if not stats:
+        return None
+    mode = stats[0].mode if all(item.mode == stats[0].mode for item in stats) else "mixed"
+    model_ids = {item.model_id for item in stats}
+    statuses = {item.status for item in stats}
+    return RecognitionRunStats(
+        mode=mode,
+        model_id=next(iter(model_ids)) if len(model_ids) == 1 else None,
+        status=next(iter(statuses)) if len(statuses) == 1 else "partial",
+        document_count=document_count,
+        call_count=sum(item.call_count for item in stats),
+        retry_count=sum(item.retry_count for item in stats),
+        fallback_count=sum(item.fallback_count for item in stats),
+        conflict_count=sum(item.conflict_count for item in stats),
+        duration_ms=sum(item.duration_ms for item in stats),
+        prompt_token_count=_sum_optional(item.prompt_token_count for item in stats),
+        completion_token_count=_sum_optional(item.completion_token_count for item in stats),
+        total_token_count=_sum_optional(item.total_token_count for item in stats),
+        reason=next((item.reason for item in stats if item.reason), None),
+    )
+
+
+def _sum_optional(values) -> int | None:
+    items = list(values)
+    if not items or all(value is None for value in items):
+        return None
+    return sum(value or 0 for value in items)
 
 
 class RedactionPipeline:
@@ -845,6 +1022,7 @@ class RedactionPipeline:
             "entity_groups": entity_groups,
             "locations": locations,
             "warnings": result.warnings,
+            "recognition_stats": result.recognition_stats.to_dict() if result.recognition_stats else None,
         }
 
     def redact(self, text: str, source_file: str | None = None, mode: str | None = None, prov_mapping: dict[str, str] | None = None, base_redaction_map: RedactionMap | None = None) -> RedactionResult:
@@ -872,7 +1050,7 @@ class RedactionPipeline:
         _linear_collect_admin_spans(self, ctx)
         _linear_collect_china_admin_candidates(self, ctx)
         _linear_collect_hanlp_candidates(self, ctx)
-        early = _linear_run_sentence_extraction(self, ctx, text)
+        early = _linear_run_recognition(self, ctx, text)
         if early is not None:
             return early
         _linear_run_engine(self, ctx)
@@ -897,6 +1075,7 @@ class RedactionPipeline:
         # 解决拼接截断 Bug：逐个对独立文件进行脱敏分析，获取高质量的 Mapping 项
         all_mappings = []
         warnings = []
+        recognition_stats: list[RecognitionRunStats] = []
         prov_mapping = {}
         shared_redaction_map = base_redaction_map
         for source_name, original_text in documents:
@@ -914,6 +1093,8 @@ class RedactionPipeline:
             )
             if res.warnings:
                 warnings.extend(res.warnings)
+            if res.recognition_stats is not None:
+                recognition_stats.append(res.recognition_stats)
                 
         # 统一汇总去重，生成统一共享的高质量映射表 (按原文长度倒序)
         unique_mappings = []
@@ -952,6 +1133,7 @@ class RedactionPipeline:
             leaks.extend(document_leaks)
             
         batch_warnings = [f"已对 {len(documents)} 份文书使用同一张映射表统一脱敏。", *warnings]
+        batch_stats = _aggregate_recognition_stats(recognition_stats, len(documents))
         return BatchRedactionResult(
             documents=redacted_documents,
             redaction_map=unified_redaction_map,
@@ -960,7 +1142,10 @@ class RedactionPipeline:
             leaks=leaks,
             mode=profile.name,
             warnings=batch_warnings,
+            recognition_stats=batch_stats,
         )
+
+
 
     def apply_redaction_map(self, text: str, redaction_map: RedactionMap) -> str:
         return remove_court_signatures(self.apply_mappings(text, redaction_map.mappings))

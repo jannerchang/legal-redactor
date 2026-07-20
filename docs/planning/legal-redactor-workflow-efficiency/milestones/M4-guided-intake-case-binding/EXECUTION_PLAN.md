@@ -2,7 +2,7 @@
 
 > **依据**:[README.md](README.md), [../../REQUIREMENTS.md](../../REQUIREMENTS.md) §6.2
 > **格式**:七层硬门槛 + 决策表 + Step 顺序 + 时间盒 + 跨模块签字 + 服务端权威重算 + 文档维护扫
-> **schema 引用**:/Users/jannerchang/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.111/templates/gate.schema.md
+> **schema 引用**:/Users/example/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.111/templates/gate.schema.md
 > **更新节奏**:Step 进 / 出时同步本文件 + [_progress.md](_progress.md)
 > **版本**:v1.0 · 2026-06-29
 
@@ -63,7 +63,7 @@
 | D-01 | Existing form already handles paste/upload/batch and carries case fields; improving it is cheaper than a second flow. | v1.0 | `legal_redactor/web_app.py` index form |
 | D-02 | Requirements say Office Mac local storage owns originals, maps, manifests, and restored output. | v1.0 | [../../REQUIREMENTS.md](../../REQUIREMENTS.md) §3 |
 | D-03 | Requirements enumerate the exact states the user needs to distinguish. | v1.0 | [../../REQUIREMENTS.md](../../REQUIREMENTS.md) §6.2 |
-| D-04 | Status/state/ownership are authoritative-decision keywords; client-submitted state must not be trusted. | v1.0 | `/Users/jannerchang/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.111/templates/authoritative-recompute.md` |
+| D-04 | Status/state/ownership are authoritative-decision keywords; client-submitted state must not be trusted. | v1.0 | `/Users/example/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.111/templates/authoritative-recompute.md` |
 | D-05 | Split signoff explicitly forbids silent wrong manifest/thread selection. | v1.0 | [../../SPLIT.md](../../SPLIT.md) Signoff Needs |
 | D-06 | Requirements preserve manual override when suggestion is ambiguous. | v1.0 | [../../REQUIREMENTS.md](../../REQUIREMENTS.md) §6.2 |
 | D-07 | M7 owns restore readiness/status; M4 only prepares correct binding. | v1.0 | [../../SPLIT.md](../../SPLIT.md) Milestone Overview |

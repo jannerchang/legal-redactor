@@ -143,7 +143,7 @@ and mocked Gate proof when live credentials are absent.
   - scope: API/Web case root selection now derives from existing `source_dir` before falling back to configured/default root; thread status lookup searches dynamic case roots and prefers the sole mapped case over empty shell manifests.
   - focused validation: `LEGAL_REDACTOR_MCP_CONFIG=<empty temp config> .venv/bin/python -m pytest tests/test_cases.py tests/test_remote_api.py tests/test_mcp_adapter.py tests/test_web_app.py -q` · `84 passed`
   - full validation: `LEGAL_REDACTOR_MCP_CONFIG=<empty temp config> .venv/bin/python -m pytest -q` · `198 passed`
-  - Office live smoke: `GET /health` on `100.121.131.77:8787` returned `{"status":"ok"}`; authenticated status by thread returned `ok=True`, `code=no_restore_yet`, `mapping_present=True`, `restore.status=no_restore_yet`, and no `/Users/` or `/Volumes/` leakage.
+  - Office live smoke: `GET /health` on `office-host.example:8787` returned `{"status":"ok"}`; authenticated status by thread returned `ok=True`, `code=no_restore_yet`, `mapping_present=True`, `restore.status=no_restore_yet`, and no `/Users/` or `/Volumes/` leakage.
   - Home Mac MCP smoke: `ai.hermes.gateway` restarted and running; `legal_redactor.mcp_adapter` tools list contains `restore_judgment_from_thread,get_case_status_by_thread,bind_discord_thread_to_case`; Home Mac MCP status call returned `ok=True`, `code=no_restore_yet`, `mapping_present=True`, and no absolute-path leakage.
 
 ## §4 · 硬门槛证据追踪
@@ -229,7 +229,7 @@ and mocked Gate proof when live credentials are absent.
 
 ### 6.4 · FFCS/profile status
 
-- **命令**:`node /Users/jannerchang/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.123/lib/local-config.mjs profile --host=/Users/jannerchang/legal-redactor` and `node /Users/jannerchang/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.123/lib/status-card.mjs --cwd=/Users/jannerchang/legal-redactor`
+- **命令**:`node /Users/example/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.123/lib/local-config.mjs profile --host=/Users/example/legal-redactor` and `node /Users/example/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.0.123/lib/status-card.mjs --cwd=/Users/example/legal-redactor`
 - **实测时间**:2026-06-29 CST
 
 | # | 名称 | 文档分类 | 权威分类 | 权威源行号 | 动作 |

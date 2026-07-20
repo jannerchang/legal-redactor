@@ -8,9 +8,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import pytest
 
 from legal_redactor.model_manager import (
     ModelManager,
+    ModelManagerError,
     ModelSpec,
     create_model_manager_app,
     discover_model_specs,
@@ -201,6 +203,48 @@ def test_manager_switches_owned_worker_when_model_changes(tmp_path: Path, monkey
     manager.shutdown()
 
 
+
+def test_manager_restores_previous_worker_when_model_switch_fails(tmp_path: Path, monkeypatch) -> None:
+    first_path = tmp_path / "first"
+    second_path = tmp_path / "second"
+    for path in (first_path, second_path):
+        path.mkdir()
+        (path / "config.json").write_text("{}", encoding="utf-8")
+    created: list[_FakeProcess] = []
+
+    def popen(command: list[str], **kwargs: object) -> _FakeProcess:
+        del kwargs
+        process = _FakeProcess()
+        if command[command.index("--model") + 1] == str(second_path):
+            process.returncode = 1
+        created.append(process)
+        return process
+
+    monkeypatch.setattr("legal_redactor.model_manager._port_is_listening", lambda host, port: False)
+    monkeypatch.setattr("legal_redactor.model_manager._worker_is_healthy", lambda host, port: True)
+    manager = ModelManager(
+        {
+            "first": ModelSpec("first", "First", first_path),
+            "second": ModelSpec("second", "Second", second_path),
+        },
+        "127.0.0.1",
+        _unused_port(),
+        startup_timeout_seconds=0.1,
+        popen_factory=popen,
+    )
+
+    manager.ensure_model("first")
+    with pytest.raises(ModelManagerError, match="previous model restored"):
+        manager.ensure_model("second")
+
+    assert len(created) == 3
+    assert created[0].terminated
+    assert manager.health_payload() == {
+        "status": "ok",
+        "active_model": "first",
+        "worker_state": "ready",
+    }
+    manager.shutdown()
 def test_manager_hides_unavailable_models_from_registry(tmp_path: Path) -> None:
     available = tmp_path / "available"
     available.mkdir()

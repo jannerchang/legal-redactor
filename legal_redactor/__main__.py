@@ -12,8 +12,8 @@
 """
 
 from __future__ import annotations
-
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -21,7 +21,13 @@ from pathlib import Path
 from .config import PipelineConfig
 from .io import load_redaction_map_auto, read_document, write_document
 from .pipeline import RedactionPipeline
+from .recognition_benchmark import (
+    load_benchmark_manifest,
+    recognition_benchmark_report_to_json,
+    run_recognition_benchmark,
+)
 from .restore import restore_docx, restore_text
+
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -51,6 +57,12 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("max-effect", "balanced", "off"),
         default="max-effect",
         help="本地模型识别模式",
+    )
+    parser.add_argument(
+        "--recognition-mode",
+        choices=("sentence_windows", "full_document"),
+        default="sentence_windows",
+        help="实体识别路径；整篇文书为实验模式",
     )
     parser.add_argument(
         "--model",
@@ -184,6 +196,42 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar=("LABEL", "OBSERVATION_JSON"),
         help="可选：添加候选的本地计时/内存/错误/探测元数据 JSON",
     )
+    parser.add_argument(
+        "--recognition-benchmark-manifest",
+        type=str,
+        default="",
+        help="运行固定识别模式/模型矩阵的 manifest JSON",
+    )
+    parser.add_argument(
+        "--recognition-benchmark-base-dir",
+        type=str,
+        default=".",
+        help="识别基准 manifest 相对路径的基准目录",
+    )
+    parser.add_argument(
+        "--recognition-benchmark-gold",
+        type=str,
+        default="",
+        help="识别基准可选 gold JSON",
+    )
+    parser.add_argument(
+        "--recognition-benchmark-code-commit",
+        type=str,
+        default="",
+        help="识别基准使用的当前代码提交 ID",
+    )
+    parser.add_argument(
+        "--recognition-benchmark-replicates",
+        type=int,
+        default=1,
+        help="识别基准每个矩阵单元的重复次数",
+    )
+    parser.add_argument(
+        "--recognition-benchmark-report",
+        type=str,
+        default="",
+        help="识别基准隐私安全报告输出路径",
+    )
     return parser
 
 
@@ -200,6 +248,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.runtime_benchmark_report:
         _write_runtime_benchmark_report(args)
+        return
+
+    if args.recognition_benchmark_manifest or args.recognition_benchmark_report:
+        _write_recognition_benchmark_report(args)
         return
 
     if args.regression_report:
@@ -222,7 +274,12 @@ def main(argv: list[str] | None = None) -> None:
 
 def _do_redact(args: argparse.Namespace) -> None:
     input_paths = [Path(p) for p in args.inputs]
-    config = PipelineConfig.from_llm_mode(args.llm, profile_name="standard", model=args.model)
+    config = PipelineConfig.from_llm_mode(
+        args.llm,
+        profile_name="standard",
+        model=args.model,
+        recognition_mode=args.recognition_mode,
+    )
     pipeline = RedactionPipeline(config=config)
     output_dir = Path(args.output_dir)
 
@@ -308,7 +365,12 @@ def _print_warnings_and_leaks(warnings: list[str], leaks: list) -> None:
 def _do_eval(args: argparse.Namespace) -> None:
     from .evaluation import evaluate_gold_file, evaluation_report_to_json
 
-    config = PipelineConfig.from_llm_mode(args.llm, profile_name="standard", model=args.model)
+    config = PipelineConfig.from_llm_mode(
+        args.llm,
+        profile_name="standard",
+        model=args.model,
+        recognition_mode=args.recognition_mode,
+    )
     eval_started = time.monotonic()
     try:
         report = evaluate_gold_file(args.eval_gold, config=config)
@@ -449,6 +511,35 @@ def _write_runtime_benchmark_report(args: argparse.Namespace) -> None:
     for delta in report["comparison"]["deltas"]:
         timing = delta["timing"]
         print(f"[差值] {delta['label']} total_redaction_eval_ms_delta={timing['total_redaction_eval_ms_delta']}")
+
+
+def _write_recognition_benchmark_report(args: argparse.Namespace) -> None:
+    output_path = Path(args.recognition_benchmark_report) if args.recognition_benchmark_report else None
+    try:
+        if not args.recognition_benchmark_manifest:
+            raise ValueError("--recognition-benchmark-manifest is required")
+        if output_path is None:
+            raise ValueError("--recognition-benchmark-report is required")
+        if not args.recognition_benchmark_code_commit:
+            raise ValueError("--recognition-benchmark-code-commit is required")
+        manifest = load_benchmark_manifest(args.recognition_benchmark_manifest)
+        report = run_recognition_benchmark(
+            manifest,
+            base_dir=args.recognition_benchmark_base_dir,
+            gold_path=args.recognition_benchmark_gold or None,
+            code_commit=args.recognition_benchmark_code_commit,
+            replicate_count=args.recognition_benchmark_replicates,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"[识别基准错误] {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(recognition_benchmark_report_to_json(report), encoding="utf-8")
+    recommendation = report["recommendation"]
+    print(f"[识别基准] {output_path}")
+    print(f"[运行数] {len(report['runs'])}")
+    print(f"[建议] action={recommendation['action']} reason={recommendation['reason']}")
 
 
 def _start_web(host: str, port: int) -> None:

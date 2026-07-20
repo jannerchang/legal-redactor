@@ -82,7 +82,7 @@ def test_mcp_adapter_strips_raw_http_error_body(monkeypatch) -> None:
                 "error": {
                     "code": "missing_map",
                     "status": 409,
-                    "message": "张三 /Users/jannerchang/private secret-token-value",
+                    "message": "张三 /Users/example/private secret-token-value",
                     "next_action": "upload_mapping",
                 },
             }

@@ -13,7 +13,6 @@ import urllib.parse
 import urllib.request
 import base64
 import tempfile
-import time
 from dataclasses import dataclass, replace
 from datetime import datetime
 from io import BytesIO
@@ -21,7 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from zipfile import BadZipFile
 
-from .config import PipelineConfig, RedactionProfile
+from .config import PipelineConfig
 from .cases import (
     CaseError,
     InvalidDiscordThreadError,
@@ -47,7 +46,7 @@ from .cases import (
 from .counters import CN_ORDINALS, TypeCounters
 from .io import redaction_map_from_json, redaction_map_to_json
 from .local_config import config_value, load_json_config
-from .models import MappingEntry, RedactedDocument, RedactionMap, sort_mapping_entries
+from .models import MappingEntry, RecognitionRunStats, RedactedDocument, RedactionMap, sort_mapping_entries
 from .org_masking import derived_organization_alias_cores
 from .llm import is_noise_entity_text
 from .pipeline import RedactionPipeline
@@ -95,12 +94,28 @@ SAMPLE_SUMMARY_KEYS = (
     "manual_corrections",
     "false_positive_deletes",
     "missing_adds",
+    "manual_modify_count",
     "restore_unresolved_placeholders",
     "newest_sample_provenance",
     "regression_suggestions",
 )
 
 SUPPORTED_UPLOAD_SUFFIXES = {".txt", ".md", ".doc", ".docx", ".pdf"}
+RECOGNITION_MODE_LABELS = {
+    "sentence_windows": "逐句窗口（稳定）",
+    "full_document": "整篇文书（实验）",
+    "rules_ner": "规则/HanLP",
+    "candidate_review": "候选复核",
+}
+
+RECOGNITION_STATUS_LABELS = {
+    "not_requested": "未请求",
+    "success": "成功",
+    "partial": "部分成功",
+    "no_targets": "未发现目标",
+    "fallback": "已降级",
+    "hard_failure": "失败",
+}
 
 
 def _entity_group_is_noise(group: dict) -> bool:
@@ -148,7 +163,10 @@ def api_model_status() -> dict[str, Any]:
 
 def _model_manager_json(path: str, *, timeout: float = 1.5) -> dict[str, Any]:
     status = probe_model_manager(timeout=timeout)
-    if status.state != "ready":
+    control_plane_reachable = status.state == "ready" or (
+        status.state == "error" and status.details.get("reason") == "worker_error"
+    )
+    if not control_plane_reachable:
         raise OSError("model manager unavailable")
     host = str(status.details.get("host") or "")
     port = int(status.details.get("port") or 0)
@@ -183,11 +201,6 @@ def _available_model_options() -> list[dict[str, str]]:
     return options
 
 
-def _model_label(model_id: str, options: list[dict[str, str]] | None = None) -> str:
-    for item in options or _available_model_options():
-        if item["id"] == model_id:
-            return item["label"]
-    return model_id
 
 
 def _pipeline_config_for_model_status(
@@ -195,15 +208,25 @@ def _pipeline_config_for_model_status(
     profile: str = "standard",
     llm_mode: str = "max-effect",
     model: str = DEFAULT_MODEL_ID,
+    recognition_mode: str = "sentence_windows",
 ) -> tuple[PipelineConfig, list[str]]:
     status = probe_model_manager()
-    if status.state != "ready":
+    recoverable_worker_error = status.state == "error" and status.details.get("reason") == "worker_error"
+    if status.state != "ready" and not recoverable_worker_error:
         return PipelineConfig.offline_without_llm(profile), ["本地模型 API 未就绪，已降级为纯规则模式。"]
-    model_ids = status.details.get("model_ids", [])
+    try:
+        model_ids = {item["id"] for item in _available_model_options()}
+    except (KeyError, TypeError):
+        model_ids = set()
     if model not in model_ids:
         return PipelineConfig.offline_without_llm(profile), ["所选模型当前不可用，已降级为纯规则模式。"]
     try:
-        return PipelineConfig.from_llm_mode(llm_mode, profile_name=profile, model=model), []
+        return PipelineConfig.from_llm_mode(
+            llm_mode,
+            profile_name=profile,
+            model=model,
+            recognition_mode=recognition_mode,
+        ), []
     except ValueError:
         return PipelineConfig.offline_without_llm(profile), ["本地模型 API 配置无效，已降级为纯规则模式。"]
 
@@ -561,6 +584,7 @@ def _is_default_case_root_value(value: str) -> bool:
 async def analyze_page(
     text: str = Form(default=""),
     llm_mode: str = Form(default="max-effect"),
+    recognition_mode: str = Form(default="sentence_windows"),
     model: str = Form(default=DEFAULT_MODEL_ID),
     file: UploadFile | None = File(default=None),
     files: list[UploadFile] = File(default=[]),
@@ -571,7 +595,12 @@ async def analyze_page(
         return _page("上传失败", str(exc))
 
     profile = "standard"
-    config, warnings = _pipeline_config_for_model_status(profile=profile, llm_mode=llm_mode, model=model)
+    config, warnings = _pipeline_config_for_model_status(
+        profile=profile,
+        llm_mode=llm_mode,
+        model=model,
+        recognition_mode=recognition_mode,
+    )
     pipeline = RedactionPipeline(config=config)
 
     # 执行语义审计（后台线程，避免阻塞 /health 等轻量请求）
@@ -586,6 +615,7 @@ async def analyze_page(
         profile=profile,
         llm_mode=llm_mode if config.enable_llm else "off",
         model=config.llm.model if config.enable_llm else model,
+        recognition_mode=config.llm.recognition_mode,
     )
 
 def _render_audit_dashboard(
@@ -594,6 +624,7 @@ def _render_audit_dashboard(
     profile: str,
     llm_mode: str,
     model: str = DEFAULT_MODEL_ID,
+    recognition_mode: str = "sentence_windows",
     round_num: int = 0,
     previous_map_json: str = "{}",
     previous_deselected_json: str = "[]",
@@ -654,6 +685,7 @@ def _render_audit_dashboard(
             <input type="hidden" name="profile" value="{profile}">
             <input type="hidden" name="llm_mode" value="{llm_mode}">
             <input type="hidden" name="model" value="{html.escape(model)}">
+            <input type="hidden" name="recognition_mode" value="{html.escape(recognition_mode)}">
             <input type="hidden" name="bundle_json" value="{html.escape(bundle_json)}">
             <input type="hidden" name="analysis_json" value="{html.escape(json.dumps(analysis, ensure_ascii=False))}">
             <input type="hidden" name="round" value="{round_num}">
@@ -706,6 +738,7 @@ async def redact_confirmed_page(request: Request) -> str:
     profile = "standard"
     llm_mode = str(form.get("llm_mode", "max-effect"))
     model = str(form.get("model", DEFAULT_MODEL_ID))
+    recognition_mode = str(form.get("recognition_mode", "sentence_windows"))
     round_num = int(form.get("round", "0"))
     previous_map_json = form.get("previous_map_json", "{}")
     previous_deselected_json = form.get("previous_deselected_json", "[]")
@@ -865,6 +898,7 @@ async def redact_confirmed_page(request: Request) -> str:
             review_candidates=[],
             leaks=all_leaks,
             warnings=[],
+            recognition_stats=_recognition_stats_from_analysis(analysis),
         )
 
     # ── 单文档：增量多轮确认 ──
@@ -878,6 +912,7 @@ async def redact_confirmed_page(request: Request) -> str:
             title="脱敏完成",
             original_text=original_text,
             redacted_text=redacted_text,
+            recognition_stats=_recognition_stats_from_analysis(analysis),
             redaction_map=redaction_map,
             review_candidates=[],
             leaks=leaks,
@@ -885,7 +920,12 @@ async def redact_confirmed_page(request: Request) -> str:
         )
 
     # 对已脱敏文本做新一轮分析；API 不可用时与 /redact 一样降级为纯规则。
-    config, fallback_warnings = _pipeline_config_for_model_status(profile=profile, llm_mode=llm_mode, model=model)
+    config, fallback_warnings = _pipeline_config_for_model_status(
+        profile=profile,
+        llm_mode=llm_mode,
+        model=model,
+        recognition_mode=recognition_mode,
+    )
     pipeline2 = RedactionPipeline(config=config)
     new_analysis = await asyncio.to_thread(pipeline2.analyze, redacted_text)
     new_analysis.setdefault("warnings", [])
@@ -918,6 +958,7 @@ async def redact_confirmed_page(request: Request) -> str:
             profile=profile,
             llm_mode=llm_mode if config.enable_llm else "off",
             model=config.llm.model if config.enable_llm else model,
+            recognition_mode=config.llm.recognition_mode,
             round_num=round_num + 1,
             previous_map_json=current_map_json,
             previous_deselected_json=deselected_json,
@@ -929,6 +970,7 @@ async def redact_confirmed_page(request: Request) -> str:
             title="脱敏完成",
             original_text=original_text,
             redacted_text=redacted_text,
+            recognition_stats=_recognition_stats_from_analysis(new_analysis),
             redaction_map=redaction_map,
             review_candidates=[],
             leaks=leaks,
@@ -941,6 +983,7 @@ async def redact_page(
     request: Request,
     text: str = Form(default=""),
     llm_mode: str = Form(default="max-effect"),
+    recognition_mode: str = Form(default="sentence_windows"),
     model: str = Form(default=DEFAULT_MODEL_ID),
     enable_hanlp: str | None = Form(default=None),
     hanlp_model: str = Form(default=""),
@@ -973,9 +1016,12 @@ async def redact_page(
         except Exception as exc:
             return _page("已有映射表解析失败", f"解析错误: {exc}")
 
-    model_options = _available_model_options()
-    config, fallback_warnings = _pipeline_config_for_model_status(profile="standard", llm_mode=llm_mode, model=model)
-    model_label = _model_label(config.llm.model, model_options) if config.enable_llm else "离线规则（本地模型 API 未就绪）"
+    config, fallback_warnings = _pipeline_config_for_model_status(
+        profile="standard",
+        llm_mode=llm_mode,
+        model=model,
+        recognition_mode=recognition_mode,
+    )
     config = replace(
         config,
         enable_hanlp_ner=bool(enable_hanlp),
@@ -989,7 +1035,6 @@ async def redact_page(
     effective_case_folder = case_folder.strip() or str(inferred_case_location.get("case_folder") or "")
     effective_case_root = manual_case_root or str(inferred_case_location.get("case_root") or "") or case_root.strip()
     effective_discord_thread_url = discord_thread_url.strip() or str(inferred_case_location.get("discord_thread_url") or "")
-    redaction_started = time.monotonic()
     try:
         if len(documents) > 1:
             result = await asyncio.to_thread(
@@ -1009,7 +1054,6 @@ async def redact_page(
             "脱敏失败",
             _redaction_failure_body(exc, enable_hanlp=bool(enable_hanlp)),
         )
-    duration_ms = max(0, round((time.monotonic() - redaction_started) * 1000))
     result = replace(result, redaction_map=_sanitize_redaction_map(result.redaction_map))
     warnings = [*fallback_warnings, *result.warnings]
     if len(documents) > 1:
@@ -1040,8 +1084,7 @@ async def redact_page(
             case_root=effective_case_root,
             case_folder=effective_case_folder,
             source_dir=inferred_source_dir,
-            model_label=model_label,
-            duration_ms=duration_ms,
+            recognition_stats=result.recognition_stats,
         )
     redacted_doc = RedactedDocument(
         source_file=documents[0].source_file,
@@ -1077,8 +1120,7 @@ async def redact_page(
         case_root=effective_case_root,
         case_folder=effective_case_folder,
         source_dir=inferred_source_dir,
-        model_label=model_label,
-        duration_ms=duration_ms,
+        recognition_stats=result.recognition_stats,
     )
 
 
@@ -1092,8 +1134,7 @@ async def apply_map_page(
         redaction_map = _sanitize_redaction_map(redaction_map_from_json(map_json))
     except Exception as exc:
         return _page("映射表解析失败", f"错误详情: {exc}")
-
-    pipeline = RedactionPipeline(config=PipelineConfig(redaction_profile=RedactionProfile.from_preset("standard")))
+    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
     if original_bundle_json.strip():
         documents = _documents_from_bundle_json(original_bundle_json)
         redacted_documents = []
@@ -1159,6 +1200,9 @@ async def apply_edited_map_page(request: Request) -> str:
     map_confidence = form.getlist("map_confidence")
     map_reason = form.getlist("map_reason")
     map_restore_by_default = form.getlist("map_restore_by_default")
+    map_entity_id = form.getlist("map_entity_id")
+    map_do_not_merge = form.getlist("map_do_not_merge")
+    map_restore_original = form.getlist("map_restore_original")
     row_delete = form.getlist("row_delete")
     remap_placeholders = str(form.get("remap_placeholders", "")).strip() == "1"
 
@@ -1169,7 +1213,8 @@ async def apply_edited_map_page(request: Request) -> str:
             map_masked=map_masked, map_role=map_role, map_source=map_source,
             map_confidence=map_confidence, map_reason=map_reason,
             map_restore_by_default=map_restore_by_default,
-            row_delete=row_delete,
+            map_entity_id=map_entity_id, map_do_not_merge=map_do_not_merge,
+            map_restore_original=map_restore_original, row_delete=row_delete,
         )
     )
     warnings = ["已手动调整映射表。"]
@@ -1363,6 +1408,7 @@ def _empty_sample_summary(source_file: str = "") -> dict[str, Any]:
         "manual_corrections": 0,
         "false_positive_deletes": 0,
         "missing_adds": 0,
+        "manual_modify_count": 0,
         "restore_unresolved_placeholders": None,
         "newest_sample_provenance": {
             "source": "web_ui",
@@ -1419,6 +1465,8 @@ def _build_sample_save_summary(
                 })
             if action == "add":
                 summary["missing_adds"] += 1
+            elif action == "modify":
+                summary["manual_modify_count"] += 1
         elif action == "delete":
             item = _summary_item_from_entry(entry, action=action)
             summary["delete_blacklist_candidates"].append({
@@ -2000,6 +2048,46 @@ def _render_docx_restore_result(
     """)
 
 
+def _recognition_stats_from_analysis(analysis: dict[str, Any]) -> RecognitionRunStats | None:
+    payload = analysis.get("recognition_stats")
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return RecognitionRunStats(
+            mode=str(payload["mode"]),
+            model_id=str(payload["model_id"]) if payload.get("model_id") is not None else None,
+            status=str(payload["status"]),
+            document_count=int(payload.get("document_count", 1)),
+            call_count=int(payload.get("call_count", 0)),
+            retry_count=int(payload.get("retry_count", 0)),
+            fallback_count=int(payload.get("fallback_count", 0)),
+            conflict_count=int(payload.get("conflict_count", 0)),
+            duration_ms=int(payload.get("duration_ms", 0)),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _render_recognition_stats(stats: RecognitionRunStats | None) -> str:
+    if stats is None:
+        return ""
+    mode_label = RECOGNITION_MODE_LABELS.get(stats.mode, stats.mode)
+    status_label = RECOGNITION_STATUS_LABELS.get(stats.status, stats.status)
+    model_id = stats.model_id or "无"
+    seconds = max(0, stats.duration_ms) / 1000
+    fallback_label = "是" if stats.fallback_count else "否"
+    return (
+        '<section class="info-card recognition-summary">'
+        '<h2>识别运行摘要</h2>'
+        f'<p class="hint">模式：{html.escape(mode_label)}；'
+        f'逻辑模型：{html.escape(model_id)}；状态：{html.escape(status_label)}；'
+        f'文档数：{stats.document_count}；调用数：{stats.call_count}；'
+        f'识别耗时：{seconds:.2f} 秒；降级：{fallback_label}；'
+        f'冲突数：{stats.conflict_count}</p>'
+        '</section>'
+    )
+
+
 def _render_redaction_result(
     title: str,
     original_text: str,
@@ -2013,8 +2101,7 @@ def _render_redaction_result(
     case_root: str = "",
     case_folder: str = "",
     source_dir: str = "",
-    model_label: str = "",
-    duration_ms: int | None = None,
+    recognition_stats: RecognitionRunStats | None = None,
 ) -> str:
     default_dir = save_dir.strip() or os.path.expanduser("~/Desktop")
     map_json = redaction_map_to_json(redaction_map)
@@ -2039,6 +2126,7 @@ def _render_redaction_result(
     )
     leaks_html = "".join(f"<li><strong>{html.escape(lk.type)}</strong>: <mark>{html.escape(lk.text)}</mark></li>" for lk in leaks)
     warnings_html = "".join(f"<li>{html.escape(w)}</li>" for w in warnings)
+    recognition_summary = _render_recognition_stats(recognition_stats)
     redacted_filename = "redacted.txt"
     redacted_filename_json = json.dumps(redacted_filename, ensure_ascii=False)
     redacted_url = _data_download(redacted_filename, "text/plain", redacted_text)
@@ -2087,6 +2175,7 @@ def _render_redaction_result(
         discord_section=discord_section,
         leaks_html=leaks_html,
         warnings_html=warnings_html,
+        recognition_summary=recognition_summary,
         original_highlight=original_highlight,
         redacted_text=redacted_text,
         redacted_highlight=redacted_highlight,
@@ -2103,8 +2192,6 @@ def _render_redaction_result(
         redaction_map=redaction_map,
         mapping_edit_rows=mapping_edit_rows,
         review_html=review_html,
-        model_label=model_label,
-        duration_ms=duration_ms,
     )
 
 
@@ -2120,8 +2207,7 @@ def _render_batch_redaction_result(
     case_root: str = "",
     case_folder: str = "",
     source_dir: str = "",
-    model_label: str = "",
-    duration_ms: int | None = None,
+    recognition_stats: RecognitionRunStats | None = None,
 ) -> str:
     default_dir = save_dir.strip() or os.path.expanduser("~/Desktop")
 
@@ -2157,6 +2243,7 @@ def _render_batch_redaction_result(
     )
     leaks_html = "".join(f"<li><strong>{html.escape(lk.type)}</strong>: <mark>{html.escape(lk.text)}</mark></li>" for lk in leaks)
     warnings_html = "".join(f"<li>{html.escape(w)}</li>" for w in warnings)
+    recognition_summary = _render_recognition_stats(recognition_stats)
     map_url = _data_download("redaction_map.json", "application/json", map_json)
     debug_url = _data_download("debug_trace.json", "application/json", debug_json)
     combined_filename = "batch.redacted.txt"
@@ -2207,6 +2294,7 @@ def _render_batch_redaction_result(
         discord_section=discord_section,
         leaks_html=leaks_html,
         warnings_html=warnings_html,
+        recognition_summary=recognition_summary,
         doc_sections=doc_sections,
         mapping_review_toolbar=mapping_review_toolbar,
         sample_summary_panel=sample_summary_panel,
@@ -2220,8 +2308,6 @@ def _render_batch_redaction_result(
         source_dir=source_dir,
         redaction_map=redaction_map,
         mapping_edit_rows=mapping_edit_rows,
-        model_label=model_label,
-        duration_ms=duration_ms,
     )
 
 
@@ -2606,7 +2692,7 @@ def _discord_command_channel_id() -> str:
     return str(
         os.environ.get("LEGAL_REDACTOR_DISCORD_COMMAND_CHANNEL_ID")
         or config_value(config, "discord_command_channel_id")
-        or "1501248343823880345"
+        or ""
     )
 
 
@@ -2826,6 +2912,9 @@ def _render_mapping_edit_row(index: int, entry: MappingEntry, review_candidate_t
             <input type="hidden" name="map_source" value="{html.escape(entry.source)}">
             <input type="hidden" name="map_confidence" value="{entry.confidence}">
             <input type="hidden" name="map_restore_by_default" value="{restore}">
+            <input type="hidden" name="map_entity_id" value="{html.escape(entry.entity_id or '')}">
+            <input type="hidden" name="map_do_not_merge" value="{html.escape(json.dumps(entry.do_not_merge, ensure_ascii=False))}">
+            <input type="hidden" name="map_restore_original" value="{html.escape(entry.restore_original or '')}">
           </td>
         </tr>
     """
@@ -2847,6 +2936,9 @@ def _render_blank_mapping_row(index: int) -> str:
             <input type="hidden" name="map_source" value="manual">
             <input type="hidden" name="map_confidence" value="1.0">
             <input type="hidden" name="map_restore_by_default" value="1">
+            <input type="hidden" name="map_entity_id" value="">
+            <input type="hidden" name="map_do_not_merge" value="[]">
+            <input type="hidden" name="map_restore_original" value="">
           </td>
         </tr>
     """
@@ -3016,7 +3108,9 @@ def _redaction_map_from_rows(
     version: str, created_at: str, mode: str, source_file: str,
     map_type: list[str], map_original: list[str], map_masked: list[str],
     map_role: list[str], map_source: list[str], map_confidence: list[str],
-    map_reason: list[str], map_restore_by_default: list[str], row_delete: list[str],
+    map_reason: list[str], map_restore_by_default: list[str],
+    map_entity_id: list[str], map_do_not_merge: list[str], map_restore_original: list[str],
+    row_delete: list[str],
 ) -> RedactionMap:
     deleted = set(row_delete)
     row_count = max(len(map_original), len(map_masked), len(map_type))
@@ -3033,6 +3127,16 @@ def _redaction_map_from_rows(
             confidence = float(_form_list_value(map_confidence, index) or "1.0")
         except ValueError:
             confidence = 1.0
+        raw_do_not_merge = _form_list_value(map_do_not_merge, index)
+        try:
+            parsed_do_not_merge = json.loads(raw_do_not_merge or "[]")
+        except json.JSONDecodeError:
+            parsed_do_not_merge = []
+        do_not_merge = (
+            tuple(str(value) for value in parsed_do_not_merge)
+            if isinstance(parsed_do_not_merge, list)
+            else ()
+        )
         mappings.append(MappingEntry(
             type=_form_list_value(map_type, index).strip() or "manual",
             original=original, masked=masked, role=role,
@@ -3040,6 +3144,9 @@ def _redaction_map_from_rows(
             confidence=confidence,
             restore_by_default=_form_list_value(map_restore_by_default, index) != "0",
             reason=_form_list_value(map_reason, index).strip() or None,
+            entity_id=_form_list_value(map_entity_id, index).strip() or None,
+            do_not_merge=do_not_merge,
+            restore_original=_form_list_value(map_restore_original, index).strip() or None,
         ))
     return RedactionMap(
         version=version or "1.0",

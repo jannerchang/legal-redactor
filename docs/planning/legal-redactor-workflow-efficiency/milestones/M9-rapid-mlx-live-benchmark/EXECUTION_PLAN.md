@@ -1,7 +1,7 @@
 # M9-rapid-mlx-live-benchmark · rapid-mlx-live-benchmark · execution plan
 
 > **Basis**: [README.md](README.md), [../M8-runtime-benchmark/README.md](../M8-runtime-benchmark/README.md), [../../REQUIREMENTS.md](../../REQUIREMENTS.md)
-> **Schema reference**: `/Users/jannerchang/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.1.14/templates/gate.schema.md`
+> **Schema reference**: `/Users/example/.codex/plugins/cache/forge-flow-marketplace/ffcs/1.1.14/templates/gate.schema.md`
 > **Update rhythm**: synchronize this file and [_progress.md](_progress.md) at each step/gate
 > **Version**: v1.0 · 2026-07-06
 
