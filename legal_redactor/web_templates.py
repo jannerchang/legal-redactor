@@ -36,107 +36,135 @@ def _page(title: str, body: str) -> str:
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <title>{html.escape(title)}</title>
       <style>
-        :root{{--bg:#fafaf8;--surface:#fff;--border:#e8e5df;--ink:#2c2c2a;--muted:#8a8880;--accent:#1a7a6d;--accent-hover:#156358;--danger:#c53b2e;--danger-bg:#fef4f2;--radius:10px;--radius-sm:7px;--shadow:0 1px 3px rgba(0,0,0,.05)}}
+        :root{{color-scheme:light;--bg:#f5f5f7;--surface:rgba(255,255,255,.82);--surface-solid:#fff;--surface-subtle:rgba(0,0,0,.03);--border:rgba(0,0,0,.1);--ink:#1d1d1f;--muted:#86868b;--accent:#0071e3;--accent-hover:#0060c9;--danger:#d70015;--danger-bg:rgba(215,0,21,.08);--success:#248a3d;--warning:#9e6500;--radius:20px;--radius-md:14px;--radius-sm:10px;--shadow:0 18px 50px rgba(0,0,0,.08);--shadow-subtle:0 1px 2px rgba(0,0,0,.05);--focus-ring:0 0 0 4px rgba(0,113,227,.22)}}
+        @media(prefers-color-scheme:dark){{:root{{color-scheme:dark;--bg:#000;--surface:rgba(28,28,30,.78);--surface-solid:#1c1c1e;--surface-subtle:rgba(255,255,255,.06);--border:rgba(255,255,255,.15);--ink:#f5f5f7;--muted:#98989d;--accent:#0a84ff;--accent-hover:#3395ff;--danger:#ff453a;--danger-bg:rgba(255,69,58,.14);--success:#30d158;--warning:#ffd60a;--shadow:0 24px 70px rgba(0,0,0,.5);--shadow-subtle:0 1px 2px rgba(0,0,0,.3);--focus-ring:0 0 0 4px rgba(10,132,255,.3)}}}}
         *,*::before,*::after{{box-sizing:border-box}}
-        body{{margin:0;padding:24px;color:var(--ink);background:var(--bg);font:15px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}}
+        body{{margin:0;min-height:100vh;padding:32px 22px 48px;color:var(--ink);background:var(--bg);font:15px/1.6 -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}}
+        body::before{{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;background:radial-gradient(900px 520px at 12% -8%,rgba(0,113,227,.16),transparent 62%),radial-gradient(760px 520px at 92% 6%,rgba(94,92,230,.12),transparent 58%),radial-gradient(700px 420px at 50% 110%,rgba(48,209,88,.08),transparent 60%)}}
         main{{max-width:1080px;margin:0 auto}}
-        h1{{font-size:22px;font-weight:700;margin:0 0 20px}}
-        h2{{font-size:16px;font-weight:600;margin:0 0 12px}}
-        section{{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:24px;margin-bottom:18px}}
-        label{{display:block;font-size:13px;font-weight:500;color:var(--muted);margin:0 0 4px}}
+        h1{{font-size:28px;font-weight:700;letter-spacing:-.03em;margin:0 0 24px}}
+        h2{{font-size:17px;font-weight:600;letter-spacing:-.01em;margin:0 0 14px}}
+        section,fieldset.case-workflow-fields{{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);backdrop-filter:blur(26px) saturate(1.7);-webkit-backdrop-filter:blur(26px) saturate(1.7);padding:24px;margin:0 0 18px}}
+        fieldset.case-workflow-fields{{padding:20px 22px;margin-top:18px}}
+        fieldset.case-workflow-fields legend{{padding:0 6px;font-size:14px;font-weight:600}}
+        label{{display:block;font-size:13px;font-weight:500;color:var(--muted);margin:14px 0 5px}}
         label.inline{{display:inline;font-size:13px;color:var(--ink);margin:0}}
-        textarea{{width:100%;border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 12px;background:var(--bg);font:13px/1.6 "SF Mono","Menlo",monospace;resize:vertical}}
-        textarea:focus{{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(26,122,109,.1)}}
-        textarea[readonly]{{background:#fff;cursor:default}}
-        input[type=text],input[type=url],select{{border:1px solid var(--border);border-radius:var(--radius-sm);padding:7px 10px;font-size:13px;background:var(--bg)}}
-        input[type=text]:focus,input[type=url]:focus,select:focus{{outline:none;border-color:var(--accent)}}
-        .btn,.downloads a,nav a{{display:inline-flex;align-items:center;gap:4px;border:0;border-radius:var(--radius-sm);padding:9px 18px;font-size:13px;font-weight:500;background:var(--accent);color:#fff;text-decoration:none;cursor:pointer}}
-        .btn:hover,.downloads a:hover{{background:var(--accent-hover)}}
-        .btn-secondary{{background:var(--ink)}}
-        .btn-secondary:hover{{background:#444}}
-        .btn-sm{{padding:5px 12px;font-size:12px}}
+        .checkbox-label{{display:flex;align-items:center;gap:9px;margin:12px 0;color:var(--ink);font-size:14px;cursor:pointer}}
+        .checkbox-label input[type=checkbox]{{width:18px;height:18px;margin:0;accent-color:var(--accent)}}
+        textarea,input[type=text],input[type=url],select{{border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 12px;background:var(--surface-subtle);color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",sans-serif;transition:border-color .18s,box-shadow .18s}}
+        textarea{{width:100%;font:13px/1.65 "SF Mono","Menlo",monospace;resize:vertical}}
+        textarea:focus,input[type=text]:focus,input[type=url]:focus,select:focus{{outline:none;border-color:var(--accent);box-shadow:var(--focus-ring)}}
+        textarea[readonly]{{background:var(--surface-subtle);cursor:default}}
+        select{{appearance:none;-webkit-appearance:none;min-width:min(360px,100%);padding-right:36px;background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);background-position:calc(100% - 18px) calc(50% + 1px),calc(100% - 13px) calc(50% + 1px);background-size:5px 5px,5px 5px;background-repeat:no-repeat}}
+        input[type=file]{{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;border:0}}
+        .upload-picker{{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0}}
+        .file-pill{{display:inline-flex;margin:8px 0}}
+        .file-pill span{{display:inline-flex;align-items:center;border:1px solid var(--border);border-radius:999px;padding:7px 14px;background:var(--surface-subtle);color:var(--ink);font-size:13px;cursor:pointer;transition:border-color .18s,background .18s}}
+        .file-pill:hover span{{border-color:var(--accent)}}
+        .btn,.downloads a,nav a{{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:1px solid transparent;border-radius:999px;padding:9px 20px;font-size:14px;font-weight:600;background:var(--accent);color:#fff;text-decoration:none;cursor:pointer;box-shadow:var(--shadow-subtle);transition:background .18s,transform .18s,box-shadow .18s}}
+        .btn:hover,.downloads a:hover,nav a:hover{{background:var(--accent-hover)}}
+        .btn:active,.downloads a:active,nav a:active{{transform:scale(.97)}}
+        .btn:focus-visible,.downloads a:focus-visible,nav a:focus-visible{{outline:none;box-shadow:var(--focus-ring)}}
+        .btn-primary{{box-shadow:0 10px 28px rgba(0,113,227,.24)}}
+        .btn-secondary{{background:var(--surface-subtle);border-color:var(--border);color:var(--ink)}}
+        .btn-secondary:hover{{background:rgba(0,113,227,.1);border-color:var(--accent);color:var(--accent)}}
+        .btn-sm{{padding:6px 14px;font-size:13px}}
+        .debug-link{{font-size:13px;color:var(--muted);text-decoration:none;border-radius:8px;padding:7px 4px}}
+        .debug-link:hover{{color:var(--accent);text-decoration:underline}}
+        details.advanced-options{{margin:16px 0;border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface-subtle);padding:0}}
+        details.advanced-options summary{{cursor:pointer;list-style:none;padding:12px 16px;font-size:14px;font-weight:600}}
+        details.advanced-options summary::-webkit-details-marker{{display:none}}
+        details.advanced-options summary::after{{content:"⌄";float:right;color:var(--muted);transition:transform .18s}}
+        details.advanced-options[open] summary::after{{transform:rotate(180deg)}}
+        details.advanced-options summary:focus-visible{{outline:none;box-shadow:var(--focus-ring);border-radius:var(--radius-md)}}
+        details.advanced-options>*:not(summary){{margin-left:16px;margin-right:16px}}
+        details.advanced-options label:first-of-type{{margin-top:2px}}
+        details.advanced-options .file-pill{{margin-bottom:16px}}
         table{{width:100%;border-collapse:collapse;font-size:12px}}
-        th{{text-align:left;font-weight:600;color:var(--muted);padding:8px;border-bottom:2px solid var(--border);font-size:11px;text-transform:uppercase}}
-        td{{padding:8px;border-bottom:1px solid var(--border)}}
-        td textarea{{min-width:180px;padding:6px 8px;font-size:12px;resize:vertical}}
-        td input[name=map_type]{{width:100px;padding:5px 6px;font-size:12px}}
+        th{{text-align:left;font-weight:600;color:var(--muted);padding:9px 8px;border-bottom:1px solid var(--border);font-size:11px;text-transform:uppercase;letter-spacing:.05em}}
+        td{{padding:9px 8px;border-bottom:1px solid var(--border)}}
+        td textarea{{min-width:180px;padding:7px 9px;font-size:12px;resize:vertical}}
+        td input[name=map_type]{{width:110px;padding:6px 8px;font-size:12px}}
         .grid{{display:grid;grid-template-columns:1fr 1fr;gap:18px}}
         .row{{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:10px 0}}
         .row label{{margin:0}}
-        .downloads{{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 14px}}
+        .downloads{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 16px}}
         .hint{{color:var(--muted);font-size:12px}}
         .hidden-raw{{display:none}}
         .warning{{border-color:var(--danger)}}
         .notice{{background:var(--danger-bg)}}
-        .status-panel{{padding:18px}}
-        .status-head{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px}}
+        .status-panel{{padding:20px}}
+        .status-head{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}}
         .status-head h2{{margin:0}}
-        .status-head a{{font-size:12px;color:var(--accent);text-decoration:none}}
+        .status-head a{{font-size:13px;color:var(--accent);text-decoration:none}}
         .status-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}}
-        .status-item{{display:grid;grid-template-columns:auto 1fr;gap:3px 8px;align-items:center;border:1px solid var(--border);border-radius:var(--radius-sm);padding:9px 10px;background:var(--bg);min-width:0}}
+        .status-item{{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;align-items:center;border:1px solid var(--border);border-radius:var(--radius-md);padding:11px 12px;background:var(--surface-subtle);min-width:0}}
         .status-item strong{{font-size:13px;font-weight:600;min-width:0}}
         .status-item span:not(.status-pill),.status-item small{{grid-column:1 / -1;font-size:12px;color:var(--muted);min-width:0;overflow-wrap:anywhere}}
-        .status-pill{{display:inline-flex;align-items:center;justify-content:center;min-width:38px;border-radius:999px;padding:2px 7px;font-size:11px;font-weight:600;background:#ece9e1;color:var(--ink)}}
-        .status-ready{{background:#dceee7;color:#17624f}}
-        .status-degraded,.status-skipped{{background:#fff1c9;color:#7a5300}}
-        .status-missing{{background:#ece9e1;color:#5a5751}}
+        .status-pill{{display:inline-flex;align-items:center;justify-content:center;min-width:42px;border-radius:999px;padding:3px 8px;font-size:11px;font-weight:600;background:var(--surface-subtle);color:var(--ink)}}
+        .status-ready{{background:rgba(48,209,88,.16);color:var(--success)}}
+        .status-degraded,.status-skipped{{background:rgba(255,214,10,.18);color:var(--warning)}}
+        .status-missing{{background:var(--surface-subtle);color:var(--muted)}}
         .status-error{{background:var(--danger-bg);color:var(--danger)}}
-        .case-workflow-panel{{border-left:4px solid var(--accent);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:16px 18px;margin-bottom:18px}}
-        .workflow-head{{display:flex;align-items:center;gap:10px;margin-bottom:10px}}
+        .case-workflow-panel{{border-left:4px solid var(--accent);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);backdrop-filter:blur(26px) saturate(1.7);-webkit-backdrop-filter:blur(26px) saturate(1.7);padding:18px 20px;margin-bottom:18px}}
+        .workflow-head{{display:flex;align-items:center;gap:10px;margin-bottom:12px}}
         .workflow-head strong{{font-size:14px}}
-        .workflow-pill{{display:inline-flex;align-items:center;justify-content:center;border-radius:999px;padding:3px 9px;font-size:12px;font-weight:700;background:#ece9e1;color:var(--ink);white-space:nowrap}}
-        .workflow-not_saved{{background:#ece9e1;color:#5a5751}}
-        .workflow-saved_local,.workflow-bound_thread{{background:#dceee7;color:#17624f}}
-        .workflow-sent_discord{{background:#dce9f9;color:#23527c}}
-        .workflow-waiting_hermes{{background:#fff1c9;color:#7a5300}}
+        .workflow-pill{{display:inline-flex;align-items:center;justify-content:center;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:700;background:var(--surface-subtle);color:var(--ink);white-space:nowrap}}
+        .workflow-not_saved{{background:var(--surface-subtle);color:var(--muted)}}
+        .workflow-saved_local,.workflow-bound_thread{{background:rgba(48,209,88,.16);color:var(--success)}}
+        .workflow-sent_discord{{background:rgba(0,113,227,.14);color:var(--accent)}}
+        .workflow-waiting_hermes{{background:rgba(255,214,10,.18);color:var(--warning)}}
         .workflow-attach_failed{{background:var(--danger-bg);color:var(--danger)}}
-        .workflow-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:8px 14px;font-size:13px}}
+        .workflow-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px 16px;font-size:13px}}
         .workflow-grid span{{min-width:0;overflow-wrap:anywhere}}
-        .workflow-grid b{{display:block;color:var(--muted);font-size:11px;font-weight:600;text-transform:uppercase;margin-bottom:2px}}
+        .workflow-grid b{{display:block;color:var(--muted);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin-bottom:2px}}
         .workflow-grid a{{color:var(--accent);text-decoration:none}}
-        mark{{background:var(--danger-bg);color:var(--danger);padding:1px 3px;border-radius:2px}}
-        .highlight-box{{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 12px;font:13px/1.6 "SF Mono","Menlo",monospace;white-space:pre-wrap;word-wrap:break-word;overflow:auto;max-height:480px;user-select:text}}
-        .highlight-box mark{{padding:1px 4px;border-radius:3px;cursor:help;border-bottom:2px solid transparent}}
-        .original-highlight mark{{background:#fff3cd;color:#856404;border-bottom-color:#ffc107}}
-        .redacted-highlight mark{{background:#d4edda;color:#155724;border-bottom-color:#28a745}}
-        nav{{margin-bottom:14px}}
-        .toast{{position:fixed;top:18px;right:18px;z-index:9999;background:var(--accent);color:#fff;padding:10px 20px;border-radius:var(--radius-sm);box-shadow:0 4px 20px rgba(0,0,0,.15);opacity:0;transform:translateY(-6px);transition:.2s;font-size:13px;font-weight:500}}
-        .toast.show{{opacity:1;transform:translateY(0)}}
-        .toast.warn{{background:var(--danger)}}
-        .mapping-toolbar{{border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg);padding:10px 12px;margin:10px 0 12px}}
+        mark{{background:var(--danger-bg);color:var(--danger);padding:1px 3px;border-radius:3px}}
+        .highlight-box{{background:var(--surface-subtle);border:1px solid var(--border);border-radius:var(--radius-md);padding:12px 14px;font:13px/1.65 "SF Mono","Menlo",monospace;white-space:pre-wrap;word-wrap:break-word;overflow:auto;max-height:480px;user-select:text}}
+        .highlight-box mark{{padding:1px 4px;border-radius:4px;cursor:help;border-bottom:2px solid transparent}}
+        .original-highlight mark{{background:rgba(255,214,10,.24);color:var(--warning);border-bottom-color:var(--warning)}}
+        .redacted-highlight mark{{background:rgba(48,209,88,.2);color:var(--success);border-bottom-color:var(--success)}}
+        nav{{margin-bottom:16px}}
+        nav a{{background:var(--surface-subtle);border-color:var(--border);color:var(--ink)}}
+        nav a:hover{{background:rgba(0,113,227,.1);color:var(--accent)}}
+        .toast{{position:fixed;top:20px;right:20px;z-index:9999;background:rgba(28,28,30,.9);color:#fff;padding:11px 20px;border-radius:999px;border:1px solid rgba(255,255,255,.16);box-shadow:0 12px 36px rgba(0,0,0,.24);backdrop-filter:blur(20px) saturate(1.6);-webkit-backdrop-filter:blur(20px) saturate(1.6);opacity:0;transform:translateY(-8px) scale(.98);transition:opacity .2s,transform .2s;font-size:13px;font-weight:600}}
+        .toast.show{{opacity:1;transform:translateY(0) scale(1)}}
+        .toast.warn{{background:rgba(215,0,21,.92)}}
+        .mapping-toolbar{{border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface-subtle);padding:12px 14px;margin:12px 0}}
         .mapping-toolbar-head{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}}
         .mapping-filter-row{{display:flex;gap:6px;flex-wrap:wrap}}
-        .mapping-filter{{border:1px solid var(--border);border-radius:999px;background:#fff;color:var(--ink);font-size:12px;padding:5px 9px;cursor:pointer}}
+        .mapping-filter{{border:1px solid var(--border);border-radius:999px;background:var(--surface-solid);color:var(--ink);font-size:12px;padding:6px 11px;cursor:pointer;transition:background .18s,border-color .18s}}
         .mapping-filter span{{color:var(--muted);margin-left:3px}}
         .mapping-filter.active{{background:var(--accent);border-color:var(--accent);color:#fff}}
         .mapping-filter.active span{{color:#fff}}
         .row-tags{{display:flex;gap:4px;flex-wrap:wrap;margin-top:6px}}
-        .row-badge{{display:inline-flex;border:1px solid var(--border);border-radius:999px;background:var(--bg);color:var(--ink);font-size:11px;line-height:1;padding:3px 6px;white-space:nowrap}}
-        .row-badge-restore_risk,.row-badge-delete_candidate{{border-color:#f1b8b1;background:var(--danger-bg);color:var(--danger)}}
-        .sample-summary-panel{{border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:var(--radius-sm);background:#fff;padding:10px 12px;margin:10px 0 12px}}
+        .row-badge{{display:inline-flex;border:1px solid var(--border);border-radius:999px;background:var(--surface-subtle);color:var(--ink);font-size:11px;line-height:1;padding:4px 7px;white-space:nowrap}}
+        .row-badge-restore_risk,.row-badge-delete_candidate{{border-color:var(--danger);background:var(--danger-bg);color:var(--danger)}}
+        .sample-summary-panel{{border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:var(--radius-md);background:var(--surface-solid);padding:12px 14px;margin:12px 0}}
         .sample-summary-panel[hidden]{{display:none}}
-        .sample-summary-content{{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:6px;margin-top:8px;font-size:12px}}
-        .sample-summary-content span{{display:block;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:6px 8px}}
-        .selection-menu{{position:absolute;z-index:10000;display:none;align-items:center;gap:4px;background:#fff;border:1px solid var(--border);border-radius:var(--radius-sm);box-shadow:0 8px 28px rgba(0,0,0,.18);padding:6px}}
-        .selection-menu button{{border:0;border-radius:6px;padding:6px 9px;background:var(--bg);color:var(--ink);font-size:12px;cursor:pointer;white-space:nowrap}}
+        .sample-summary-content{{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-top:8px;font-size:12px}}
+        .sample-summary-content span{{display:block;background:var(--surface-subtle);border:1px solid var(--border);border-radius:var(--radius-sm);padding:7px 9px}}
+        .selection-menu{{position:absolute;z-index:10000;display:none;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:999px;box-shadow:var(--shadow);backdrop-filter:blur(26px) saturate(1.7);-webkit-backdrop-filter:blur(26px) saturate(1.7);padding:5px}}
+        .selection-menu button{{border:0;border-radius:999px;padding:7px 12px;background:transparent;color:var(--ink);font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}}
         .selection-menu button:hover{{background:var(--accent);color:#fff}}
-        #text-input.dragover{{border-color:var(--accent);border-width:2px;background:rgba(26,122,109,.03)}}
-        .redact-submit-row{{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:4px}}
+        #text-input.dragover{{border-color:var(--accent);border-width:2px;background:rgba(0,113,227,.06)}}
+        .redact-submit-row{{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-top:18px}}
         .redact-progress{{display:flex;align-items:center;gap:10px;flex:1;min-width:240px}}
-        .redact-progress-track{{flex:1;max-width:220px;height:6px;border-radius:999px;background:#e8e4dc;overflow:hidden}}
-        .redact-progress-fill{{height:100%;width:38%;border-radius:999px;background:linear-gradient(90deg,var(--accent),#3cb8a4);animation:redact-progress-slide 1.4s ease-in-out infinite}}
+        .redact-progress-track{{flex:1;max-width:220px;height:6px;border-radius:999px;background:var(--surface-subtle);overflow:hidden}}
+        .redact-progress-fill{{height:100%;width:38%;border-radius:999px;background:linear-gradient(90deg,var(--accent),#5e5ce6);animation:redact-progress-slide 1.4s ease-in-out infinite}}
         @keyframes redact-progress-slide{{0%{{transform:translateX(-120%)}}100%{{transform:translateX(320%)}}}}
         .redact-progress-text{{font-size:13px;color:var(--ink);white-space:nowrap}}
         .redact-elapsed{{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}}
-        .upload-file-list{{margin:10px 0 14px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg);padding:10px 12px}}
+        .upload-file-list{{margin:12px 0 14px;border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface-subtle);padding:12px 14px}}
         .upload-file-list[hidden]{{display:none}}
         .upload-file-list-head{{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;font-size:12px;color:var(--muted)}}
-        .upload-file-list-items{{display:flex;flex-direction:column;gap:4px;max-height:180px;overflow:auto}}
+        .upload-file-list-items{{display:flex;flex-direction:column;gap:5px;max-height:180px;overflow:auto}}
         .upload-file-item{{display:flex;align-items:flex-start;gap:8px;margin:0;font-size:12px;color:var(--ink);font-weight:400;cursor:pointer}}
-        .upload-file-item input{{width:auto;margin:2px 0 0;flex:0 0 auto}}
+        .upload-file-item input{{width:auto;margin:2px 0 0;flex:0 0 auto;accent-color:var(--accent)}}
         .upload-file-item span{{min-width:0;overflow-wrap:anywhere}}
-        .btn:disabled{{opacity:.72;cursor:wait}}
-        @media(max-width:768px){{body{{padding:14px}}section{{padding:18px}}.grid{{grid-template-columns:1fr}}}}
+        .btn:disabled{{opacity:.65;cursor:wait;transform:none}}
+        @media(prefers-reduced-motion:reduce){{*,*::before,*::after{{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important}}}}
+        @media(max-width:768px){{body{{padding:20px 14px 36px}}section,fieldset.case-workflow-fields{{padding:18px}}.grid{{grid-template-columns:1fr}}h1{{font-size:24px}}}}
       </style>
     </head>
     <body>
@@ -410,6 +438,12 @@ def _page(title: str, body: str) -> str:
             if(status.state!=='ready'&&status.state!=='skipped')toast('本地模型 API 未就绪，将使用纯规则模式','warn');
             if(text)text.textContent='上传并读取文书…';
             runRedact();
+          }});
+        }});
+        document.querySelectorAll('[data-upload-target]').forEach(function(button){{
+          button.addEventListener('click',function(){{
+            var target=document.getElementById(button.dataset.uploadTarget||'');
+            if(target)target.click();
           }});
         }});
         var fileInput=document.getElementById('source-files');
@@ -904,12 +938,14 @@ def render_home_page(
         <section>
           <h2>脱敏</h2>
           <form id="redact-form" action="/redact" method="post" enctype="multipart/form-data">
-            <label>粘贴文本</label>
+            <label>文书内容</label>
             <textarea name="text" id="text-input" rows="12" placeholder="粘贴文书原文，或拖拽 txt/md/doc/docx/pdf 文件到此处"></textarea>
-            <label>选择文件（可多选）</label>
-            <input type="file" id="source-files" name="files" accept=".txt,.md,.doc,.docx,.pdf" multiple>
-            <label>或选择案件文件夹（推荐）</label>
-            <input type="file" id="source-directory-files" name="case_folder_files" accept=".txt,.md,.doc,.docx,.pdf" webkitdirectory directory multiple>
+            <div class="upload-picker">
+              <input type="file" id="source-files" name="files" accept=".txt,.md,.doc,.docx,.pdf" multiple>
+              <input type="file" id="source-directory-files" name="case_folder_files" accept=".txt,.md,.doc,.docx,.pdf" webkitdirectory directory multiple>
+              <button type="button" class="btn btn-secondary btn-sm" data-upload-target="source-files">选择文件</button>
+              <button type="button" class="btn btn-secondary btn-sm" data-upload-target="source-directory-files">选择案件文件夹</button>
+            </div>
             <input type="hidden" id="upload-relative-paths-input" name="upload_relative_paths" value="">
             <div id="upload-file-list" class="upload-file-list" hidden>
               <div class="upload-file-list-head">
@@ -917,32 +953,30 @@ def render_home_page(
               </div>
               <div id="upload-file-list-items" class="upload-file-list-items"></div>
             </div>
-            <div class="row">
-              <p class="hint">统一标准脱敏：人名、地名、机构名称及敏感编号按同一套规则处理。</p>
-              <p class="hint">{html.escape(model_hint)}</p>
-            </div>
-            <label for="recognition-mode-choice">本次处理使用的识别模式</label>
-            <select id="recognition-mode-choice" name="recognition_mode" style="min-width:320px">
-              <option value="full_document" selected>整篇文书（LLM 双轮补漏）</option>
-              <option value="sentence_windows">逐句窗口（稳定回退）</option>
-            </select>
-            <p class="hint">默认使用 Qwen3.5 9B 整篇阅读，并在首轮登记后再次阅读全文补漏；人名和机构采用两轮合并登记，行政区划与身份证、电话、银行账号、案号继续保留确定性规则。单篇最多 120000 字符，超限或首轮失败时回退逐句窗口，不截断原文。</p>
-            <label for="model-choice">本次处理使用的模型</label>
-            <select id="model-choice" name="model" style="min-width:320px">
-              {model_options_html}
-            </select>
-            <p class="hint">选择只影响本次文书。默认 Qwen3.5 9B；切换模型会重载本地 MLX worker。</p>
+            <p class="hint">识别模式默认使用整篇文书双轮补漏；统一标准脱敏：人名、地名、机构名称及敏感编号按同一套规则处理。{html.escape(model_hint)}</p>
+            <input type="hidden" name="recognition_mode" value="full_document">
             <input type="hidden" name="llm_mode" value="max-effect">
-            <label style="display:flex; align-items:center; gap:8px; margin-top:12px; margin-bottom:12px; cursor:pointer;">
-              <input type="checkbox" name="enable_hanlp" value="1" {hanlp_attr} style="width:auto; margin:0;">
-              <span>HanLP 本地候选识别（可选启用，默认关闭以节省内存）</span>
-            </label>
-            <label>HanLP 模型（故障排查时再调整）</label>
-            <input type="text" name="hanlp_model" value="MSRA_NER_ELECTRA_SMALL_ZH" style="max-width:320px">
-            <label>已有映射表（保持替换一致性，选填，支持粘贴JSON或上传文件）</label>
-            <textarea name="base_map_json" rows="3" placeholder="粘贴已有映射表 JSON（可选）"></textarea>
-            <input type="file" name="base_map_file" accept=".json,.enc">
-            <fieldset>
+            <details class="advanced-options">
+              <summary>高级选项</summary>
+              <label for="model-choice">识别模型</label>
+              <select id="model-choice" name="model">
+                {model_options_html}
+              </select>
+              <p class="hint">整篇文书双轮识别是默认路径；单篇最多 120000 字符，超限或首轮失败时自动回退逐句窗口。切换模型会重载本地 MLX worker，仅影响本次文书。</p>
+              <label class="checkbox-label">
+                <input type="checkbox" name="enable_hanlp" value="1" {hanlp_attr}>
+                <span>启用 HanLP 本地候选识别（占用更多内存）</span>
+              </label>
+              <label>HanLP 模型</label>
+              <input type="text" name="hanlp_model" value="MSRA_NER_ELECTRA_SMALL_ZH">
+              <label>已有映射表（保持替换一致性）</label>
+              <textarea name="base_map_json" rows="3" placeholder="粘贴已有映射表 JSON（可选）"></textarea>
+              <label class="file-pill">
+                <input type="file" name="base_map_file" accept=".json,.enc">
+                <span>选择映射表文件</span>
+              </label>
+            </details>
+            <fieldset class="case-workflow-fields">
               <legend>案件工作流（选填）</legend>
               <label>案件文件夹名</label>
               <input type="text" id="case-folder-input" name="case_folder" placeholder="例如：2025 8765">
@@ -955,7 +989,7 @@ def render_home_page(
               <p class="hint">浏览器不会提供上传文件的本机绝对路径，所以系统会用文件名在案件库中反查目录。自动识别失败时，可在“原文件所在目录”粘贴完整目录。若未填写 Discord 链接，脱敏结果页可请求 Hermes 新建案件帖并通过 MCP 写回链接；映射表不会上传到 Discord。</p>
             </fieldset>
             <div class="redact-submit-row">
-              <button type="submit" class="btn" id="redact-submit-btn">一键脱敏</button>
+              <button type="submit" class="btn btn-primary" id="redact-submit-btn">一键脱敏</button>
               <div id="redact-progress" class="redact-progress" hidden>
                 <div class="redact-progress-track" aria-hidden="true"><div class="redact-progress-fill"></div></div>
                 <span id="redact-progress-text" class="redact-progress-text">准备中…</span>
@@ -969,15 +1003,21 @@ def render_home_page(
           <form action="/restore/preview" method="post" enctype="multipart/form-data">
             <label>粘贴脱敏后的文本</label>
             <textarea name="text" rows="6" placeholder="粘贴脱敏后的文书"></textarea>
-            <label>或上传脱敏文本 / Word</label>
-            <input type="file" name="file" accept=".txt,.md,.docx">
-            <label style="display:flex; align-items:center; gap:8px; margin-top:12px; margin-bottom:12px; cursor:pointer;">
-              <input type="checkbox" name="restore_docx_format" value="1" checked style="width:auto; margin:0;">
+            <label>脱敏文本 / Word</label>
+            <label class="file-pill">
+              <input type="file" name="file" accept=".txt,.md,.docx">
+              <span>选择脱敏文本 / Word</span>
+            </label>
+            <label class="checkbox-label">
+              <input type="checkbox" name="restore_docx_format" value="1" checked>
               <span>如果上传的是 Word，输出保留格式的 .docx</span>
             </label>
-            <label>粘贴或上传映射表（支持加密文件）</label>
+            <label>映射表（支持加密文件）</label>
             <textarea name="map_json" rows="4" placeholder="粘贴 redaction_map.json"></textarea>
-            <input type="file" name="map_file" accept=".json,.enc">
+            <label class="file-pill">
+              <input type="file" name="map_file" accept=".json,.enc">
+              <span>选择映射表文件</span>
+            </label>
             <p class="hint">映射表中的全部条目将一次性还原。</p>
             <button type="submit" class="btn btn-secondary">全部还原</button>
           </form>
@@ -1027,7 +1067,7 @@ def render_redaction_result_page(
         <div class="downloads">
           <a download="{html.escape(redacted_filename)}" href="{redacted_url}" class="btn">下载脱敏文本</a>
           <a download="redaction_map.json" href="{map_url}" class="btn btn-secondary" onclick="prepareCurrentMapDownload(this)">下载 redaction_map</a>
-          <a download="debug_trace.json" href="{debug_url}" class="btn btn-secondary">下载 debug_trace</a>
+          <a href="{debug_url}" download="debug_trace.json" class="debug-link">诊断文件</a>
           <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制脱敏文本</button>
         </div>
         {recognition_summary}
@@ -1126,7 +1166,7 @@ def render_batch_redaction_result_page(
         <div class="downloads">
           <a download="{combined_filename}" href="{redacted_url}" class="btn">下载合并脱敏文本</a>
           <a download="redaction_map.json" href="{map_url}" class="btn btn-secondary" onclick="prepareCurrentMapDownload(this)">下载统一映射表</a>
-          <a download="debug_trace.json" href="{debug_url}" class="btn btn-secondary">下载 debug_trace</a>
+          <a href="{debug_url}" download="debug_trace.json" class="debug-link">诊断文件</a>
           <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制合并文本</button>
         </div>
         {recognition_summary}
