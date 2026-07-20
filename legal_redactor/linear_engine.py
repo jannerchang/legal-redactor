@@ -14,7 +14,6 @@ from typing import Callable, Iterable
 
 from .candidate_resolution import is_noisy_org_capture, resolve_candidate_overlaps
 from .filters import clean_organization_text as _clean_organization_text
-from .entity_registry import FullDocumentEntityRegistry
 from .config import RedactionProfile
 from .filters import is_false_org as _is_false_org
 from .counters import TypeCounters
@@ -63,7 +62,6 @@ class LinearRuleEngine:
     source_text: str = ""
     _alias_cores_cache: dict[str, frozenset[str]] = field(default_factory=dict, repr=False)
     _organization_plans: dict[str, CompanyMaskPlan] = field(default_factory=dict, repr=False)
-    _registry_constraints: FullDocumentEntityRegistry | None = field(default=None, repr=False)
     _entity_masks: dict[str, str] = field(default_factory=dict, repr=False)
     _entity_org_plans: dict[str, CompanyMaskPlan] = field(default_factory=dict, repr=False)
 
@@ -72,10 +70,11 @@ class LinearRuleEngine:
         text: str,
         candidates: Iterable[Candidate] = (),
         llm_analysis: dict | None = None,
-        *,
         respect_fact_section_boundary: bool = True,
-        registry_constraints: FullDocumentEntityRegistry | None = None,
+        registry_constraints: object | None = None,
     ) -> list[MappingEntry]:
+        """Accept ordered discoveries; registry identity travels on candidate metadata."""
+        _ = registry_constraints
         scan_text = text
         if respect_fact_section_boundary:
             boundary_match = FACT_SECTION_BOUNDARY_RE.search(text)
@@ -83,7 +82,6 @@ class LinearRuleEngine:
                 scan_text = text[: boundary_match.start()]
 
         self.source_text = scan_text
-        self._registry_constraints = registry_constraints
         accepted_candidates = self._apply_llm_verdicts(list(candidates), scan_text, llm_analysis or {})
         accepted_candidates = resolve_candidate_overlaps(accepted_candidates)
 
@@ -381,16 +379,13 @@ class LinearRuleEngine:
         value = candidate.metadata.get("registry_primary_text") if isinstance(candidate.metadata, dict) else None
         return value if isinstance(value, str) and value else None
 
-    def _entity_do_not_merge_ids(self, entity_id: str | None) -> tuple[str, ...]:
-        if not entity_id or self._registry_constraints is None:
+    @staticmethod
+    def _candidate_do_not_merge(candidate: Candidate) -> tuple[str, ...]:
+        value = candidate.metadata.get("registry_do_not_merge") if isinstance(candidate.metadata, dict) else None
+        if not isinstance(value, (list, tuple)):
             return ()
-        blocked: list[str] = []
-        for pair in self._registry_constraints.do_not_merge:
-            if pair.left_id == entity_id:
-                blocked.append(pair.right_id)
-            elif pair.right_id == entity_id:
-                blocked.append(pair.left_id)
-        return tuple(blocked)
+        return tuple(item for item in value if isinstance(item, str) and item)
+
 
     def _expand_discovered_aliases(self) -> None:
         for organization in list(self.known_organizations):
@@ -467,7 +462,7 @@ class LinearRuleEngine:
                 confidence=candidate.confidence,
                 restore_by_default=True,
                 entity_id=self._candidate_entity_id(candidate),
-                do_not_merge=self._entity_do_not_merge_ids(self._candidate_entity_id(candidate)),
+                do_not_merge=self._candidate_do_not_merge(candidate),
                 restore_original=self._candidate_restore_original(candidate),
             )
         )

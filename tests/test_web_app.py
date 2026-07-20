@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -150,8 +151,8 @@ class WebAppUploadTests(unittest.TestCase):
             patch(
                 "legal_redactor.web_app._available_model_options",
                 return_value=[
-                    {"id": "bonsai-27b", "label": "Ternary Bonsai 27B（MLX 2-bit）"},
-                    {"id": "qwen3.5-9b", "label": "Qwen3.5 9B（MLX 4-bit）"},
+                    {"id": "bonsai-27b", "label": "Ternary Bonsai 27B（MLX 2-bit；长全文不推荐）"},
+                    {"id": "qwen3.5-9b", "label": "Qwen3.5 9B（MLX 4-bit；全文默认）"},
                 ],
             ),
         ):
@@ -180,19 +181,21 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertNotIn("body:new FormData(form)", page)
         self.assertIn('id="redact-form"', page)
         self.assertIn('id="redact-progress"', page)
-        self.assertIn("Ternary Bonsai 27B（MLX 2-bit）", page)
-        self.assertIn("Qwen3.5 9B（MLX 4-bit）", page)
+        self.assertIn("Ternary Bonsai 27B（MLX 2-bit；长全文不推荐）", page)
+        self.assertIn("Qwen3.5 9B（MLX 4-bit；全文默认）", page)
         self.assertIn('id="model-choice"', page)
         self.assertIn('name="model"', page)
         self.assertIn("每次处理都可重新选择", page)
+        self.assertIn("默认使用 Qwen3.5 9B 整篇阅读", page)
         self.assertIn('id="recognition-mode-choice"', page)
         self.assertIn('name="recognition_mode"', page)
-        self.assertIn('<option value="sentence_windows" selected>逐句窗口（稳定）</option>', page)
-        self.assertIn('<option value="full_document">整篇文书（实验）</option>', page)
+        self.assertIn('<option value="full_document" selected>整篇文书（LLM 双轮补漏）</option>', page)
+        self.assertIn('<option value="sentence_windows">逐句窗口（稳定回退）</option>', page)
         self.assertIn("单篇最多 120000 字符", page)
         self.assertIn("/api/model-status", page)
         self.assertIn("已用时", page)
         self.assertNotIn("super-secret-token", page)
+        self.assertIn('value="qwen3.5-9b" selected', page)
 
 
     def test_models_endpoint_forwards_public_manager_registry(self) -> None:
@@ -1001,7 +1004,7 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertGreaterEqual(len(configs), 2)
         self.assertTrue(all(cfg.enable_llm is False for cfg in configs))
-        self.assertEqual(configs[-1].llm.recognition_mode, "sentence_windows")
+        self.assertEqual(configs[-1].llm.recognition_mode, "full_document")
 
     def test_redact_confirmed_preserves_full_document_mode_when_manager_is_ready(self) -> None:
         from fastapi.testclient import TestClient
@@ -1121,7 +1124,7 @@ class WebAppUploadTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("模式：整篇文书（实验）", response.text)
+        self.assertIn("模式：整篇文书（LLM 双轮补漏）", response.text)
         self.assertIn("调用数：1", response.text)
         self.assertIn("冲突数：1", response.text)
 
@@ -1150,6 +1153,8 @@ class WebAppUploadTests(unittest.TestCase):
                         fallback_count=1,
                         duration_ms=800,
                         reason="invalid_registry",
+                        fallback_from_mode="full_document",
+                        http_status=200,
                     ),
                 )
 
@@ -1175,6 +1180,9 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertIn("模式：逐句窗口（稳定）", response.text)
         self.assertIn("状态：成功", response.text)
         self.assertIn("降级：是", response.text)
+        self.assertIn("Fallback 来源：整篇文书（LLM 双轮补漏）", response.text)
+        self.assertIn("原因：invalid_registry（invalid_registry）", response.text)
+        self.assertIn("HTTP：200", response.text)
         self.assertNotIn("本地模型 API 未就绪，已降级为纯规则模式。", response.text)
 
     def test_redact_route_uses_selected_manager_model_and_reports_duration(self) -> None:
@@ -1235,7 +1243,7 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertEqual(configs[0].llm.model, "qwen3.5-9b")
         self.assertEqual(configs[0].llm.recognition_mode, "full_document")
         self.assertIn("识别运行摘要", response.text)
-        self.assertIn("模式：整篇文书（实验）", response.text)
+        self.assertIn("模式：整篇文书（LLM 双轮补漏）", response.text)
         self.assertIn("逻辑模型：qwen3.5-9b", response.text)
         self.assertIn("状态：成功", response.text)
         self.assertIn("文档数：1", response.text)
@@ -2178,6 +2186,17 @@ class WebAppUploadTests(unittest.TestCase):
         data = json.loads(response.body.decode("utf-8"))
         self.assertEqual(data["code"], "INVALID_INPUT")
         self.assertEqual(data["fields"], ["sent"])
+    def test_text_download_uses_utf8_bom_and_picker_writes_blob(self) -> None:
+        from legal_redactor.web_app import _data_download
+
+        url = _data_download("redacted.txt", "text/plain", "张三")
+        decoded = urllib.parse.unquote(url.split(",", 1)[1])
+        page = _page("结果", "")
+
+        self.assertEqual(decoded, "\ufeff张三")
+        self.assertIn("new Blob([contentText]", page)
+        self.assertIn("charset=utf-8", page)
+
 
     def test_redaction_result_preserves_save_dir_in_edit_form(self) -> None:
         redaction_map = RedactionMap.create(

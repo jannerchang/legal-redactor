@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from .config import PipelineConfig
+from .model_manager import DEFAULT_MODEL_ID
 from .io import (
     load_redaction_map_auto,
     read_document,
@@ -38,10 +39,10 @@ def main(argv: list[str] | None = None) -> int:
     redact_parser.add_argument(
         "--recognition-mode",
         choices=("sentence_windows", "full_document"),
-        default="sentence_windows",
-        help="实体识别路径；整篇文书为实验模式",
+        default="full_document",
+        help="实体识别路径；默认整篇文书双轮补漏",
     )
-    redact_parser.add_argument("--model", default="bonsai-27b", help="model-manager 返回的逻辑模型 ID")
+    redact_parser.add_argument("--model", default=DEFAULT_MODEL_ID, help="model-manager 返回的逻辑模型 ID")
     redact_parser.add_argument("--debug-trace", action="store_true", help="额外输出 debug_trace.json")
 
     restore_parser = subparsers.add_parser("restore", help="按 redaction_map 反向还原")
@@ -74,10 +75,10 @@ def main(argv: list[str] | None = None) -> int:
     eval_parser.add_argument(
         "--recognition-mode",
         choices=("sentence_windows", "full_document"),
-        default="sentence_windows",
+        default="full_document",
         help="评估使用的实体识别路径",
     )
-    eval_parser.add_argument("--model", default="bonsai-27b", help="model-manager 返回的逻辑模型 ID")
+    eval_parser.add_argument("--model", default=DEFAULT_MODEL_ID, help="model-manager 返回的逻辑模型 ID")
     eval_parser.add_argument("--fail-under-recall", type=float, default=None, help="低于该 recall 时返回非零")
     eval_parser.add_argument("--fail-under-precision", type=float, default=None, help="低于该 precision 时返回非零")
     benchmark_parser = subparsers.add_parser(

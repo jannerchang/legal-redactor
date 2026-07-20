@@ -32,7 +32,7 @@ def get_logger(name: str | None = None) -> logging.Logger:
             handler.setFormatter(formatter)
             _logger.addHandler(handler)
             _logger.setLevel(logging.INFO)
-            _logger.propagate = False
+            _logger.propagate = True
     if name and name != _LOGGER_NAME:
         return _logger.getChild(name)
     return _logger

@@ -20,6 +20,7 @@ from pathlib import Path
 
 from .config import PipelineConfig
 from .io import load_redaction_map_auto, read_document, write_document
+from .model_manager import DEFAULT_MODEL_ID
 from .pipeline import RedactionPipeline
 from .recognition_benchmark import (
     load_benchmark_manifest,
@@ -61,12 +62,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--recognition-mode",
         choices=("sentence_windows", "full_document"),
-        default="sentence_windows",
-        help="实体识别路径；整篇文书为实验模式",
+        default="full_document",
+        help="实体识别路径；默认整篇文书双轮补漏",
     )
     parser.add_argument(
         "--model",
-        default="bonsai-27b",
+        default=DEFAULT_MODEL_ID,
         help="model-manager 返回的逻辑模型 ID（例如 bonsai-27b 或 qwen3.5-9b）",
     )
     parser.add_argument(

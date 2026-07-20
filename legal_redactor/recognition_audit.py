@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Iterable
 
-from .entity_registry import FullDocumentEntityRegistry, RegistryMaterialization
+from .entity_registry import RegistryMaterialization
 from .models import Candidate
 
 _RECOGNITION_CATEGORIES = (
@@ -42,12 +42,10 @@ class RecognitionAuditResult:
 def audit_recognition(
     detector_candidates: Iterable[Candidate],
     registry_materialization: RegistryMaterialization,
-    constraints: FullDocumentEntityRegistry | None = None,
 ) -> RecognitionAuditResult:
     """Classify detector/registry relationships without accepting or rejecting candidates."""
     detectors = _dedupe_candidates(detector_candidates)
     registry = _dedupe_candidates(registry_materialization.candidates)
-    constraints = constraints or registry_materialization.constraints
     detector_by_span = _by_span(detectors)
     registry_by_span = _by_span(registry)
     items: list[RecognitionAuditItem] = []
@@ -60,7 +58,7 @@ def audit_recognition(
         for detector in detector_group:
             match = next((candidate for candidate in registry_group if candidate.type == detector.type), None)
             if match is not None:
-                category = _identity_category(detector, match, constraints)
+                category = _identity_category(detector, match)
                 items.append(RecognitionAuditItem(category, detector, match))
                 consumed_detectors.add(id(detector))
                 consumed_registry.add(id(match))
@@ -69,6 +67,14 @@ def audit_recognition(
             items.append(RecognitionAuditItem("type_conflict", detector, match, "same_span_different_type"))
             consumed_detectors.add(id(detector))
             consumed_registry.add(id(match))
+
+    detectors = [
+        detector
+        for detector in detectors
+        if id(detector) in consumed_detectors
+        or not any(_full_document_person_correction(registry_candidate, detector) for registry_candidate in registry)
+    ]
+
 
     for detector in detectors:
         if id(detector) in consumed_detectors:
@@ -116,16 +122,10 @@ def audit_recognition(
 def _identity_category(
     detector: Candidate,
     registry: Candidate,
-    constraints: FullDocumentEntityRegistry,
 ) -> str:
     detector_id = _entity_id(detector)
     registry_id = _entity_id(registry)
     if detector_id and registry_id and detector_id != registry_id:
-        if tuple(sorted((detector_id, registry_id))) in constraints.blocked_pairs():
-            return "merge_conflict"
-        return "grouping_conflict"
-    detector_possible = detector.metadata.get("registry_possible_entity_ids", ())
-    if isinstance(detector_possible, list) and registry_id and detector_possible and registry_id not in detector_possible:
         return "grouping_conflict"
     return "agreed"
 
@@ -140,6 +140,17 @@ def _by_span(candidates: list[Candidate]) -> dict[tuple[int, int, str], list[Can
     for candidate in candidates:
         result.setdefault((candidate.start, candidate.end, candidate.text), []).append(candidate)
     return result
+
+
+def _full_document_person_correction(inner: Candidate, outer: Candidate) -> bool:
+    return (
+        inner.type == "person"
+        and outer.type == "person"
+        and inner.source.startswith("full_document_llm")
+        and inner.start >= outer.start
+        and inner.end <= outer.end
+        and (inner.start, inner.end) != (outer.start, outer.end)
+    )
 
 
 def _overlaps(left: Candidate, right: Candidate) -> bool:

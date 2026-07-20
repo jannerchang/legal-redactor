@@ -165,6 +165,10 @@ def test_manager_starts_worker_without_inheriting_output(tmp_path: Path, monkeyp
     assert len(calls) == 1
     assert calls[0][1] == {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     assert calls[0][0][calls[0][0].index("--model") + 1] == str(model_path)
+    assert calls[0][0][calls[0][0].index("--max-tokens") + 1] == "8192"
+    assert manager._startup_timeout_seconds == 1
+    assert manager._request_timeout_seconds == 300
+
     manager.shutdown()
 
 
@@ -336,6 +340,57 @@ def test_manager_scrubs_unknown_and_worker_errors(tmp_path: Path, monkeypatch) -
     assert invalid.status_code == 502
     assert invalid.json()["error"]["code"] == "invalid_worker_response"
     assert "/private/model" not in worker_error.text
+
+
+
+def test_manager_reports_worker_failure_without_sensitive_payload(tmp_path: Path, monkeypatch, caplog) -> None:
+    created: list[_FakeProcess] = []
+    monkeypatch.setattr("legal_redactor.model_manager._port_is_listening", lambda host, port: False)
+    with caplog.at_level("INFO", logger="legal_redactor"), _WorkerServer() as worker:
+        manager = _manager(tmp_path, worker.port, created)
+        _WorkerHandler.status = 500
+        _WorkerHandler.payload = {"error": {"message": "/private/model failed for 张三"}}
+        response = TestClient(create_model_manager_app(manager)).post(
+            "/v1/chat/completions",
+            json={"model": "bonsai-27b", "max_tokens": 8192, "messages": [{"role": "user", "content": "张三"}]},
+        )
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert response.status_code == 502
+    assert "模型请求开始：逻辑模型=bonsai-27b，max_tokens=8192" in messages
+    assert "HTTP=502" in messages
+    assert "错误码=worker_error" in messages
+    assert "/private/" not in messages
+    assert "张三" not in messages
+
+
+def test_manager_logs_safe_cold_start_timeout_reason(tmp_path: Path, monkeypatch, caplog) -> None:
+    created: list[_FakeProcess] = []
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    (model_path / "config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("legal_redactor.model_manager._port_is_listening", lambda host, port: False)
+    monkeypatch.setattr("legal_redactor.model_manager._worker_is_healthy", lambda host, port: False)
+    manager = ModelManager(
+        {"bonsai-27b": ModelSpec("bonsai-27b", "Test Bonsai", model_path)},
+        "127.0.0.1",
+        _unused_port(),
+        startup_timeout_seconds=0.01,
+        popen_factory=lambda command, **kwargs: created.append(_FakeProcess()) or created[-1],
+    )
+
+    with caplog.at_level("INFO", logger="legal_redactor"):
+        response = TestClient(create_model_manager_app(manager)).post(
+            "/v1/chat/completions",
+            json={"model": "bonsai-27b", "messages": [{"role": "user", "content": "张三"}]},
+        )
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert response.status_code == 503
+    assert "错误码=model_unavailable" in messages
+    assert "原因=worker_startup_timeout" in messages
+    assert str(model_path) not in messages
+    assert "张三" not in messages
 
 
 def test_manager_rejects_missing_model_without_starting_worker(tmp_path: Path) -> None:

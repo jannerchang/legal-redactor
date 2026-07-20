@@ -6,6 +6,8 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
+from ._logging import get_logger
+
 from .candidate_collector import (
     CandidateCollectionContext,
     CandidateCollector,
@@ -13,7 +15,7 @@ from .candidate_collector import (
     CandidateCollectionResult,
 )
 from .config import HIGH_RISK_TYPES, PipelineConfig, RedactionProfile
-from .entity_registry import FullDocumentEntityRegistry, RegistryMaterialization, materialize_registry_candidates
+from .entity_registry import RegistryMaterialization, materialize_registry_candidates
 from .counters import TypeCounters
 from .detectors import (
     detect_standard_regex_candidates,
@@ -27,6 +29,8 @@ from .location_utils import get_location_core
 from .models import BatchRedactionResult, Candidate, Leak, MappingEntry, RecognitionRunStats, RedactedDocument, RedactionMap, RedactionResult
 from .postprocess import PostprocessConfig, apply_postprocess
 from .recognition_audit import audit_recognition
+
+_logger = get_logger(__name__)
 
 
 _COMPANY_SUFFIXES_FOR_ALIAS_BOUNDARY = (
@@ -404,7 +408,6 @@ class _RedactionContext:
     review_candidates: list[Candidate] = field(default_factory=list)
     recognition_state: _RecognitionState = _RecognitionState.NOT_REQUESTED
     registry_materialization: RegistryMaterialization | None = None
-    registry_constraints: FullDocumentEntityRegistry | None = None
     recognition_stats: RecognitionRunStats | None = None
 
     def get_location_prefix(self, name: str) -> str:
@@ -597,12 +600,22 @@ def _linear_run_recognition(pipeline, ctx, text):
 
 
     if pipeline.config.llm.recognition_mode == "full_document":
+        _logger.info(
+            "识别路径：请求=full_document，模型=%s，字符数=%d。",
+            pipeline.config.llm.model,
+            len(ctx.scan_text),
+        )
         early = _linear_run_full_document_recognition(pipeline, ctx, text)
         if early is not None or ctx.recognition_state == _RecognitionState.SUCCESS:
             return early
-        ctx.warnings.append(
-            f"整篇 LLM 识别失败，已回退逐句窗口：{ctx.recognition_stats.reason if ctx.recognition_stats else 'unknown'}"
+        reason = ctx.recognition_stats.reason if ctx.recognition_stats else "unknown"
+        http_status = ctx.recognition_stats.http_status if ctx.recognition_stats else None
+        _logger.warning(
+            "全文 LLM 第 1 阶段失败：原因=%s，HTTP=%s；切换到逐句窗口 fallback。",
+            reason,
+            http_status if http_status is not None else "无",
         )
+        ctx.warnings.append(f"整篇 LLM 识别失败，已回退逐句窗口：{reason}")
 
     return _linear_run_sentence_windows(pipeline, ctx, text)
 
@@ -629,12 +642,12 @@ def _linear_run_full_document_recognition(pipeline, ctx, text):
             completion_token_count=metadata.completion_token_count,
             total_token_count=metadata.total_token_count,
             reason=extraction.reason,
+            http_status=metadata.http_status,
         )
         return None
 
     materialization = materialize_registry_candidates(ctx.scan_text, extraction.validation)
     ctx.registry_materialization = materialization
-    ctx.registry_constraints = materialization.constraints
     ctx.review_candidates.extend(materialization.review_candidates)
     detector_candidates = CandidateCollector().collect(
         CandidateCollectionContext(
@@ -649,10 +662,17 @@ def _linear_run_full_document_recognition(pipeline, ctx, text):
     audit_result = audit_recognition(
         detector_candidates,
         materialization,
-        materialization.constraints,
     )
     ctx.review_candidates.extend(audit_result.review_candidates)
     ctx.warnings.extend(extraction.validation.warnings)
+    # Fixed structured identifiers always remain deterministic. Administrative
+    # database mappings also remain authoritative: the LLM registry supplements
+    # semantic identity but must not erase exact, gated administrative matches.
+    ctx.mappings = [
+        mapping
+        for mapping in ctx.mappings
+        if mapping in ctx.fixed_regex_mappings or mapping.type == "location"
+    ]
     ctx.recognition_state = _RecognitionState.SUCCESS
     ctx.recognition_stats = RecognitionRunStats(
         mode="full_document",
@@ -684,15 +704,26 @@ def _linear_run_sentence_windows(pipeline, ctx, text):
     from .llm import LegalEntityAuditor
 
     prior_stats = ctx.recognition_stats
+    if prior_stats and prior_stats.fallback_count:
+        _logger.info(
+            "逐句 fallback 开始：来源=%s，原因=%s，前序调用=%d，前序用时=%.2fs。",
+            prior_stats.mode,
+            prior_stats.reason or "unknown",
+            prior_stats.call_count,
+            prior_stats.duration_ms / 1000,
+        )
     ctx.analysis = LegalEntityAuditor(pipeline.config.llm).extract_sentence_entities(
         ctx.scan_text,
         enable_samples=False,
     )
+    fallback_from_mode = prior_stats.mode if prior_stats and prior_stats.fallback_count else None
+    prior_reason = prior_stats.reason if prior_stats and prior_stats.fallback_count else None
+    prior_http_status = prior_stats.http_status if prior_stats and prior_stats.fallback_count else None
+    prior_call_count = prior_stats.call_count if prior_stats else 0
+    prior_retry_count = prior_stats.retry_count if prior_stats else 0
+    prior_duration_ms = prior_stats.duration_ms if prior_stats else 0
     if ctx.analysis.get("error"):
         reason = str(ctx.analysis["error"])
-        call_count = prior_stats.call_count if prior_stats else 0
-        retry_count = prior_stats.retry_count if prior_stats else 0
-        duration_ms = prior_stats.duration_ms if prior_stats else 0
         fallback_count = (prior_stats.fallback_count if prior_stats else 0) + 1
         if not pipeline.config.llm.fail_open:
             ctx.recognition_state = _RecognitionState.HARD_FAILURE
@@ -700,11 +731,13 @@ def _linear_run_sentence_windows(pipeline, ctx, text):
                 mode=pipeline.config.llm.recognition_mode,
                 model_id=pipeline.config.llm.model,
                 status=ctx.recognition_state.value,
-                call_count=call_count,
-                retry_count=retry_count,
+                call_count=prior_call_count,
+                retry_count=prior_retry_count,
                 fallback_count=fallback_count,
-                duration_ms=duration_ms,
+                duration_ms=prior_duration_ms,
                 reason=reason,
+                fallback_from_mode=fallback_from_mode,
+                http_status=prior_http_status,
             )
             ctx.warnings.append(f"整句 LLM 识别失败，已仅保留固定结构化正则脱敏：{reason}")
             return _structured_regex_early_result(pipeline, ctx, text)
@@ -713,11 +746,13 @@ def _linear_run_sentence_windows(pipeline, ctx, text):
             mode=pipeline.config.llm.recognition_mode,
             model_id=pipeline.config.llm.model,
             status=ctx.recognition_state.value,
-            call_count=call_count,
-            retry_count=retry_count,
+            call_count=prior_call_count,
+            retry_count=prior_retry_count,
             fallback_count=fallback_count,
-            duration_ms=duration_ms,
+            duration_ms=prior_duration_ms,
             reason=reason,
+            fallback_from_mode=fallback_from_mode,
+            http_status=prior_http_status,
         )
         ctx.warnings.append(f"整句 LLM 识别失败，已降级为规则模式：{reason}")
         ctx.analysis = {
@@ -742,9 +777,21 @@ def _linear_run_sentence_windows(pipeline, ctx, text):
         mode="sentence_windows",
         model_id=pipeline.config.llm.model,
         status=ctx.recognition_state.value,
+        call_count=prior_call_count,
+        retry_count=prior_retry_count,
         fallback_count=prior_stats.fallback_count if prior_stats else 0,
-        reason=prior_stats.reason if prior_stats and prior_stats.fallback_count else None,
+        duration_ms=prior_duration_ms,
+        reason=prior_reason,
+        fallback_from_mode=fallback_from_mode,
+        http_status=prior_http_status,
     )
+    if fallback_from_mode:
+        _logger.info(
+            "逐句 fallback 完成：状态=%s，保留首阶段原因=%s，HTTP=%s。",
+            ctx.recognition_state.value,
+            prior_reason or "unknown",
+            prior_http_status if prior_http_status is not None else "无",
+        )
     return None
 
 
@@ -790,20 +837,20 @@ def _linear_run_engine(pipeline, ctx) -> None:
     seed_candidates = [*ctx.admin_candidates, *ctx.hanlp_candidates]
 
     if ctx.registry_materialization is not None and ctx.recognition_state == _RecognitionState.SUCCESS:
-        collected = collector.collect(
-            CandidateCollectionContext(
-                text=ctx.scan_text,
-                seed_candidates=seed_candidates,
-                llm_analysis={},
-                llm_primary_discovery=False,
-                use_semantic_rules=True,
-                use_china_admin_rules=pipeline.config.enable_china_admin_rules,
-                registry_materialization=ctx.registry_materialization,
-            )
-        )
-        final_candidates = collected.candidates
+        # Full-document LLM owns people and organizations. Exact administrative
+        # locations keep their deterministic database/rule path so a model
+        # omission cannot erase a verified location.
+        deterministic_locations = [
+            candidate
+            for candidate in seed_candidates
+            if candidate.type in {"location", "grassroots_org"}
+        ]
+        final_candidates = [
+            *ctx.registry_materialization.candidates,
+            *deterministic_locations,
+        ]
         ctx.review_candidates = _dedupe_review_candidates(
-            [*ctx.review_candidates, *collected.review_candidates]
+            [*ctx.review_candidates, *ctx.registry_materialization.review_candidates]
         )
     elif ctx.recognition_state in {
         _RecognitionState.SUCCESS,
@@ -873,7 +920,11 @@ def _linear_run_engine(pipeline, ctx) -> None:
             ctx.scan_text,
             final_candidates,
             ctx.analysis,
-            registry_constraints=ctx.registry_constraints,
+            registry_constraints=(
+                ctx.registry_materialization.constraints
+                if ctx.registry_materialization is not None
+                else None
+            ),
         )
     )
 
@@ -952,6 +1003,8 @@ def _aggregate_recognition_stats(
         completion_token_count=_sum_optional(item.completion_token_count for item in stats),
         total_token_count=_sum_optional(item.total_token_count for item in stats),
         reason=next((item.reason for item in stats if item.reason), None),
+        fallback_from_mode=next((item.fallback_from_mode for item in stats if item.fallback_from_mode), None),
+        http_status=next((item.http_status for item in stats if item.http_status is not None), None),
     )
 
 

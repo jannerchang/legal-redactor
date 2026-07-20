@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import re
 from typing import Any, Iterable
@@ -9,9 +9,12 @@ from .models import Candidate
 
 _ALLOWED_ENTITY_TYPES = frozenset({"person", "organization", "location"})
 _MAX_PAYLOAD_CHARS = 1_000_000
-_MAX_EVIDENCE_CHARS = 160
 _MAX_ENTITY_TEXT_CHARS = 240
+_MAX_EVIDENCE_CHARS = 160
 _MAX_ENTITY_COUNT = 2_000
+_MAX_NAMES_PER_ENTITY = 16
+_DEFAULT_ENTITY_CONFIDENCE = 0.9
+
 
 
 @dataclass(frozen=True)
@@ -20,7 +23,7 @@ class RegistryEntity:
     entity_type: str
     primary_text: str
     variants: tuple[str, ...] = ()
-    confidence: float = 0.0
+    confidence: float = _DEFAULT_ENTITY_CONFIDENCE
     evidence: tuple[str, ...] = ()
 
 
@@ -31,6 +34,7 @@ class DoNotMergePair:
 
     def normalized(self) -> tuple[str, str]:
         return tuple(sorted((self.left_id, self.right_id)))  # type: ignore[return-value]
+
 
 _COURT_PERSONNEL_PREFIXES = (
     "审判长",
@@ -99,6 +103,7 @@ class RegistryMaterialization:
         return self.registry
 
 
+
 def parse_full_document_registry(payload: object) -> RegistryValidationResult:
     """Parse model output into a bounded registry without trusting its contents."""
     try:
@@ -107,6 +112,144 @@ def parse_full_document_registry(payload: object) -> RegistryValidationResult:
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         return RegistryValidationResult(error=_safe_error_kind(exc))
     return RegistryValidationResult(registry=registry)
+
+
+def merge_full_document_registries(
+    text: str,
+    primary: RegistryValidationResult,
+    supplement: RegistryValidationResult,
+) -> RegistryValidationResult:
+    """Union two validated passes while preserving the first pass identity groups."""
+    if not primary.valid:
+        return primary
+    if not supplement.valid:
+        return supplement
+
+    primary_entities = list(primary.registry.entities)
+    type_by_variant = {
+        value: entity.entity_type
+        for entity in primary_entities
+        for value in entity.variants
+    }
+    id_map: dict[str, str] = {}
+    used_ids = {entity.entity_id for entity in primary_entities}
+    next_index: dict[str, int] = {}
+    for entity in primary_entities:
+        prefix = _entity_id_prefix(entity.entity_type)
+        match = re.fullmatch(rf"{re.escape(prefix)}-(\d+)", entity.entity_id)
+        if match:
+            next_index[prefix] = max(next_index.get(prefix, 0), int(match.group(1)))
+
+    for entity in supplement.registry.entities:
+        overlaps = [
+            existing
+            for existing in primary_entities
+            if existing.entity_type == entity.entity_type
+            and set(existing.variants) & set(entity.variants)
+        ]
+        if overlaps:
+            target = overlaps[0]
+            merged_variants = tuple(
+                dict.fromkeys(
+                    (
+                        *target.variants,
+                        *(
+                            value
+                            for value in entity.variants
+                            if type_by_variant.get(value, entity.entity_type) == entity.entity_type
+                        ),
+                    )
+                )
+            )[:_MAX_NAMES_PER_ENTITY]
+            merged_evidence = tuple(dict.fromkeys((*target.evidence, *entity.evidence)))
+            updated = replace(
+                target,
+                primary_text=max(merged_variants, key=len),
+                variants=merged_variants,
+                confidence=max(target.confidence, entity.confidence),
+                evidence=merged_evidence,
+            )
+            primary_entities[primary_entities.index(target)] = updated
+            id_map[entity.entity_id] = target.entity_id
+            for value in merged_variants:
+                type_by_variant[value] = entity.entity_type
+            continue
+
+        variants = tuple(value for value in entity.variants if value not in type_by_variant)
+        if not variants:
+            continue
+        prefix = _entity_id_prefix(entity.entity_type)
+        next_index[prefix] = next_index.get(prefix, 0) + 1
+        entity_id = f"{prefix}-{next_index[prefix]}"
+        while entity_id in used_ids:
+            next_index[prefix] += 1
+            entity_id = f"{prefix}-{next_index[prefix]}"
+        used_ids.add(entity_id)
+        id_map[entity.entity_id] = entity_id
+        added = replace(
+            entity,
+            entity_id=entity_id,
+            primary_text=max(variants, key=len),
+            variants=variants,
+        )
+        primary_entities.append(added)
+        for value in variants:
+            type_by_variant[value] = entity.entity_type
+
+    primary_by_variant = {
+        value: entity.entity_id
+        for entity in primary_entities
+        for value in entity.variants
+    }
+    for entity in supplement.registry.entities:
+        id_map.setdefault(
+            entity.entity_id,
+            next(
+                (
+                    primary_by_variant[value]
+                    for value in entity.variants
+                    if value in primary_by_variant
+                ),
+                "",
+            ),
+        )
+
+    merged_pairs = list(primary.registry.do_not_merge)
+    seen_pairs = {pair.normalized() for pair in merged_pairs}
+    for pair in supplement.registry.do_not_merge:
+        left_id = id_map.get(pair.left_id)
+        right_id = id_map.get(pair.right_id)
+        if not left_id or not right_id or left_id == right_id:
+            continue
+        merged_pair = DoNotMergePair(left_id, right_id)
+        if merged_pair.normalized() not in seen_pairs:
+            seen_pairs.add(merged_pair.normalized())
+            merged_pairs.append(merged_pair)
+
+    merged_uncertain = [*primary.registry.uncertain]
+    for uncertain in supplement.registry.uncertain:
+        mapped_ids = tuple(
+            dict.fromkeys(
+                id_map[entity_id]
+                for entity_id in uncertain.possible_entity_ids
+                if entity_id in id_map
+            )
+        )
+        merged_uncertain.append(replace(uncertain, possible_entity_ids=mapped_ids))
+
+    merged = RegistryValidationResult(
+        registry=FullDocumentEntityRegistry(
+            entities=tuple(primary_entities),
+            do_not_merge=tuple(merged_pairs),
+            uncertain=tuple(_dedupe_uncertain(merged_uncertain)),
+        ),
+        warnings=tuple(dict.fromkeys((*primary.warnings, *supplement.warnings))),
+    )
+    return validate_registry_against_text(text, merged)
+
+
+def _entity_id_prefix(entity_type: str) -> str:
+    return "org" if entity_type == "organization" else entity_type
 
 
 def validate_registry_against_text(
@@ -139,6 +282,7 @@ def validate_registry_against_text(
                 error="invalid_uncertain_reference",
             )
 
+
     dropped_variants = 0
     dropped_evidence = 0
     validated_entities: list[RegistryEntity] = []
@@ -152,6 +296,9 @@ def validate_registry_against_text(
             if value not in variants:
                 variants.append(value)
                 claims.setdefault((entity.entity_type, value), []).append(entity.entity_id)
+        if not variants:
+            continue
+        primary_text = entity.primary_text if entity.primary_text in variants else variants[0]
         evidence: list[str] = []
         for value in entity.evidence:
             if len(value) > _MAX_EVIDENCE_CHARS or value not in text:
@@ -163,7 +310,7 @@ def validate_registry_against_text(
             RegistryEntity(
                 entity_id=entity.entity_id,
                 entity_type=entity.entity_type,
-                primary_text=entity.primary_text,
+                primary_text=primary_text,
                 variants=tuple(variants),
                 confidence=entity.confidence,
                 evidence=tuple(evidence),
@@ -229,11 +376,26 @@ def validate_registry_against_text(
                 possible_entity_ids=conflict.entity_ids,
             )
         )
+    retained_ids = {entity.entity_id for entity in validated_entities if entity.variants}
+    retained_pairs = tuple(
+        pair
+        for pair in registry.do_not_merge
+        if pair.left_id in retained_ids and pair.right_id in retained_ids
+    )
+    retained_uncertain = tuple(
+        replace(
+            uncertain,
+            possible_entity_ids=tuple(
+                entity_id for entity_id in uncertain.possible_entity_ids if entity_id in retained_ids
+            ),
+        )
+        for uncertain in _dedupe_uncertain(uncertain)
+    )
     return RegistryValidationResult(
         registry=FullDocumentEntityRegistry(
-            entities=tuple(validated_entities),
-            do_not_merge=registry.do_not_merge,
-            uncertain=tuple(_dedupe_uncertain(uncertain)),
+            entities=tuple(entity for entity in validated_entities if entity.variants),
+            do_not_merge=retained_pairs,
+            uncertain=retained_uncertain,
         ),
         warnings=tuple(warnings),
         conflicts=tuple(conflicts),
@@ -276,11 +438,15 @@ def materialize_registry_candidates(
                         "registry_entity_id": entity.entity_id,
                         "registry_primary_text": entity.primary_text,
                         "registry_confidence": entity.confidence,
+                        "registry_do_not_merge": list(
+                            _blocked_entity_ids(validation.registry, entity.entity_id)
+                        ),
                         "registry_variant_kind": variant_kind,
                         "provenance_sources": ["full_document_llm"],
                     },
                 )
                 candidates.append(candidate)
+
 
     for uncertain in validation.registry.uncertain:
         if uncertain.possible_type not in _ALLOWED_ENTITY_TYPES or uncertain.text not in text:
@@ -309,6 +475,19 @@ def materialize_registry_candidates(
         conflicts=validation.conflicts,
         registry=validation.registry,
     )
+
+def _blocked_entity_ids(
+    registry: FullDocumentEntityRegistry,
+    entity_id: str,
+) -> tuple[str, ...]:
+    blocked: list[str] = []
+    for pair in registry.do_not_merge:
+        if pair.left_id == entity_id:
+            blocked.append(pair.right_id)
+        elif pair.right_id == entity_id:
+            blocked.append(pair.left_id)
+    return tuple(dict.fromkeys(blocked))
+
 
 
 def _registry_variant_allowed(entity_type: str, value: str, text: str) -> bool:
@@ -348,6 +527,81 @@ def _payload_object(payload: object) -> dict[str, Any]:
 
 
 def _normalize_registry(data: dict[str, Any]) -> FullDocumentEntityRegistry:
+    if set(data) <= {"persons", "organizations", "locations", "same_entities"} and {
+        "persons", "organizations", "locations", "same_entities"
+    } <= set(data):
+        return _normalize_minimal_registry(data)
+    return _normalize_detailed_registry(data)
+
+
+def _normalize_minimal_registry(data: dict[str, Any]) -> FullDocumentEntityRegistry:
+    category_specs = (
+        ("persons", "person", "person"),
+        ("organizations", "organization", "org"),
+        ("locations", "location", "location"),
+    )
+    if set(data) != {key for key, _entity_type, _id_prefix in category_specs} | {"same_entities"}:
+        raise ValueError("invalid_entities")
+
+    names_by_type: dict[str, tuple[str, ...]] = {}
+    type_by_name: dict[str, str] = {}
+    total_count = 0
+    for key, entity_type, _id_prefix in category_specs:
+        names = _text_list(data.get(key), max_length=_MAX_ENTITY_TEXT_CHARS)
+        names_by_type[entity_type] = tuple(name for name in names if name not in type_by_name)
+        total_count += len(names_by_type[entity_type])
+        if total_count > _MAX_ENTITY_COUNT:
+            raise ValueError("invalid_entities")
+        for name in names_by_type[entity_type]:
+            type_by_name[name] = entity_type
+
+    parent = {name: name for name in type_by_name}
+
+    def find(name: str) -> str:
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    same_entities = data.get("same_entities")
+    if not isinstance(same_entities, list) or len(same_entities) > _MAX_ENTITY_COUNT:
+        raise ValueError("invalid_entities")
+    for pair in same_entities:
+        if not isinstance(pair, list) or len(pair) != 2:
+            raise ValueError("invalid_entity")
+        left, right = pair
+        if not isinstance(left, str) or not isinstance(right, str):
+            raise ValueError("invalid_entity")
+        if left not in type_by_name or right not in type_by_name:
+            continue
+        if type_by_name[left] != type_by_name[right]:
+            continue
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    entities: list[RegistryEntity] = []
+    for _key, entity_type, id_prefix in category_specs:
+        groups: dict[str, list[str]] = {}
+        for name in names_by_type[entity_type]:
+            groups.setdefault(find(name), []).append(name)
+        for index, names in enumerate(groups.values(), 1):
+            variants = tuple(names[:_MAX_NAMES_PER_ENTITY])
+            entities.append(
+                RegistryEntity(
+                    entity_id=f"{id_prefix}-{index}",
+                    entity_type=entity_type,
+                    primary_text=max(variants, key=len),
+                    variants=variants,
+                )
+            )
+    return FullDocumentEntityRegistry(entities=tuple(entities))
+
+
+def _normalize_detailed_registry(data: dict[str, Any]) -> FullDocumentEntityRegistry:
+    if set(data) != {"entities", "do_not_merge", "uncertain"}:
+        raise ValueError("invalid_entities")
     raw_entities = data.get("entities", [])
     if not isinstance(raw_entities, list) or len(raw_entities) > _MAX_ENTITY_COUNT:
         raise ValueError("invalid_entities")
@@ -361,21 +615,11 @@ def _normalize_registry(data: dict[str, Any]) -> FullDocumentEntityRegistry:
         if entity_type not in _ALLOWED_ENTITY_TYPES or entity_id in seen_ids:
             raise ValueError("invalid_entity_identity")
         primary_text = _required_text(item.get("primary_text") or item.get("primary"), "primary_text", _MAX_ENTITY_TEXT_CHARS)
-        confidence = _confidence(item.get("confidence", 0.0))
-        variants = _text_list(item.get("variants", []), max_length=_MAX_ENTITY_TEXT_CHARS)
-        variants = tuple(dict.fromkeys((primary_text, *variants)))
+        confidence = _confidence(item.get("confidence", _DEFAULT_ENTITY_CONFIDENCE))
+        variants = tuple(dict.fromkeys((primary_text, *_text_list(item.get("variants", []), max_length=_MAX_ENTITY_TEXT_CHARS))))
         evidence = _text_list(item.get("evidence", []), max_length=_MAX_EVIDENCE_CHARS * 4)
         seen_ids.add(entity_id)
-        entities.append(
-            RegistryEntity(
-                entity_id=entity_id,
-                entity_type=entity_type,
-                primary_text=primary_text,
-                variants=variants,
-                confidence=confidence,
-                evidence=evidence,
-            )
-        )
+        entities.append(RegistryEntity(entity_id, entity_type, primary_text, variants, confidence, evidence))
 
     pairs: list[DoNotMergePair] = []
     seen_pairs: set[tuple[str, str]] = set()
@@ -390,13 +634,9 @@ def _normalize_registry(data: dict[str, Any]) -> FullDocumentEntityRegistry:
             left, right = item
         else:
             raise ValueError("invalid_do_not_merge")
-        pair = DoNotMergePair(
-            _required_text(left, "left_id", 80),
-            _required_text(right, "right_id", 80),
-        )
-        normalized = pair.normalized()
-        if normalized not in seen_pairs:
-            seen_pairs.add(normalized)
+        pair = DoNotMergePair(_required_text(left, "left_id", 80), _required_text(right, "right_id", 80))
+        if pair.normalized() not in seen_pairs:
+            seen_pairs.add(pair.normalized())
             pairs.append(pair)
 
     uncertain: list[UncertainEntity] = []
@@ -406,16 +646,21 @@ def _normalize_registry(data: dict[str, Any]) -> FullDocumentEntityRegistry:
     for item in raw_uncertain:
         if not isinstance(item, dict):
             raise ValueError("invalid_uncertain")
-        text = _required_text(item.get("text"), "uncertain_text", _MAX_ENTITY_TEXT_CHARS)
         possible_type = item.get("possible_type") or item.get("type")
         if possible_type is not None:
             possible_type = str(possible_type).strip()
             if possible_type not in _ALLOWED_ENTITY_TYPES:
                 possible_type = None
-        possible_ids = _text_list(item.get("possible_entity_ids", item.get("entity_ids", [])), max_length=80)
-        uncertain.append(UncertainEntity(text, possible_type, possible_ids))
-
+        uncertain.append(
+            UncertainEntity(
+                _required_text(item.get("text"), "uncertain_text", _MAX_ENTITY_TEXT_CHARS),
+                possible_type,
+                _text_list(item.get("possible_entity_ids", item.get("entity_ids", [])), max_length=80),
+            )
+        )
     return FullDocumentEntityRegistry(tuple(entities), tuple(pairs), tuple(uncertain))
+
+
 
 
 def _required_text(value: object, field_name: str, max_length: int) -> str:
@@ -459,6 +704,10 @@ def _dedupe_uncertain(values: Iterable[UncertainEntity]) -> list[UncertainEntity
             seen.add(key)
             result.append(value)
     return result
+
+
+
+
 
 
 def _safe_error_kind(exc: Exception) -> str:

@@ -38,6 +38,21 @@ def test_party_role_name_action_boundary_recall() -> None:
     assert {c.text for c in inline} >= {"张三", "李四", "王五"}
 
 
+def test_party_name_stops_before_causal_and_directional_connectors() -> None:
+    cases = {
+        "原告许永亮因与被告赵文赏民间借贷纠纷一案。": {"许永亮", "赵文赏"},
+        "被告赵文赏向原告支付借款。": {"赵文赏"},
+    }
+
+    for text, expected in cases.items():
+        party, _ = detect_party_candidates(text)
+        inline = detect_inline_party_person_list_candidates(text)
+        actual = {candidate.text for candidate in [*party, *inline]}
+
+        assert expected <= actual, text
+        assert not any(candidate.endswith(("因", "向")) for candidate in actual), text
+
+
 def test_phone_ocr_space_and_dash_variants() -> None:
     """手机号允许 OCR/排版常见的空格、连字符分隔，且不误伤短数字。"""
     spaced = detect_regex_candidates("联系电话：138 0013 8000")

@@ -103,7 +103,7 @@ SAMPLE_SUMMARY_KEYS = (
 SUPPORTED_UPLOAD_SUFFIXES = {".txt", ".md", ".doc", ".docx", ".pdf"}
 RECOGNITION_MODE_LABELS = {
     "sentence_windows": "逐句窗口（稳定）",
-    "full_document": "整篇文书（实验）",
+    "full_document": "整篇文书（LLM 双轮补漏）",
     "rules_ner": "规则/HanLP",
     "candidate_review": "候选复核",
 }
@@ -208,7 +208,7 @@ def _pipeline_config_for_model_status(
     profile: str = "standard",
     llm_mode: str = "max-effect",
     model: str = DEFAULT_MODEL_ID,
-    recognition_mode: str = "sentence_windows",
+    recognition_mode: str = "full_document",
 ) -> tuple[PipelineConfig, list[str]]:
     status = probe_model_manager()
     recoverable_worker_error = status.state == "error" and status.details.get("reason") == "worker_error"
@@ -584,7 +584,7 @@ def _is_default_case_root_value(value: str) -> bool:
 async def analyze_page(
     text: str = Form(default=""),
     llm_mode: str = Form(default="max-effect"),
-    recognition_mode: str = Form(default="sentence_windows"),
+    recognition_mode: str = Form(default="full_document"),
     model: str = Form(default=DEFAULT_MODEL_ID),
     file: UploadFile | None = File(default=None),
     files: list[UploadFile] = File(default=[]),
@@ -624,7 +624,7 @@ def _render_audit_dashboard(
     profile: str,
     llm_mode: str,
     model: str = DEFAULT_MODEL_ID,
-    recognition_mode: str = "sentence_windows",
+    recognition_mode: str = "full_document",
     round_num: int = 0,
     previous_map_json: str = "{}",
     previous_deselected_json: str = "[]",
@@ -738,7 +738,7 @@ async def redact_confirmed_page(request: Request) -> str:
     profile = "standard"
     llm_mode = str(form.get("llm_mode", "max-effect"))
     model = str(form.get("model", DEFAULT_MODEL_ID))
-    recognition_mode = str(form.get("recognition_mode", "sentence_windows"))
+    recognition_mode = str(form.get("recognition_mode", "full_document"))
     round_num = int(form.get("round", "0"))
     previous_map_json = form.get("previous_map_json", "{}")
     previous_deselected_json = form.get("previous_deselected_json", "[]")
@@ -983,7 +983,7 @@ async def redact_page(
     request: Request,
     text: str = Form(default=""),
     llm_mode: str = Form(default="max-effect"),
-    recognition_mode: str = Form(default="sentence_windows"),
+    recognition_mode: str = Form(default="full_document"),
     model: str = Form(default=DEFAULT_MODEL_ID),
     enable_hanlp: str | None = Form(default=None),
     hanlp_model: str = Form(default=""),
@@ -2063,9 +2063,27 @@ def _recognition_stats_from_analysis(analysis: dict[str, Any]) -> RecognitionRun
             fallback_count=int(payload.get("fallback_count", 0)),
             conflict_count=int(payload.get("conflict_count", 0)),
             duration_ms=int(payload.get("duration_ms", 0)),
+            reason=str(payload["reason"]) if payload.get("reason") is not None else None,
+            fallback_from_mode=str(payload["fallback_from_mode"]) if payload.get("fallback_from_mode") is not None else None,
+            http_status=int(payload["http_status"]) if payload.get("http_status") is not None else None,
         )
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _recognition_reason_label(reason: str | None) -> str:
+    labels = {
+        "input_too_large": "文书超过全文模式字符上限",
+        "llm_disabled": "LLM 未启用",
+        "invalid_registry_payload": "模型返回的实体登记 JSON 无效或不完整",
+        "invalid_do_not_merge_reference": "模型返回了无效的不合并引用",
+        "invalid_uncertain_reference": "模型返回了无效的不确定实体引用",
+        "timeout": "模型调用超时",
+    }
+    value = reason or "unknown"
+    if value.startswith("http_"):
+        return f"模型 API 返回 HTTP {value.removeprefix('http_')}"
+    return labels.get(value, value)
 
 
 def _render_recognition_stats(stats: RecognitionRunStats | None) -> str:
@@ -2076,6 +2094,16 @@ def _render_recognition_stats(stats: RecognitionRunStats | None) -> str:
     model_id = stats.model_id or "无"
     seconds = max(0, stats.duration_ms) / 1000
     fallback_label = "是" if stats.fallback_count else "否"
+    fallback_details = ""
+    if stats.fallback_count:
+        source_mode = RECOGNITION_MODE_LABELS.get(stats.fallback_from_mode or "", stats.fallback_from_mode or "未知")
+        reason = stats.reason or "unknown"
+        reason_label = _recognition_reason_label(reason)
+        http_status = str(stats.http_status) if stats.http_status is not None else "无"
+        fallback_details = (
+            f'<p class="hint">Fallback 来源：{html.escape(source_mode)}；'
+            f'原因：{html.escape(reason_label)}（{html.escape(reason)}）；HTTP：{html.escape(http_status)}</p>'
+        )
     return (
         '<section class="info-card recognition-summary">'
         '<h2>识别运行摘要</h2>'
@@ -2084,6 +2112,7 @@ def _render_recognition_stats(stats: RecognitionRunStats | None) -> str:
         f'文档数：{stats.document_count}；调用数：{stats.call_count}；'
         f'识别耗时：{seconds:.2f} 秒；降级：{fallback_label}；'
         f'冲突数：{stats.conflict_count}</p>'
+        f'{fallback_details}'
         '</section>'
     )
 
@@ -3435,7 +3464,8 @@ def _form_list_value(values: list[str], index: int) -> str:
 
 
 def _data_download(filename: str, mime: str, content: str) -> str:
-    return f"data:{mime};charset=utf-8,{urllib.parse.quote(content)}"
+    prefix = "\ufeff" if mime == "text/plain" and filename.lower().endswith(".txt") else ""
+    return f"data:{mime};charset=utf-8,{urllib.parse.quote(prefix + content)}"
 
 
 def _binary_download(mime: str, content: bytes) -> str:

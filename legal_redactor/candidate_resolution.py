@@ -94,6 +94,17 @@ def _should_prefer_nested(inner: Candidate, outer: Candidate) -> bool:
         return True
     return False
 
+def _should_prefer_full_document_person(inner: Candidate, outer: Candidate) -> bool:
+    return (
+        inner.type == "person"
+        and outer.type == "person"
+        and inner.source.startswith("full_document_llm")
+        and outer.start <= inner.start
+        and outer.end >= inner.end
+        and inner.text != outer.text
+    )
+
+
 
 def resolve_candidate_overlaps(candidates: list[Candidate]) -> list[Candidate]:
     """Keep the highest-quality candidate for each overlapping span."""
@@ -107,11 +118,11 @@ def resolve_candidate_overlaps(candidates: list[Candidate]) -> list[Candidate]:
         for index, other in enumerate(list(accepted)):
             if not _overlaps(candidate, other):
                 continue
-            if _should_prefer_nested(candidate, other):
+            if _should_prefer_full_document_person(candidate, other) or _should_prefer_nested(candidate, other):
                 accepted[index] = candidate
                 skip_candidate = True
                 break
-            if _should_prefer_nested(other, candidate):
+            if _should_prefer_full_document_person(other, candidate) or _should_prefer_nested(other, candidate):
                 skip_candidate = True
                 break
         if skip_candidate:

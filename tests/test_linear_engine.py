@@ -341,6 +341,35 @@ def test_resolve_candidate_overlaps_prefers_higher_priority_source() -> None:
     assert resolved[0].source == "party_section"
 
 
+def test_resolve_candidate_overlaps_prefers_full_document_exact_person_boundary() -> None:
+    rule = Candidate(
+        type="person",
+        text="许永亮因",
+        start=2,
+        end=6,
+        source="party_section",
+        confidence=1.0,
+        risk_level="high",
+        auto_redact=True,
+    )
+    registry = Candidate(
+        type="person",
+        text="许永亮",
+        start=2,
+        end=5,
+        source="full_document_llm",
+        confidence=0.9,
+        risk_level="medium",
+        auto_redact=True,
+    )
+
+    resolved = resolve_candidate_overlaps([rule, registry])
+
+    assert [(candidate.text, candidate.source) for candidate in resolved] == [
+        ("许永亮", "full_document_llm")
+    ]
+
+
 def test_collect_skips_ambiguous_global_find_when_window_misses() -> None:
     text = "甲公司提交说明。乙公司到庭。"
     result = CandidateCollector().collect(
@@ -1138,7 +1167,7 @@ def test_fail_closed_sentence_extraction_skips_collector_and_engine() -> None:
     from unittest.mock import patch
 
     config = replace(
-        PipelineConfig.balanced_llm(),
+        PipelineConfig.balanced_llm(recognition_mode="sentence_windows"),
         enable_hebei_admin_db=False,
         enable_china_admin_db=False,
     )

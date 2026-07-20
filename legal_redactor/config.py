@@ -174,7 +174,7 @@ class LLMAPIConfig:
     enabled: bool = True
     role: str = "candidate_review_only"
     mode: str = "max-effect"
-    recognition_mode: str = "sentence_windows"
+    recognition_mode: str = "full_document"
     model: str = DEFAULT_MODEL_ID
     temperature: float = 0.0
     context_window: int = 32768
@@ -236,7 +236,7 @@ class PipelineConfig:
         cls,
         profile_name: str = "standard",
         model: str = DEFAULT_MODEL_ID,
-        recognition_mode: str = "sentence_windows",
+        recognition_mode: str = "full_document",
     ) -> "PipelineConfig":
         llm = LLMAPIConfig(
             enabled=True,
@@ -260,7 +260,7 @@ class PipelineConfig:
         cls,
         profile_name: str = "standard",
         model: str = DEFAULT_MODEL_ID,
-        recognition_mode: str = "sentence_windows",
+        recognition_mode: str = "full_document",
     ) -> "PipelineConfig":
         llm = LLMAPIConfig(
             enabled=True,
@@ -285,7 +285,7 @@ class PipelineConfig:
         llm_mode: str,
         profile_name: str = "standard",
         model: str = DEFAULT_MODEL_ID,
-        recognition_mode: str = "sentence_windows",
+        recognition_mode: str = "full_document",
     ) -> "PipelineConfig":
         if llm_mode == "off":
             return cls.offline_without_llm(profile_name)

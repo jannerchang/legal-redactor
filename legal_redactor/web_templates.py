@@ -813,7 +813,7 @@ def _page(title: str, body: str) -> str:
               }};
               const handle = await window.showSaveFilePicker(options);
               const writable = await handle.createWritable();
-              await writable.write(contentText);
+              await writable.write(new Blob([contentText], {{type: cleanMimeType + ';charset=utf-8'}}));
               await writable.close();
               toast('保存成功！');
             }} catch (err) {{
@@ -923,15 +923,15 @@ def render_home_page(
             </div>
             <label for="recognition-mode-choice">本次处理使用的识别模式</label>
             <select id="recognition-mode-choice" name="recognition_mode" style="min-width:320px">
-              <option value="sentence_windows" selected>逐句窗口（稳定）</option>
-              <option value="full_document">整篇文书（实验）</option>
+              <option value="full_document" selected>整篇文书（LLM 双轮补漏）</option>
+              <option value="sentence_windows">逐句窗口（稳定回退）</option>
             </select>
-            <p class="hint">整篇文书模式单篇最多 120000 字符；超限或模型调用失败会明确降级，且不会截断原文。</p>
+            <p class="hint">默认使用 Qwen3.5 9B 整篇阅读，并在首轮登记后再次阅读全文补漏；人名和机构采用两轮合并登记，行政区划与身份证、电话、银行账号、案号继续保留确定性规则。单篇最多 120000 字符，超限或首轮失败时回退逐句窗口，不截断原文。</p>
             <label for="model-choice">本次处理使用的模型</label>
             <select id="model-choice" name="model" style="min-width:320px">
               {model_options_html}
             </select>
-            <p class="hint">选择只影响本次文书。切换模型时，模型管理器会卸载当前 MLX worker，再加载所选模型。</p>
+            <p class="hint">选择只影响本次文书。默认 Qwen3.5 9B；切换模型会重载本地 MLX worker。</p>
             <input type="hidden" name="llm_mode" value="max-effect">
             <label style="display:flex; align-items:center; gap:8px; margin-top:12px; margin-bottom:12px; cursor:pointer;">
               <input type="checkbox" name="enable_hanlp" value="1" {hanlp_attr} style="width:auto; margin:0;">

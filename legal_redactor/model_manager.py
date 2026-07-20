@@ -16,12 +16,14 @@ from typing import Any
 
 from fastapi import FastAPI
 from fastapi.responses import Response
+from ._logging import get_logger
 
-DEFAULT_MODEL_ID = "bonsai-27b"
-BONSAI_MODEL_ID = DEFAULT_MODEL_ID
-BONSAI_MODEL_LABEL = "Ternary Bonsai 27B（MLX 2-bit）"
+
+BONSAI_MODEL_ID = "bonsai-27b"
+BONSAI_MODEL_LABEL = "Ternary Bonsai 27B（MLX 2-bit；长全文不推荐）"
 QWEN_MODEL_ID = "qwen3.5-9b"
-QWEN_MODEL_LABEL = "Qwen3.5 9B（MLX 4-bit）"
+QWEN_MODEL_LABEL = "Qwen3.5 9B（MLX 4-bit；全文默认）"
+DEFAULT_MODEL_ID = QWEN_MODEL_ID
 DEFAULT_MODEL_PATH = Path.home() / "Models/HuggingFace/prism-ml/Ternary-Bonsai-27B-mlx-2bit"
 DEFAULT_QWEN_MODEL_PATH = (
     Path.home()
@@ -29,6 +31,11 @@ DEFAULT_QWEN_MODEL_PATH = (
 )
 DEFAULT_WORKER_HOST = "127.0.0.1"
 DEFAULT_WORKER_PORT = 18081
+DEFAULT_WORKER_MAX_TOKENS = 8192
+DEFAULT_WORKER_STARTUP_TIMEOUT_SECONDS = 300
+DEFAULT_WORKER_REQUEST_TIMEOUT_SECONDS = 300
+
+
 DEFAULT_MODEL_SEARCH_ROOTS = (
     Path.home() / "Models/HuggingFace",
     Path.home() / ".cache/huggingface/hub",
@@ -62,6 +69,8 @@ BUILTIN_MODEL_SOURCE_NAMES = frozenset(
         "models--mlx-community--Qwen3.5-9B-MLX-4bit",
     }
 )
+_logger = get_logger(__name__)
+
 
 
 @dataclass(frozen=True)
@@ -99,7 +108,8 @@ class ModelManager:
         models: Mapping[str, ModelSpec],
         worker_host: str,
         worker_port: int,
-        startup_timeout_seconds: float = 130,
+        startup_timeout_seconds: float = DEFAULT_WORKER_STARTUP_TIMEOUT_SECONDS,
+        request_timeout_seconds: float = DEFAULT_WORKER_REQUEST_TIMEOUT_SECONDS,
         popen_factory: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
         model_discovery: Callable[[], Mapping[str, ModelSpec]] | None = None,
     ) -> None:
@@ -108,6 +118,7 @@ class ModelManager:
         self._worker_host = worker_host
         self._worker_port = worker_port
         self._startup_timeout_seconds = startup_timeout_seconds
+        self._request_timeout_seconds = request_timeout_seconds
         self._popen_factory = popen_factory
         self._lock = threading.RLock()
         self._worker_process: subprocess.Popen[bytes] | None = None
@@ -165,8 +176,12 @@ class ModelManager:
         if not isinstance(model_id, str) or not model_id:
             return _error_response(ModelNotFoundError("A registered model ID is required"))
 
+        max_tokens = payload.get("max_tokens")
+        safe_max_tokens = max_tokens if isinstance(max_tokens, int) and not isinstance(max_tokens, bool) else "未指定"
+        started = time.monotonic()
         with self._lock:
             try:
+                _logger.info("模型请求开始：逻辑模型=%s，max_tokens=%s。", model_id, safe_max_tokens)
                 spec = self.ensure_model(model_id)
                 worker_payload = dict(payload)
                 worker_payload["model"] = str(spec.path)
@@ -178,12 +193,37 @@ class ModelManager:
                     response_payload["model"] = spec.id
                 self._active_model = spec.id
                 self._worker_state = "ready"
+                usage = response_payload.get("usage") if isinstance(response_payload, dict) else None
+                completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+                _logger.info(
+                    "模型请求完成：逻辑模型=%s，HTTP=200，用时=%.2fs，输出 tokens=%s。",
+                    spec.id,
+                    time.monotonic() - started,
+                    completion_tokens if isinstance(completion_tokens, int) else "未知",
+                )
                 return 200, json.dumps(response_payload, ensure_ascii=False).encode("utf-8"), content_type
             except ModelManagerError as exc:
+                safe_reason = _safe_manager_reason(exc)
+                _logger.warning(
+                    "模型请求终止：逻辑模型=%s，HTTP=%d，错误码=%s，原因=%s，用时=%.2fs。",
+                    model_id,
+                    exc.status_code,
+                    exc.code,
+                    safe_reason,
+                    time.monotonic() - started,
+                )
                 return _error_response(exc)
             except (OSError, http.client.HTTPException):
                 self._refresh_worker_state()
-                return _error_response(ModelManagerError("MLX worker is unavailable"))
+                error = ModelManagerError("MLX worker is unavailable")
+                _logger.warning(
+                    "模型请求终止：逻辑模型=%s，HTTP=%d，错误码=%s，用时=%.2fs。",
+                    model_id,
+                    error.status_code,
+                    error.code,
+                    time.monotonic() - started,
+                )
+                return _error_response(error)
 
     def shutdown(self) -> None:
         with self._lock:
@@ -238,7 +278,7 @@ class ModelManager:
             "--temp",
             "0",
             "--max-tokens",
-            "4096",
+            str(DEFAULT_WORKER_MAX_TOKENS),
             "--prompt-cache-size",
             "2",
         ]
@@ -305,7 +345,7 @@ class ModelManager:
         connection = http.client.HTTPConnection(
             self._worker_host,
             self._worker_port,
-            timeout=self._startup_timeout_seconds,
+            timeout=self._request_timeout_seconds,
         )
         try:
             connection.request(
@@ -486,6 +526,22 @@ def _parse_worker_response(body: bytes) -> dict[str, Any]:
     if not isinstance(payload, dict) or not isinstance(payload.get("choices"), list):
         raise InvalidWorkerResponseError("MLX worker returned an invalid completion")
     return payload
+
+def _safe_manager_reason(error: ModelManagerError) -> str:
+    message = str(error)
+    labels = {
+        "Registered model is unavailable": "model_source_unavailable",
+        "mlx_lm.server is not installed": "mlx_server_not_installed",
+        "MLX worker port is occupied by another process": "worker_port_occupied",
+        "Failed to start MLX worker": "worker_spawn_failed",
+        "MLX worker exited during startup": "worker_exited_during_startup",
+        "MLX worker startup timed out": "worker_startup_timeout",
+        "Requested model failed to start; previous model restored": "model_switch_failed_previous_restored",
+        "MLX worker switch and rollback failed": "model_switch_and_rollback_failed",
+        "MLX worker rejected the request": "worker_rejected_request",
+    }
+    return labels.get(message, "model_manager_error")
+
 
 
 def _error_response(error: ModelManagerError) -> tuple[int, bytes, str]:

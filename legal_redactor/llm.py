@@ -10,9 +10,9 @@ from json import JSONDecodeError
 from typing import Any
 
 from ._logging import get_logger
-from .config import LLMAPIConfig
 from .entity_registry import (
     RegistryValidationResult,
+    merge_full_document_registries,
     parse_full_document_registry,
     validate_registry_against_text,
 )
@@ -970,16 +970,99 @@ class LegalEntityAuditor:
         """Extract and validate one document-level entity registry."""
         _ = enable_samples
         if not self.config.enabled:
+            _logger.warning("全文 LLM 未执行：原因=llm_disabled。")
             return FullDocumentRegistryExtraction(status="disabled", reason="llm_disabled")
         if len(text) > self.config.full_document_max_chars:
+            _logger.warning(
+                "全文 LLM 未执行：字符数=%d，限制=%d，原因=input_too_large。",
+                len(text),
+                self.config.full_document_max_chars,
+            )
             return FullDocumentRegistryExtraction(status="fallback", reason="input_too_large")
 
-        prompt = self._build_full_document_registry_prompt(text, enable_samples=False)
+        primary_prompt = self._build_full_document_registry_prompt(text, enable_samples=False)
+        repair_prompt = self._build_registry_repair_prompt(text)
+        primary = self._extract_full_document_pass(
+            text,
+            primary_prompt,
+            repair_prompt,
+            phase_label="初次登记",
+            repair_phase_label="JSON 修复",
+        )
+        if primary.status != "success":
+            return primary
+
+        supplement = self._extract_full_document_pass(
+            text,
+            self._build_full_document_supplement_prompt(text, primary.validation),
+            self._build_full_document_supplement_repair_prompt(text, primary.validation),
+            phase_label="二次补漏",
+            repair_phase_label="补漏 JSON 修复",
+        )
+        combined_metadata = self._merge_call_metadata(primary.metadata, supplement.metadata)
+        if supplement.status != "success":
+            _logger.warning(
+                "全文 LLM 二次补漏失败：原因=%s；保留首轮有效登记。",
+                supplement.reason or "unknown",
+            )
+            return FullDocumentRegistryExtraction(
+                validation=primary.validation,
+                status="success",
+                reason="supplement_failed",
+                metadata=combined_metadata,
+            )
+
+        merged = merge_full_document_registries(text, primary.validation, supplement.validation)
+        if not merged.valid:
+            _logger.warning(
+                "全文 LLM 补漏合并失败：原因=%s；保留首轮有效登记。",
+                merged.error or "invalid_registry_payload",
+            )
+            return FullDocumentRegistryExtraction(
+                validation=primary.validation,
+                status="success",
+                reason="supplement_merge_failed",
+                metadata=combined_metadata,
+            )
+        _logger.info(
+            "全文 LLM 完成：实体=%d，冲突=%d，总调用=%d，总用时=%.2fs。",
+            len(merged.registry.entities),
+            len(merged.conflicts),
+            combined_metadata.call_count,
+            combined_metadata.duration_ms / 1000,
+        )
+        return FullDocumentRegistryExtraction(
+            validation=merged,
+            status="success",
+            metadata=combined_metadata,
+        )
+
+    def _extract_full_document_pass(
+        self,
+        text: str,
+        prompt: str,
+        repair_prompt: str,
+        *,
+        phase_label: str,
+        repair_phase_label: str,
+    ) -> FullDocumentRegistryExtraction:
         attempts = 1 + self.config.full_document_retry_count
         total_metadata = ModelCallMetadata()
         last_reason = "invalid_registry_payload"
+        _logger.info(
+            "全文 LLM 开始：模型=%s，字符数=%d，最大输出=%d tokens，超时=%ds，最多调用=%d。",
+            self.config.model,
+            len(text),
+            self.config.full_document_max_output_tokens,
+            self.config.full_document_timeout_seconds,
+            attempts,
+        )
         for attempt in range(attempts):
-            current_prompt = prompt if attempt == 0 else self._build_registry_repair_prompt(text)
+            attempt_number = attempt + 1
+            phase = phase_label if attempt == 0 else repair_phase_label
+            current_prompt = prompt if attempt == 0 else repair_prompt
+            _logger.info("全文 LLM 调用 %d/%d：阶段=%s。", attempt_number, attempts, phase)
+            attempt_started = time.monotonic()
             try:
                 response = self._call_model_manager_with_metadata(
                     current_prompt,
@@ -987,14 +1070,26 @@ class LegalEntityAuditor:
                     timeout_seconds=self.config.full_document_timeout_seconds,
                 )
             except Exception as exc:
+                attempt_duration_ms = max(0, int(round((time.monotonic() - attempt_started) * 1000)))
                 reason = self._safe_exception_reason(exc)
+                http_status = self._exception_http_status(exc)
                 total_metadata = self._merge_call_metadata(
                     total_metadata,
                     ModelCallMetadata(
                         call_count=1,
                         retry_count=1 if attempt else 0,
-                        http_status=self._exception_http_status(exc),
+                        duration_ms=attempt_duration_ms,
+                        http_status=http_status,
                     ),
+                )
+                _logger.warning(
+                    "全文 LLM 调用 %d/%d 失败：阶段=%s，原因=%s，HTTP=%s，用时=%.2fs；将进入逐句 fallback。",
+                    attempt_number,
+                    attempts,
+                    phase,
+                    reason,
+                    http_status if http_status is not None else "无",
+                    attempt_duration_ms / 1000,
                 )
                 return FullDocumentRegistryExtraction(
                     status="fallback",
@@ -1014,11 +1109,32 @@ class LegalEntityAuditor:
                     http_status=response.metadata.http_status,
                 ),
             )
+            _logger.info(
+                "全文 LLM 调用 %d/%d 返回：阶段=%s，HTTP=%s，用时=%.2fs，输出 tokens=%s。",
+                attempt_number,
+                attempts,
+                phase,
+                response.metadata.http_status if response.metadata.http_status is not None else "无",
+                response.metadata.duration_ms / 1000,
+                response.metadata.completion_token_count if response.metadata.completion_token_count is not None else "未知",
+            )
             parsed = parse_full_document_registry(response.response_text)
             if not parsed.valid:
                 last_reason = parsed.error or "invalid_registry_payload"
                 if attempt + 1 < attempts:
+                    _logger.warning(
+                        "全文 LLM 输出校验失败：调用=%d/%d，原因=%s；将执行 JSON 修复重试。",
+                        attempt_number,
+                        attempts,
+                        last_reason,
+                    )
                     continue
+                _logger.warning(
+                    "全文 LLM 输出校验失败：调用=%d/%d，原因=%s；重试耗尽，将进入逐句 fallback。",
+                    attempt_number,
+                    attempts,
+                    last_reason,
+                )
                 return FullDocumentRegistryExtraction(
                     validation=parsed,
                     status="fallback",
@@ -1027,12 +1143,25 @@ class LegalEntityAuditor:
                 )
             validated = validate_registry_against_text(text, parsed)
             if not validated.valid:
+                reason = validated.error or "invalid_registry_payload"
+                _logger.warning(
+                    "全文 LLM 文本一致性校验失败：原因=%s；将进入逐句 fallback。",
+                    reason,
+                )
                 return FullDocumentRegistryExtraction(
                     validation=validated,
                     status="fallback",
-                    reason=validated.error or "invalid_registry_payload",
+                    reason=reason,
                     metadata=total_metadata,
                 )
+            _logger.info(
+                "全文 LLM 阶段成功：阶段=%s，实体=%d，冲突=%d，调用=%d，用时=%.2fs。",
+                phase_label,
+                len(validated.registry.entities),
+                len(validated.conflicts),
+                total_metadata.call_count,
+                total_metadata.duration_ms / 1000,
+            )
             return FullDocumentRegistryExtraction(
                 validation=validated,
                 status="success",
@@ -1758,8 +1887,12 @@ class LegalEntityAuditor:
     def _build_registry_repair_prompt(self, text: str) -> str:
         return (
             "/no_think\n"
-            "上一轮输出不是合法的案件级实体登记 JSON。重新阅读同一全文，只输出合法 JSON；"
-            "不要解释、不要 Markdown、不要省略字段。\n"
+            "上一轮输出不是合法的案件级实体 JSON。重新阅读同一全文，只输出合法 JSON；"
+            "顶层必须且只能有 persons、organizations、locations、same_entities 四个数组。\n"
+            "前三个数组各自是去重后的原文实体名称字符串；same_entities 每项只能是两个名称组成的数组，"
+            "只在全文语义确认两个名称是同一主体时输出。不要输出其他字段、解释或 Markdown。\n"
+            "格式：{\"persons\":[\"张三\"],\"organizations\":[\"星河建设有限公司\",\"星河公司\"],"
+            "\"locations\":[\"北京市\"],\"same_entities\":[[\"星河建设有限公司\",\"星河公司\"]]}\n"
             f"=== 文书全文 ===\n{text}\n"
         )
 
@@ -1771,23 +1904,68 @@ class LegalEntityAuditor:
         _ = enable_samples
         return (
             "/no_think\n"
-            "你是法律文书案件级实体登记器。一次阅读完整文书，只输出一个紧凑 JSON 对象；"
+            "你是法律文书案件级实体登记器。阅读完整文书后，只输出一个最小 JSON 对象；"
             "不要解释、不要 Markdown、不要输出脱敏稿。\n"
-            "只登记三类：person、organization、location。primary_text、variants、evidence 必须逐字来自原文，"
-            "不得修改内部字符；evidence 每条不超过 160 字。\n"
-            "同一真实主体的明确全称、简称、曾用名可放入同一 entities 项；无法确认时放 uncertain。"
-            "明确不是同一主体的 ID 放 do_not_merge。\n"
-            "禁止登记普通指代、职务称谓（如张经理）、审判人员、法官助理、书记员、项目、合同、案号、"
-            "电话、身份证号、银行账号、详细地址或其他编号。地点只登记符合当前脱敏策略的行政区划名称。\n"
-            "entity_id 使用文书内稳定短 ID；confidence 为 0 到 1。无实体时返回空数组。\n"
+            "顶层必须且只能有 persons、organizations、locations、same_entities 四个数组。"
+            "persons、organizations、locations 分别只放去重后的原文名称字符串；每个名称只出现一次。\n"
+            "same_entities 只输出需要推理的同一主体关系，每项恰好是两个名称组成的数组。"
+            "只有全文语义确认两个称呼属于同一主体时才输出关系；无法确认就不输出，不要猜测。"
+            "例如确认全称和简称是同一公司时输出 [\"河南省偃师市鑫龙建安工程有限公司\",\"鑫龙公司\"]。\n"
+            "名称必须逐字来自原文，不得改写、补空格或规范化数字。"
+            "不要输出 entity_id、type、primary_text、variants、confidence、evidence、关系说明或任何其他字段。\n"
+            "只登记 person、organization、location。禁止登记普通指代、职务称谓（如张经理）、"
+            "审判人员、法官助理、书记员、项目、合同、案号、电话、身份证号、银行账号、详细地址或其他编号。"
+            "地点只登记符合当前脱敏策略的行政区划名称。没有某类实体或同一性关系时输出空数组。\n"
             "输出格式："
-            '{"entities":[{"entity_id":"person-1","type":"person","primary_text":"张三",'
-            '"variants":["张三"],"confidence":0.9,"evidence":["原告张三"]}],'
-            '"do_not_merge":[{"left_id":"org-1","right_id":"org-2"}],'
-            '"uncertain":[{"text":"星河公司","possible_type":"organization",'
-            '"possible_entity_ids":["org-1","org-2"]}]}\n'
+            '{"persons":["张三","李四"],'
+            '"organizations":["星河建设有限公司","星河公司"],'
+            '"locations":["北京市"],'
+            '"same_entities":[["星河建设有限公司","星河公司"]]}\n'
             f"=== 文书全文 ===\n{text}\n"
         )
+
+    def _build_full_document_supplement_prompt(
+        self,
+        text: str,
+        primary: RegistryValidationResult,
+    ) -> str:
+        known = {
+            "persons": [],
+            "organizations": [],
+            "locations": [],
+        }
+        for entity in primary.registry.entities:
+            key = {
+                "person": "persons",
+                "organization": "organizations",
+                "location": "locations",
+            }.get(entity.entity_type)
+            if key is not None:
+                known[key].extend(entity.variants)
+        known_json = json.dumps(known, ensure_ascii=False, separators=(",", ":"))
+        return (
+            "/no_think\n"
+            "你是法律文书案件级实体补漏器。第一轮已经登记了一批实体；重新独立阅读完整文书，"
+            "只找第一轮遗漏的 person、organization、location 原文名称，以及遗漏名称与已登记名称之间明确的同一主体关系。\n"
+            "只输出一个最小 JSON 对象；顶层必须且只能有 persons、organizations、locations、same_entities 四个数组。"
+            "不要重复输出第一轮已有名称；没有遗漏就输出四个空数组。\n"
+            "名称必须逐字来自原文。禁止登记普通指代、职务称谓、审判人员、法官助理、书记员、项目、合同、案号、电话、"
+            "身份证号、银行账号、详细地址或其他编号。地点只登记符合当前脱敏策略的行政区划名称。\n"
+            "same_entities 每项必须恰好包含两个名称；可连接一个新发现名称和一个第一轮已有名称，但只有全文语义明确确认同一主体时才输出。"
+            "不要解释、不要 Markdown、不要输出其他字段。\n"
+            f"=== 第一轮已登记名称（只用于去重）===\n{known_json}\n"
+            f"=== 文书全文 ===\n{text}\n"
+        )
+    def _build_full_document_supplement_repair_prompt(
+        self,
+        text: str,
+        primary: RegistryValidationResult,
+    ) -> str:
+        return (
+            "上一轮补漏输出不是合法 JSON。重新执行同一个补漏任务，并严格使用以下格式。\n"
+            + self._build_full_document_supplement_prompt(text, primary)
+        )
+
 
     def _build_merged_prompt(self, text: str, candidates: list[dict], enable_samples: bool = False) -> str:
         # Runtime prompts never load sample-library few-shot evidence.

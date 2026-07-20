@@ -243,9 +243,9 @@ def _extract_party_entity(body: str) -> str:
     #    或 证人刘芳到庭作证 / 上诉人陈戊靖不服原审判决
     #    只取句首 2–4 字姓名，避免把机构整段或动作并入实体。
     person_action = re.match(
-        r"^(?P<name>[\u4e00-\u9fa5·]{2,4})(?:"
+        r"^(?P<name>[\u4e00-\u9fa5·]{2,4}?)(?:"
         r"到庭|出庭|参加|提出|申请|不服|负责|办理|陈述|说明|表示|确认|拒绝|要求|主张|"
-        r"辩称|诉称|称|系|为|男|女|汉族|住|住所地|身份证|公民身份|于|在|已|将|以|向|与|和|及"
+        r"辩称|诉称|称|系|为|男|女|汉族|住|住所地|身份证|公民身份|因|于|在|已|将|以|向|与|和|及"
         r")",
         field,
     )
@@ -457,7 +457,9 @@ def detect_inline_party_person_list_candidates(text: str) -> list[Candidate]:
         tail = text[match.end() :]
         stop = INLINE_PERSON_LIST_STOP_RE.search(tail)
         if stop:
-            tail = tail[: stop.start()]
+            tail = tail[: stop.start()].rstrip()
+            if tail.endswith(("因", "向")):
+                tail = tail[:-1]
         tail = INLINE_PERSON_CASE_TAIL_RE.sub("", tail).strip(" ：:，,。；;\n\t")
         if not tail:
             continue

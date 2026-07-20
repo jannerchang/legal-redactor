@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from legal_redactor.model_manager import BONSAI_MODEL_ID
+from legal_redactor.model_manager import QWEN_MODEL_ID
 from legal_redactor.models import MappingEntry, RedactionMap
 from legal_redactor.regression import (
     aggregate_sample_summaries,
@@ -48,7 +48,8 @@ def test_module_cli_uses_manager_logical_model_for_redaction(monkeypatch, tmp_pa
 
     assert len(configs) == 1
     assert configs[0].enable_llm is True
-    assert configs[0].llm.model == BONSAI_MODEL_ID
+    assert configs[0].llm.model == QWEN_MODEL_ID
+    assert configs[0].llm.recognition_mode == "full_document"
 
 
 def test_module_cli_uses_manager_logical_model_for_evaluation(monkeypatch, tmp_path) -> None:
@@ -77,7 +78,8 @@ def test_module_cli_uses_manager_logical_model_for_evaluation(monkeypatch, tmp_p
 
     assert len(configs) == 1
     assert configs[0].enable_llm is True
-    assert configs[0].llm.model == BONSAI_MODEL_ID
+    assert configs[0].llm.model == QWEN_MODEL_ID
+    assert configs[0].llm.recognition_mode == "full_document"
 
 
 def test_project_gold_report_keeps_metrics_and_drops_raw_diagnostics() -> None:

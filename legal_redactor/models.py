@@ -159,6 +159,8 @@ class RecognitionRunStats:
     completion_token_count: int | None = None
     total_token_count: int | None = None
     reason: str | None = None
+    fallback_from_mode: str | None = None
+    http_status: int | None = None
     category_counts: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
