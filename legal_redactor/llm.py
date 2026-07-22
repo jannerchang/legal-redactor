@@ -10,6 +10,7 @@ from json import JSONDecodeError
 from typing import Any
 
 from ._logging import get_logger
+from .config import LLMAPIConfig
 from .entity_registry import (
     RegistryValidationResult,
     merge_full_document_registries,
@@ -1068,6 +1069,7 @@ class LegalEntityAuditor:
                     current_prompt,
                     max_tokens=self.config.full_document_max_output_tokens,
                     timeout_seconds=self.config.full_document_timeout_seconds,
+                    stop="\n",
                 )
             except Exception as exc:
                 attempt_duration_ms = max(0, int(round((time.monotonic() - attempt_started) * 1000)))
@@ -1118,7 +1120,8 @@ class LegalEntityAuditor:
                 response.metadata.duration_ms / 1000,
                 response.metadata.completion_token_count if response.metadata.completion_token_count is not None else "未知",
             )
-            parsed = parse_full_document_registry(response.response_text)
+            repaired_payload = self._repair_full_document_registry_payload(response.response_text)
+            parsed = parse_full_document_registry(repaired_payload or response.response_text)
             if not parsed.valid:
                 last_reason = parsed.error or "invalid_registry_payload"
                 if attempt + 1 < attempts:
@@ -1400,6 +1403,7 @@ class LegalEntityAuditor:
         *,
         max_tokens: int = _AUDIT_MAX_TOKENS,
         timeout_seconds: int | None = None,
+        stop: str | None = None,
     ) -> ModelManagerCallResult:
         body = json.dumps(
             {
@@ -1408,6 +1412,7 @@ class LegalEntityAuditor:
                 "stream": False,
                 "temperature": self.config.temperature,
                 "max_tokens": max_tokens,
+                **({"stop": stop} if stop is not None else {}),
             },
             ensure_ascii=False,
         ).encode("utf-8")
@@ -1456,6 +1461,18 @@ class LegalEntityAuditor:
                 http_status=status,
             ),
         )
+
+    @classmethod
+    def _repair_full_document_registry_payload(cls, value: str) -> str | None:
+        """Close a max-token-truncated registry without inventing entity text."""
+        if cls._json_decode_failure_kind(value) != "truncated":
+            return None
+        repaired = cls._repair_json_text(value)
+        try:
+            parsed = json.loads(repaired)
+        except JSONDecodeError:
+            return None
+        return repaired if isinstance(parsed, dict) else None
 
     @staticmethod
     def _json_decode_failure_kind(value: str) -> str:
@@ -1887,10 +1904,10 @@ class LegalEntityAuditor:
     def _build_registry_repair_prompt(self, text: str) -> str:
         return (
             "/no_think\n"
-            "上一轮输出不是合法的案件级实体 JSON。重新阅读同一全文，只输出合法 JSON；"
-            "顶层必须且只能有 persons、organizations、locations、same_entities 四个数组。\n"
-            "前三个数组各自是去重后的原文实体名称字符串；same_entities 每项只能是两个名称组成的数组，"
-            "只在全文语义确认两个名称是同一主体时输出。不要输出其他字段、解释或 Markdown。\n"
+            "上一轮输出不是合法的案件级实体 JSON。重新阅读同一全文，只输出一行紧凑 JSON；"
+            "顶层必须且只能有 persons、organizations、locations、same_entities 四个数组。"
+            "前三个数组只列去重后的原文实体名称；same_entities 只列同一主体的名称对。"
+            "不要证据、解释、Markdown、换行或其他字段。输出最后一个 } 后立即停止。\n"
             "格式：{\"persons\":[\"张三\"],\"organizations\":[\"星河建设有限公司\",\"星河公司\"],"
             "\"locations\":[\"北京市\"],\"same_entities\":[[\"星河建设有限公司\",\"星河公司\"]]}\n"
             f"=== 文书全文 ===\n{text}\n"
@@ -1904,18 +1921,16 @@ class LegalEntityAuditor:
         _ = enable_samples
         return (
             "/no_think\n"
-            "你是法律文书案件级实体登记器。阅读完整文书后，只输出一个最小 JSON 对象；"
-            "不要解释、不要 Markdown、不要输出脱敏稿。\n"
+            "你是法律文书案件级实体登记器。阅读完整文书后，只输出一行紧凑 JSON。"
             "顶层必须且只能有 persons、organizations、locations、same_entities 四个数组。"
-            "persons、organizations、locations 分别只放去重后的原文名称字符串；每个名称只出现一次。\n"
-            "same_entities 只输出需要推理的同一主体关系，每项恰好是两个名称组成的数组。"
-            "只有全文语义确认两个称呼属于同一主体时才输出关系；无法确认就不输出，不要猜测。"
-            "例如确认全称和简称是同一公司时输出 [\"河南省偃师市鑫龙建安工程有限公司\",\"鑫龙公司\"]。\n"
+            "persons、organizations、locations 只列去重后的原文名称字符串；每个名称只出现一次。"
+            "same_entities 只列全文明确属于同一主体的两个名称；无法确认就不列。"
             "名称必须逐字来自原文，不得改写、补空格或规范化数字。"
-            "不要输出 entity_id、type、primary_text、variants、confidence、evidence、关系说明或任何其他字段。\n"
-            "只登记 person、organization、location。禁止登记普通指代、职务称谓（如张经理）、"
-            "审判人员、法官助理、书记员、项目、合同、案号、电话、身份证号、银行账号、详细地址或其他编号。"
-            "地点只登记符合当前脱敏策略的行政区划名称。没有某类实体或同一性关系时输出空数组。\n"
+            "只登记 person、organization、location；禁止登记普通指代、职务称谓、审判人员、法官助理、书记员、"
+            "项目、合同、案号、电话、身份证号、银行账号、详细地址或其他编号。"
+            "地点只登记符合当前脱敏策略的行政区划名称。没有某类实体或映射时使用空数组。"
+            "不要证据、entity_id、type、confidence、解释、Markdown、脱敏稿、换行或其他字段。"
+            "输出最后一个 } 后立即停止。\n"
             "输出格式："
             '{"persons":["张三","李四"],'
             '"organizations":["星河建设有限公司","星河公司"],'
@@ -1945,14 +1960,14 @@ class LegalEntityAuditor:
         known_json = json.dumps(known, ensure_ascii=False, separators=(",", ":"))
         return (
             "/no_think\n"
-            "你是法律文书案件级实体补漏器。第一轮已经登记了一批实体；重新独立阅读完整文书，"
-            "只找第一轮遗漏的 person、organization、location 原文名称，以及遗漏名称与已登记名称之间明确的同一主体关系。\n"
-            "只输出一个最小 JSON 对象；顶层必须且只能有 persons、organizations、locations、same_entities 四个数组。"
-            "不要重复输出第一轮已有名称；没有遗漏就输出四个空数组。\n"
-            "名称必须逐字来自原文。禁止登记普通指代、职务称谓、审判人员、法官助理、书记员、项目、合同、案号、电话、"
-            "身份证号、银行账号、详细地址或其他编号。地点只登记符合当前脱敏策略的行政区划名称。\n"
-            "same_entities 每项必须恰好包含两个名称；可连接一个新发现名称和一个第一轮已有名称，但只有全文语义明确确认同一主体时才输出。"
-            "不要解释、不要 Markdown、不要输出其他字段。\n"
+            "你是法律文书案件级实体补漏器。重新阅读完整文书，只列第一轮遗漏的 person、organization、location 原文名称，"
+            "以及遗漏名称与已登记名称之间明确的同一主体映射。只输出一行紧凑 JSON；"
+            "顶层必须且只能有 persons、organizations、locations、same_entities 四个数组。"
+            "不要重复第一轮已有名称；没有遗漏就输出四个空数组。名称必须逐字来自原文。"
+            "禁止登记普通指代、职务称谓、审判人员、法官助理、书记员、项目、合同、案号、电话、身份证号、银行账号、"
+            "详细地址或其他编号。地点只登记符合当前脱敏策略的行政区划名称。"
+            "same_entities 每项必须恰好包含两个名称，且只能用于全文明确确认的同一主体。"
+            "不要证据、解释、Markdown、换行或其他字段。输出最后一个 } 后立即停止。\n"
             f"=== 第一轮已登记名称（只用于去重）===\n{known_json}\n"
             f"=== 文书全文 ===\n{text}\n"
         )
