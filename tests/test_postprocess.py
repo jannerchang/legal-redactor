@@ -59,3 +59,39 @@ def test_apply_postprocess_empty_mappings_is_identity():
         PostprocessConfig(include_fragments=True, include_alias_merge=True),
     ]:
         assert apply_postprocess(text, [], cfg) == []
+
+
+def test_postprocess_does_not_merge_registry_entities_marked_do_not_merge():
+    text = "星河建设有限公司与星河科技有限公司并非同一主体。"
+    mappings = [
+        MappingEntry(
+            type="organization",
+            original="星河建设有限公司",
+            masked="甲公司",
+            role=None,
+            source="linear:full_document_llm",
+            confidence=0.9,
+            restore_by_default=True,
+            entity_id="org-1",
+            do_not_merge=("org-2",),
+        ),
+        MappingEntry(
+            type="organization",
+            original="星河科技有限公司",
+            masked="乙公司",
+            role=None,
+            source="linear:full_document_llm",
+            confidence=0.9,
+            restore_by_default=True,
+            entity_id="org-2",
+            do_not_merge=("org-1",),
+        ),
+    ]
+
+    processed = apply_postprocess(
+        text,
+        mappings,
+        PostprocessConfig(include_alias_merge=True),
+    )
+
+    assert [mapping.masked for mapping in processed] == ["甲公司", "乙公司"]

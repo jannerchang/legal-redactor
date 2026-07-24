@@ -368,7 +368,7 @@ def create_model_manager_app(manager: ModelManager) -> FastAPI:
         finally:
             manager.shutdown()
 
-    app = FastAPI(title="legal-redactor local model manager", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title="legal-redactor local model manager", version="0.2.1", lifespan=lifespan)
 
     @app.get("/health")
     def health() -> dict[str, str | None]:

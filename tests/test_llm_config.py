@@ -7,6 +7,15 @@ import pytest
 from legal_redactor.config import LLMAPIConfig, PipelineConfig
 from legal_redactor.llm import LegalEntityAuditor
 from legal_redactor.model_manager import BONSAI_MODEL_ID, QWEN_MODEL_ID
+from legal_redactor.entity_registry import (
+    DoNotMergePair,
+    FullDocumentEntityRegistry,
+    RegistryEntity,
+    RegistryValidationResult,
+    UncertainEntity,
+    materialize_registry_candidates,
+    validate_registry_against_text,
+)
 
 
 class _Response:
@@ -132,6 +141,36 @@ def test_auditor_manager_errors_do_not_echo_prompt(monkeypatch, response) -> Non
     assert prompt not in str(raised.value)
 
 
+def test_full_document_call_uses_newline_stop_sequence(monkeypatch) -> None:
+    registry = {
+        "persons": ["张三"],
+        "organizations": [],
+        "locations": [],
+        "same_entities": [],
+    }
+    response_body = json.dumps(
+        {"choices": [{"message": {"content": json.dumps(registry, ensure_ascii=False)}}]},
+        ensure_ascii=False,
+    )
+    _Connection.requests = []
+    _Connection.responses = [_Response(200, response_body), _Response(200, response_body)]
+    monkeypatch.setattr("legal_redactor.llm.http.client.HTTPConnection", _Connection)
+    auditor = LegalEntityAuditor(
+        LLMAPIConfig(
+            model=BONSAI_MODEL_ID,
+            recognition_mode="full_document",
+            model_manager_host="manager.local",
+            model_manager_port=18080,
+        )
+    )
+
+    result = auditor.extract_full_document_registry("原告张三。")
+
+    assert result.status == "success"
+    assert len(_Connection.requests) == 2
+    assert all(request["body"]["stop"] == "\n" for request in _Connection.requests)
+
+
 def test_full_document_transport_failure_preserves_http_reason_and_logs(caplog) -> None:
     _Connection.requests = []
     _Connection.responses = [_Response(503, '{"error":{"code":"model_unavailable"}}')]
@@ -200,11 +239,13 @@ def test_full_document_prompt_requires_minimal_identity_groups() -> None:
     auditor = LegalEntityAuditor(LLMAPIConfig(recognition_mode="full_document"))
     prompt = auditor._build_full_document_registry_prompt("星河建设有限公司又称星河公司。")
 
-    assert "persons、organizations、locations 分别只放去重后的原文名称字符串" in prompt
-    assert "same_entities 只输出需要推理的同一主体关系" in prompt
+    assert "只输出一行紧凑 JSON" in prompt
+    assert "persons、organizations、locations 只列去重后的原文名称字符串" in prompt
+    assert "same_entities 只列全文明确属于同一主体的两个名称" in prompt
     assert '"persons":["张三","李四"]' in prompt
-    assert "无法确认就不输出" in prompt
-    assert "不要输出 entity_id、type、primary_text、variants、confidence、evidence" in prompt
+    assert "无法确认就不列" in prompt
+    assert "不要证据、entity_id、type、confidence、解释、Markdown、脱敏稿、换行或其他字段" in prompt
+    assert "输出最后一个 } 后立即停止" in prompt
     assert '"same_entities":[["星河建设有限公司","星河公司"]]' in prompt
 
 
@@ -225,6 +266,27 @@ def test_full_document_supplement_prompt_excludes_known_names_and_keeps_full_tex
     assert '"persons":["张三"]' in prompt
     assert "张三与遗漏的李四。" in prompt
     assert "没有遗漏就输出四个空数组" in prompt
+
+
+def test_truncated_registry_repair_only_closes_existing_json_structure() -> None:
+    truncated = '{"persons":["张三"],"organizations":["星河建设有限公司"],"locations":[],"same_entities":['
+
+    repaired = LegalEntityAuditor._repair_full_document_registry_payload(truncated)
+
+    assert repaired == '{"persons":["张三"],"organizations":["星河建设有限公司"],"locations":[]}'
+    assert json.loads(repaired) == {
+        "persons": ["张三"],
+        "organizations": ["星河建设有限公司"],
+        "locations": [],
+    }
+    assert "same_entities" not in repaired
+
+
+def test_registry_repair_does_not_rewrite_complete_or_non_json_output() -> None:
+    complete = '{"persons":[],"organizations":[],"locations":[],"same_entities":[]}'
+
+    assert LegalEntityAuditor._repair_full_document_registry_payload(complete) is None
+    assert LegalEntityAuditor._repair_full_document_registry_payload("模型解释文本") is None
 
 
 def test_registry_parser_builds_identity_groups_and_bounds_names() -> None:
@@ -283,3 +345,85 @@ def test_registry_parser_rejects_nonminimal_top_level_fields() -> None:
 
     assert not result.valid
     assert result.error == "invalid_entities"
+
+
+def test_registry_validation_requires_exact_source_text_and_materializes_local_spans() -> None:
+    text = "原告张三起诉星河建设有限公司，星河公司答辩。"
+    validation = validate_registry_against_text(
+        text,
+        RegistryValidationResult(
+            registry=FullDocumentEntityRegistry(
+                entities=(
+                    RegistryEntity("person-1", "person", "张三", ("张三", "张某")),
+                    RegistryEntity(
+                        "org-1",
+                        "organization",
+                        "星河建设有限公司",
+                        ("星河建设有限公司", "星河公司", "不存在公司"),
+                    ),
+                )
+            )
+        ),
+    )
+
+    assert validation.dropped_variant_count == 2
+    materialization = materialize_registry_candidates(text, validation)
+    assert [
+        (candidate.text, candidate.start, candidate.end)
+        for candidate in materialization.candidates
+    ] == [
+        ("张三", text.index("张三"), text.index("张三") + len("张三")),
+        (
+            "星河建设有限公司",
+            text.index("星河建设有限公司"),
+            text.index("星河建设有限公司") + len("星河建设有限公司"),
+        ),
+        ("星河公司", text.index("星河公司"), text.index("星河公司") + len("星河公司")),
+    ]
+
+
+def test_registry_conflicts_and_uncertain_entities_never_auto_redact() -> None:
+    text = "张三提交材料。"
+    validation = validate_registry_against_text(
+        text,
+        RegistryValidationResult(
+            registry=FullDocumentEntityRegistry(
+                entities=(
+                    RegistryEntity("person-1", "person", "张三", ("张三",)),
+                    RegistryEntity("person-2", "person", "张三", ("张三",)),
+                ),
+                uncertain=(UncertainEntity("张三", "person", ("person-1", "person-2")),),
+            )
+        ),
+    )
+
+    materialization = materialize_registry_candidates(text, validation)
+
+    assert validation.conflicts
+    assert materialization.candidates == ()
+    assert materialization.review_candidates
+    assert all(not candidate.auto_redact for candidate in materialization.review_candidates)
+
+
+def test_registry_do_not_merge_constraint_reaches_materialized_candidates() -> None:
+    text = "星河建设有限公司与星河科技有限公司并非同一主体。"
+    validation = validate_registry_against_text(
+        text,
+        RegistryValidationResult(
+            registry=FullDocumentEntityRegistry(
+                entities=(
+                    RegistryEntity("org-1", "organization", "星河建设有限公司", ("星河建设有限公司",)),
+                    RegistryEntity("org-2", "organization", "星河科技有限公司", ("星河科技有限公司",)),
+                ),
+                do_not_merge=(DoNotMergePair("org-1", "org-2"),),
+            )
+        ),
+    )
+
+    materialization = materialize_registry_candidates(text, validation)
+    blocked_by_id = {
+        candidate.metadata["registry_entity_id"]: candidate.metadata["registry_do_not_merge"]
+        for candidate in materialization.candidates
+    }
+
+    assert blocked_by_id == {"org-1": ["org-2"], "org-2": ["org-1"]}
