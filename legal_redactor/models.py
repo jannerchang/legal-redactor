@@ -186,7 +186,9 @@ class RedactedDocument:
     original_text: str
     redacted_text: str
     leaks: list[Leak] = field(default_factory=list)
-
+    output_filename: str | None = None
+    output_media_type: str = "text/plain"
+    output_bytes: bytes | None = None
 
 @dataclass
 class BatchRedactionResult:

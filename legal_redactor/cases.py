@@ -598,9 +598,14 @@ def persist_case_redaction(
     records: list[RedactedFileRecord] = []
     multiple_documents = len(documents) > 1
     for index, document in enumerate(documents, start=1):
-        filename = _redacted_filename(index=index, multiple_documents=multiple_documents)
+        filename = _redacted_filename(index=index, multiple_documents=multiple_documents, document=document)
         output_path = redacted_dir / filename
-        output_path.write_text(document.redacted_text, encoding="utf-8")
+        temporary_path = redacted_dir / f".{filename}.tmp"
+        if document.output_bytes is not None:
+            temporary_path.write_bytes(document.output_bytes)
+        else:
+            temporary_path.write_text(document.redacted_text, encoding="utf-8")
+        temporary_path.replace(output_path)
         records.append(RedactedFileRecord(filename=filename))
 
     save_redaction_map_auto(mapping_path, redaction_map)
@@ -984,10 +989,11 @@ def looks_like_case_root(root: Path) -> bool:
     return root.name in {"案件资料", "legal-redactor-cases"}
 
 
-def _redacted_filename(*, index: int, multiple_documents: bool) -> str:
+def _redacted_filename(*, index: int, multiple_documents: bool, document: RedactedDocument) -> str:
+    extension = "xlsx" if document.output_bytes is not None else "txt"
     if multiple_documents:
-        return f"document-{index}.redacted.txt"
-    return "redacted.txt"
+        return f"document-{index}.redacted.{extension}"
+    return f"redacted.{extension}"
 
 
 def _now_iso() -> str:

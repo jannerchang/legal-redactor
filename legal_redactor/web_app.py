@@ -19,6 +19,7 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any
 from zipfile import BadZipFile
+from .excel_io import EXCEL_INPUT_SUFFIXES, XLSX_MEDIA_TYPE, ExcelFormulaLeakError, extract_workbook_text, redact_workbook
 
 from .config import PipelineConfig
 from .cases import (
@@ -73,11 +74,12 @@ except ImportError as exc:
 
 app = FastAPI(title="本地法律文书脱敏系统", version="0.2.1")
 
-
 @dataclass(frozen=True)
 class InputDocument:
     source_file: str
     text: str
+    source_bytes: bytes | None = None
+    source_suffix: str = ".txt"
 
 
 
@@ -100,7 +102,7 @@ SAMPLE_SUMMARY_KEYS = (
     "regression_suggestions",
 )
 
-SUPPORTED_UPLOAD_SUFFIXES = {".txt", ".md", ".doc", ".docx", ".pdf"}
+SUPPORTED_UPLOAD_SUFFIXES = {".txt", ".md", ".doc", ".docx", ".pdf", *EXCEL_INPUT_SUFFIXES}
 RECOGNITION_MODE_LABELS = {
     "sentence_windows": "逐句窗口（稳定）",
     "full_document": "整篇文书（LLM 双轮补漏）",
@@ -309,14 +311,14 @@ async def suggest_case_location(request: Request) -> JSONResponse:
     if case_root and not _is_default_case_root_value(case_root):
         roots.append(Path(case_root).expanduser())
     relative_paths = body.get("relative_paths") or body.get("upload_relative_paths") or []
-    if _safe_upload_relative_paths(relative_paths):
+    safe_relative_paths = _safe_upload_relative_paths(relative_paths)
+    if safe_relative_paths:
         relative_suggestion = _suggest_case_location_from_relative_paths(
-            relative_paths,
+            safe_relative_paths,
             roots or None,
             discord_thread_url=str(body.get("discord_thread_url", "")).strip(),
         )
-        if relative_suggestion.get("status") != "not_found":
-            return JSONResponse(relative_suggestion)
+        return JSONResponse(relative_suggestion)
     suggestion = suggest_case_location_from_filenames(
         filenames,
         roots or None,
@@ -978,6 +980,39 @@ async def redact_confirmed_page(request: Request) -> str:
         )
 
 
+def _excel_source(document: InputDocument) -> bool:
+    return document.source_bytes is not None and document.source_suffix in EXCEL_INPUT_SUFFIXES
+
+
+def _render_output_document(
+    source: InputDocument,
+    redacted: RedactedDocument,
+    redaction_map: RedactionMap,
+    pipeline: RedactionPipeline,
+) -> RedactedDocument:
+    if not _excel_source(source):
+        return redacted
+    output_bytes = redact_workbook(source.source_bytes or b"", source.source_file, redaction_map, pipeline.apply_mappings)
+    output_filename = f"{PurePosixPath(source.source_file.replace(chr(92), chr(47))).stem or 'redacted'}.redacted.xlsx"
+    output_text = extract_workbook_text(output_bytes, output_filename)
+    return replace(
+        redacted,
+        redacted_text=output_text,
+        output_filename=output_filename,
+        output_media_type=XLSX_MEDIA_TYPE,
+        output_bytes=output_bytes,
+        leaks=pipeline.scan_high_risk_leaks(output_text),
+    )
+
+
+def _excel_warnings(documents: list[InputDocument]) -> list[str]:
+    if any(d.source_suffix == ".xlsm" for d in documents):
+        return ["已移除 XLSM 宏并输出为 XLSX；宏、批注、超链接目标和图形文本未参与脱敏。"]
+    if any(_excel_source(d) for d in documents):
+        return ["Excel 仅脱敏单元格文本；批注、超链接目标和图形文本未参与脱敏。"]
+    return []
+
+
 @app.post("/redact", response_class=HTMLResponse)
 async def redact_page(
     request: Request,
@@ -1050,12 +1085,27 @@ async def redact_page(
                 base_redaction_map=base_redaction_map,
             )
     except Exception as exc:
-        return _page(
-            "脱敏失败",
-            _redaction_failure_body(exc, enable_hanlp=bool(enable_hanlp)),
-        )
+        return _page("脱敏失败", _redaction_failure_body(exc, enable_hanlp=bool(enable_hanlp)))
     result = replace(result, redaction_map=_sanitize_redaction_map(result.redaction_map))
-    warnings = [*fallback_warnings, *result.warnings]
+    try:
+        if len(documents) > 1:
+            augmented_documents = [
+                _render_output_document(source, document, result.redaction_map, pipeline)
+                for source, document in zip(documents, result.documents)
+            ]
+            result = replace(
+                result,
+                documents=augmented_documents,
+                warnings=[*result.warnings, *_excel_warnings(documents)],
+            )
+        else:
+            warnings = [*fallback_warnings, *result.warnings, *_excel_warnings(documents)]
+    except ExcelFormulaLeakError as exc:
+        locations = "".join(f"<li>{html.escape(location)}</li>" for location in exc.locations)
+        return _page("Excel 源格式输出失败", f"<p>公式包含待替换内容，已阻止导出。</p><ul>{locations}</ul>")
+    except ValueError as exc:
+        return _page("Excel 源格式输出失败", html.escape(str(exc)))
+    warnings = [*fallback_warnings, *result.warnings] if len(documents) > 1 else warnings
     if len(documents) > 1:
         try:
             _persist_optional_case_redaction(
@@ -1085,13 +1135,25 @@ async def redact_page(
             case_folder=effective_case_folder,
             source_dir=inferred_source_dir,
             recognition_stats=result.recognition_stats,
+            source_documents=documents,
         )
-    redacted_doc = RedactedDocument(
-        source_file=documents[0].source_file,
-        original_text=result.original_text,
-        redacted_text=result.redacted_text,
-        leaks=result.leaks,
-    )
+    try:
+        redacted_doc = _render_output_document(
+            documents[0],
+            RedactedDocument(
+                source_file=documents[0].source_file,
+                original_text=result.original_text,
+                redacted_text=result.redacted_text,
+                leaks=result.leaks,
+            ),
+            result.redaction_map,
+            pipeline,
+        )
+    except ExcelFormulaLeakError as exc:
+        locations = "".join(f"<li>{html.escape(location)}</li>" for location in exc.locations)
+        return _page("Excel 源格式输出失败", f"<p>公式包含待替换内容，已阻止导出。</p><ul>{locations}</ul>")
+    except ValueError as exc:
+        return _page("Excel 源格式输出失败", html.escape(str(exc)))
     try:
         _persist_optional_case_redaction(
             effective_case_root,
@@ -1117,6 +1179,8 @@ async def redact_page(
         warnings,
         save_dir=inferred_source_dir,
         discord_thread_url=effective_discord_thread_url,
+        document=redacted_doc,
+        source_document=documents[0],
         case_root=effective_case_root,
         case_folder=effective_case_folder,
         source_dir=inferred_source_dir,
@@ -1136,41 +1200,20 @@ async def apply_map_page(
         return _page("映射表解析失败", f"错误详情: {exc}")
     pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
     if original_bundle_json.strip():
-        documents = _documents_from_bundle_json(original_bundle_json)
-        redacted_documents = []
-        all_leaks = []
-        for doc in documents:
-            redacted_text = pipeline.apply_redaction_map(doc.text, redaction_map)
-            leaks = pipeline.scan_high_risk_leaks(redacted_text)
-            redacted_documents.append(
-                RedactedDocument(
-                    source_file=doc.source_file,
-                    original_text=doc.text,
-                    redacted_text=redacted_text,
-                    leaks=leaks,
-                )
-            )
-            all_leaks.extend(leaks)
-        return _render_batch_redaction_result(
-            title="应用映射表结果",
-            documents=redacted_documents,
-            redaction_map=redaction_map,
-            review_candidates=[],
-            leaks=all_leaks,
-            warnings=["已重新应用您上传/修改后的映射表。"],
-        )
-
+        try:
+            documents = _documents_from_bundle_json(original_bundle_json)
+            redacted_documents = _apply_map_to_documents(pipeline, documents, redaction_map)
+            augmented = [_render_output_document(source, document, redaction_map, pipeline) for source, document in zip(documents, redacted_documents)]
+        except ExcelFormulaLeakError as exc:
+            locations = "".join(f"<li>{html.escape(location)}</li>" for location in exc.locations)
+            return _page("Excel 源格式输出失败", f"<p>公式包含待替换内容，已阻止导出。</p><ul>{locations}</ul>")
+        except ValueError as exc:
+            return _page("Excel 源文件状态无效，请重新上传", html.escape(str(exc)))
+        leaks = [lk for document in augmented for lk in document.leaks]
+        return _render_batch_redaction_result("应用映射表结果", augmented, redaction_map, [], leaks, ["已重新应用您上传/修改后的映射表。"], source_documents=documents)
     redacted_text = pipeline.apply_redaction_map(original_text, redaction_map)
     leaks = pipeline.scan_high_risk_leaks(redacted_text)
-    return _render_redaction_result(
-        title="应用映射表结果",
-        original_text=original_text,
-        redacted_text=redacted_text,
-        redaction_map=redaction_map,
-        review_candidates=[],
-        leaks=leaks,
-        warnings=["已重新应用您上传/修改后的映射表。"],
-    )
+    return _render_redaction_result("应用映射表结果", original_text, redacted_text, redaction_map, [], leaks, ["已重新应用您上传/修改后的映射表。"])
 
 
 @app.post("/redact/apply-edited-map", response_class=HTMLResponse)
@@ -1225,48 +1268,32 @@ async def apply_edited_map_page(request: Request) -> str:
         )
         warnings.append("已按当前保留的映射重新排列占位符。")
     pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
-    documents = _documents_from_bundle_json(original_bundle_json)
+    try:
+        documents = _documents_from_bundle_json(original_bundle_json)
+    except ValueError as exc:
+        return _page("Excel 源文件状态无效，请重新上传", html.escape(str(exc)))
     if documents:
-        redacted_documents = _apply_map_to_documents(pipeline, documents, redaction_map)
-        leaks = [lk for d in redacted_documents for lk in d.leaks]
-        return _render_batch_redaction_result(
-            "编辑映射后结果",
-            redacted_documents,
-            redaction_map,
-            [],
-            leaks,
-            warnings,
-            save_dir=save_dir,
-            discord_thread_url=discord_thread_url,
-            case_root=case_root,
-            case_folder=case_folder,
-            source_dir=source_dir,
-        )
+        try:
+            redacted_documents = _apply_map_to_documents(pipeline, documents, redaction_map)
+            augmented = [_render_output_document(source, document, redaction_map, pipeline) for source, document in zip(documents, redacted_documents)]
+        except ExcelFormulaLeakError as exc:
+            locations = "".join(f"<li>{html.escape(location)}</li>" for location in exc.locations)
+            return _page("Excel 源格式输出失败", f"<p>公式包含待替换内容，已阻止导出。</p><ul>{locations}</ul>")
+        except ValueError as exc:
+            return _page("Excel 源文件状态无效，请重新上传", html.escape(str(exc)))
+        leaks = [lk for document in augmented for lk in document.leaks]
+        return _render_batch_redaction_result("编辑映射后结果", augmented, redaction_map, [], leaks, warnings, save_dir=save_dir, discord_thread_url=discord_thread_url, case_root=case_root, case_folder=case_folder, source_dir=source_dir, source_documents=documents)
     redacted_text = pipeline.apply_redaction_map(original_text, redaction_map)
     leaks = pipeline.scan_high_risk_leaks(redacted_text)
-    return _render_redaction_result(
-        "编辑映射后结果",
-        original_text,
-        redacted_text,
-        redaction_map,
-        [],
-        leaks,
-        warnings,
-        save_dir=save_dir,
-        discord_thread_url=discord_thread_url,
-        case_root=case_root,
-        case_folder=case_folder,
-        source_dir=source_dir,
-    )
+    return _render_redaction_result("编辑映射后结果", original_text, redacted_text, redaction_map, [], leaks, warnings, save_dir=save_dir, discord_thread_url=discord_thread_url, case_root=case_root, case_folder=case_folder, source_dir=source_dir)
 
 
 def _source_indicates_manual(source: str) -> bool:
-    normalized = (source or "").strip().lower()
-    return normalized.startswith(("manual", "user", "selection"))
+    return str(source or "").strip().lower().startswith(("manual", "user", "selection"))
 
 
 def _source_indicates_sample(source: str) -> bool:
-    return "sample" in (source or "").strip().lower()
+    return "sample" in str(source or "").strip().lower()
 
 
 def _review_candidate_text_set(review_candidates: list) -> set[str]:
@@ -2118,112 +2145,30 @@ def _render_recognition_stats(stats: RecognitionRunStats | None) -> str:
 
 
 def _render_redaction_result(
-    title: str,
-    original_text: str,
-    redacted_text: str,
-    redaction_map: RedactionMap,
-    review_candidates: list,
-    leaks: list,
-    warnings: list[str],
-    save_dir: str = "",
-    discord_thread_url: str = "",
-    case_root: str = "",
-    case_folder: str = "",
-    source_dir: str = "",
-    recognition_stats: RecognitionRunStats | None = None,
+    title: str, original_text: str, redacted_text: str, redaction_map: RedactionMap,
+    review_candidates: list, leaks: list, warnings: list[str], save_dir: str = "",
+    discord_thread_url: str = "", case_root: str = "", case_folder: str = "", source_dir: str = "",
+    recognition_stats: RecognitionRunStats | None = None, document: RedactedDocument | None = None,
+    source_document: InputDocument | None = None,
 ) -> str:
     default_dir = save_dir.strip() or os.path.expanduser("~/Desktop")
     map_json = redaction_map_to_json(redaction_map)
     from .debug_trace import debug_trace_from_parts, debug_trace_to_json
-
-    debug_json = debug_trace_to_json(
-        debug_trace_from_parts(
-            mode=redaction_map.mode,
-            source_file=redaction_map.source_file,
-            mappings=redaction_map.mappings,
-            documents=[
-                {
-                    "source_file": redaction_map.source_file,
-                    "original_text": original_text,
-                    "redacted_text": redacted_text,
-                }
-            ],
-            review_candidates=review_candidates,
-            leaks=leaks,
-            warnings=warnings,
-        )
-    )
+    debug_json = debug_trace_to_json(debug_trace_from_parts(mode=redaction_map.mode, source_file=redaction_map.source_file, mappings=redaction_map.mappings, documents=[{"source_file": redaction_map.source_file, "original_text": original_text, "redacted_text": redacted_text}], review_candidates=review_candidates, leaks=leaks, warnings=warnings))
     leaks_html = "".join(f"<li><strong>{html.escape(lk.type)}</strong>: <mark>{html.escape(lk.text)}</mark></li>" for lk in leaks)
     warnings_html = "".join(f"<li>{html.escape(w)}</li>" for w in warnings)
-    recognition_summary = _render_recognition_stats(recognition_stats)
-    redacted_filename = "redacted.txt"
-    redacted_filename_json = json.dumps(redacted_filename, ensure_ascii=False)
-    redacted_url = _data_download(redacted_filename, "text/plain", redacted_text)
+    artifact = document if document and document.output_bytes is not None else None
+    redacted_filename = artifact.output_filename if artifact else "redacted.txt"
+    redacted_url = _binary_download(XLSX_MEDIA_TYPE, artifact.output_bytes) if artifact else _data_download(redacted_filename, "text/plain", redacted_text)
     map_url = _data_download("redaction_map.json", "application/json", map_json)
     debug_url = _data_download("debug_trace.json", "application/json", debug_json)
-    discord_create_section = _discord_create_thread_section(
-        discord_thread_url=discord_thread_url,
-        case_root=case_root,
-        case_folder=case_folder,
-        source_dir=source_dir or save_dir,
-        filename=redacted_filename,
-        textarea_id="redacted-output",
-        map_textarea_id="mapping-json-output",
-        message_id="discord-create-message",
-    )
-    discord_section = _discord_send_section(discord_thread_url, redacted_filename, "redacted-output", "discord-message")
-    workflow_panel = _render_case_workflow_panel(
-        case_root=case_root,
-        case_folder=case_folder,
-        discord_thread_url=discord_thread_url,
-        saved_local=bool(case_folder),
-    )
-    mapping_review_toolbar = _render_mapping_review_toolbar(redaction_map, review_candidates)
-    sample_summary_panel = _render_sample_summary_panel()
-    review_candidate_texts_json = _review_candidate_texts_json(review_candidates)
-    review_html = "".join(
-        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.2f}</td><td>{}</td></tr>".format(
-            html.escape(c.type), html.escape(c.text), html.escape(c.source),
-            c.confidence, html.escape(c.reason or ""))
-        for c in review_candidates
-    )
-    original_highlight = _highlight_replaced_text(original_text, redaction_map.mappings)
-    redacted_highlight = _highlight_replaced_text(redacted_text, redaction_map.mappings, reverse=True)
+    disable_discord = artifact is not None
+    workflow_panel = _render_case_workflow_panel(case_root=case_root, case_folder=case_folder, discord_thread_url=discord_thread_url, saved_local=bool(case_folder))
     mapping_edit_rows = _render_mapping_edit_rows(redaction_map, review_candidates)
-    return render_redaction_result_page(
-        title=title,
-        redacted_filename=redacted_filename,
-        redacted_url=redacted_url,
-        map_url=map_url,
-        debug_url=debug_url,
-        workflow_panel=workflow_panel,
-        default_dir=default_dir,
-        redacted_filename_json=redacted_filename_json,
-        save_dir=save_dir,
-        discord_create_section=discord_create_section,
-        discord_section=discord_section,
-        leaks_html=leaks_html,
-        warnings_html=warnings_html,
-        recognition_summary=recognition_summary,
-        original_highlight=original_highlight,
-        redacted_text=redacted_text,
-        redacted_highlight=redacted_highlight,
-        mapping_review_toolbar=mapping_review_toolbar,
-        sample_summary_panel=sample_summary_panel,
-        original_text=original_text,
-        map_json=map_json,
-        review_candidate_texts_json=review_candidate_texts_json,
-        debug_json=debug_json,
-        discord_thread_url=discord_thread_url,
-        case_root=case_root,
-        case_folder=case_folder,
-        source_dir=source_dir,
-        redaction_map=redaction_map,
-        mapping_edit_rows=mapping_edit_rows,
-        review_html=review_html,
-    )
-
-
+    discord_create_section = "" if disable_discord else _discord_create_thread_section(discord_thread_url=discord_thread_url, case_root=case_root, case_folder=case_folder, source_dir=source_dir or save_dir, filename=redacted_filename, textarea_id="redacted-output", map_textarea_id="mapping-json-output", message_id="discord-create-message")
+    discord_section = "" if disable_discord else _discord_send_section(discord_thread_url, redacted_filename, "redacted-output", "discord-message")
+    bundle_json = _documents_bundle_json([document], sources=[source_document]) if document and source_document else ""
+    return render_redaction_result_page(title=title, redacted_filename=redacted_filename, redacted_url=redacted_url, map_url=map_url, debug_url=debug_url, workflow_panel=workflow_panel, default_dir=default_dir, redacted_filename_json=json.dumps(redacted_filename, ensure_ascii=False), save_dir=save_dir, discord_create_section=discord_create_section, discord_section=discord_section, leaks_html=leaks_html, warnings_html=warnings_html, recognition_summary=_render_recognition_stats(recognition_stats), original_highlight=_highlight_replaced_text(original_text, redaction_map.mappings), redacted_text=redacted_text, redacted_highlight=_highlight_replaced_text(redacted_text, redaction_map.mappings, reverse=True), mapping_review_toolbar=_render_mapping_review_toolbar(redaction_map, review_candidates), sample_summary_panel=_render_sample_summary_panel(), original_text=original_text, map_json=map_json, review_candidate_texts_json=_review_candidate_texts_json(review_candidates), debug_json=debug_json, discord_thread_url=discord_thread_url, case_root=case_root, case_folder=case_folder, source_dir=source_dir, redaction_map=redaction_map, mapping_edit_rows=mapping_edit_rows, review_html="".join("<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.2f}</td><td>{}</td></tr>".format(html.escape(c.type), html.escape(c.text), html.escape(c.source), c.confidence, html.escape(c.reason or "")) for c in review_candidates), bundle_json=bundle_json)
 def _render_batch_redaction_result(
     title: str,
     documents: list[RedactedDocument],
@@ -2237,18 +2182,26 @@ def _render_batch_redaction_result(
     case_folder: str = "",
     source_dir: str = "",
     recognition_stats: RecognitionRunStats | None = None,
+    source_documents: list[InputDocument] | None = None,
 ) -> str:
     default_dir = save_dir.strip() or os.path.expanduser("~/Desktop")
 
-    # 构建各个独立文件的脱敏文本列表供 JS 使用
     individual_files = []
+    used_names: dict[str, int] = {}
     for index, document in enumerate(documents, start=1):
-        out_name = f"document-{index}.redacted.txt"
-        individual_files.append({"filename": out_name, "content": document.redacted_text})
+        if document.output_bytes is not None:
+            stem = PurePosixPath(document.source_file.replace("\\", "/")).stem or "redacted"
+            base_name = f"{stem}.redacted.xlsx"
+            used_names[base_name] = used_names.get(base_name, 0) + 1
+            count = used_names[base_name]
+            out_name = base_name if count == 1 else f"{stem}-{count}.redacted.xlsx"
+            individual_files.append({"filename": out_name, "mime": XLSX_MEDIA_TYPE, "base64": base64.b64encode(document.output_bytes).decode("ascii")})
+        else:
+            out_name = f"document-{index}.redacted.txt"
+            individual_files.append({"filename": out_name, "content": document.redacted_text, "mime": "text/plain"})
     individual_files_json = json.dumps(individual_files, ensure_ascii=False)
-
     map_json = redaction_map_to_json(redaction_map)
-    bundle_json = _documents_bundle_json(documents)
+    bundle_json = _documents_bundle_json(documents, sources=source_documents or [InputDocument(d.source_file, d.original_text) for d in documents])
     combined_redacted = "\n\n".join(d.redacted_text for d in documents)
     from .debug_trace import debug_trace_from_parts, debug_trace_to_json
 
@@ -2278,7 +2231,8 @@ def _render_batch_redaction_result(
     combined_filename = "batch.redacted.txt"
     combined_filename_json = json.dumps(combined_filename, ensure_ascii=False)
     redacted_url = _data_download(combined_filename, "text/plain", combined_redacted)
-    discord_create_section = _discord_create_thread_section(
+    disable_discord = any(document.output_bytes is not None for document in documents)
+    discord_create_section = "" if disable_discord else _discord_create_thread_section(
         discord_thread_url=discord_thread_url,
         case_root=case_root,
         case_folder=case_folder,
@@ -2288,7 +2242,7 @@ def _render_batch_redaction_result(
         map_textarea_id="mapping-json-output",
         message_id="discord-create-message-batch",
     )
-    discord_section = _discord_send_section(discord_thread_url, combined_filename, "redacted-output", "discord-message-batch")
+    discord_section = "" if disable_discord else _discord_send_section(discord_thread_url, combined_filename, "redacted-output", "discord-message-batch")
     workflow_panel = _render_case_workflow_panel(
         case_root=case_root,
         case_folder=case_folder,
@@ -2298,14 +2252,23 @@ def _render_batch_redaction_result(
     mapping_review_toolbar = _render_mapping_review_toolbar(redaction_map, review_candidates)
     sample_summary_panel = _render_sample_summary_panel()
     review_candidate_texts_json = _review_candidate_texts_json(review_candidates)
-    doc_sections = "".join(
-        f'<article class="doc-result">'
-        f'<h3>{html.escape(d.source_file)}</h3>'
-        f'<h4>原文高亮</h4><div class="highlight-box original-highlight selection-add-source">{_highlight_replaced_text(d.original_text, redaction_map.mappings)}</div>'
-        f'<h4>脱敏文</h4><div class="highlight-box redacted-highlight">{_highlight_replaced_text(d.redacted_text, redaction_map.mappings, reverse=True)}</div>'
-        f'</article>'
-        for d in documents
-    )
+    doc_sections_parts: list[str] = []
+    for index, document in enumerate(documents):
+        if document.output_bytes is not None:
+            item = individual_files[index]
+            filename = str(item["filename"])
+            link = _binary_download(XLSX_MEDIA_TYPE, document.output_bytes)
+            download_html = f'<p><a class="btn" data-no-intercept="true" download="{html.escape(filename, quote=True)}" href="{link}">下载脱敏 Excel</a></p>'
+        else:
+            filename = str(individual_files[index]["filename"])
+            link = _data_download(filename, "text/plain", document.redacted_text)
+            download_html = f'<p><a class="btn" data-no-intercept="true" download="{html.escape(filename, quote=True)}" href="{link}">下载脱敏文本</a></p>'
+        doc_sections_parts.append(
+            f'<article class="doc-result"><h3>{html.escape(document.source_file)}</h3>{download_html}'
+            f'<h4>原文高亮</h4><div class="highlight-box original-highlight selection-add-source">{_highlight_replaced_text(document.original_text, redaction_map.mappings)}</div>'
+            f'<h4>脱敏文</h4><div class="highlight-box redacted-highlight">{_highlight_replaced_text(document.redacted_text, redaction_map.mappings, reverse=True)}</div></article>'
+        )
+    doc_sections = "".join(doc_sections_parts)
     mapping_edit_rows = _render_mapping_edit_rows(redaction_map, review_candidates)
     return render_batch_redaction_result_page(
         title=title,
@@ -2443,9 +2406,9 @@ def _resolve_case_location(upload_source_dir: str, source_files: list[str], uplo
     source_dir = upload_source_dir.strip()
     if source_dir:
         return suggest_case_location_from_filenames(source_files, source_dir=source_dir)
-    relative_suggestion = _suggest_case_location_from_relative_paths(upload_relative_paths)
-    if relative_suggestion.get("status") == "ok":
-        return relative_suggestion
+    relative_paths = _safe_upload_relative_paths(upload_relative_paths)
+    if relative_paths:
+        return _suggest_case_location_from_relative_paths(relative_paths)
     suggestion = suggest_case_location_from_filenames(source_files)
     if suggestion.get("status") == "ok":
         return suggestion
@@ -2481,14 +2444,14 @@ def _suggest_case_location_from_relative_paths(
             "evidence": [{"kind": "ambiguous_case_directory", "count": len(unique_dirs)}],
         }
 
-    if unique_dirs:
-        result = _case_folder_hint_summary(unique_dirs[0].parent, case_folder, matched_dir=unique_dirs[0])
-        result["confidence"] = 0.98
-    else:
-        root = Path(roots[0]).expanduser() if roots else default_case_root()
-        result = _case_folder_hint_summary(root, case_folder)
-        result["confidence"] = 0.86
-
+    if not unique_dirs:
+        return {
+            "status": "not_found",
+            "workflow_state": "not_saved",
+            "evidence": [{"kind": "upload_relative_path", "case_folder": case_folder}],
+        }
+    result = _case_folder_hint_summary(unique_dirs[0].parent, case_folder, matched_dir=unique_dirs[0])
+    result["confidence"] = 0.98
     result["status"] = "ok"
     result["evidence"] = [
         {"kind": "upload_relative_path", "case_folder": case_folder},
@@ -2979,39 +2942,31 @@ async def _read_input_documents(
     files: list[UploadFile],
     case_folder_files: list[UploadFile] | None = None,
 ) -> list[InputDocument]:
-    documents = []
+    documents: list[InputDocument] = []
     if text.strip():
         documents.append(InputDocument(source_file="粘贴文本.txt", text=text))
-
-    target_files = []
+    target_files: list[UploadFile] = []
     if file and file.filename:
         target_files.append(file)
-    if files:
-        target_files.extend([f for f in files if f.filename])
-    folder_target_files = [
-        item
-        for item in (case_folder_files or [])
+    target_files.extend(f for f in files if f.filename)
+    target_files.extend(
+        item for item in (case_folder_files or [])
         if item.filename and _is_supported_folder_upload_filename(item.filename)
-    ]
-
+    )
     for item in target_files:
+        name = str(item.filename)
+        data = await item.read()
+        suffix = _suffix_for_filename(name)
         try:
-            content = await _read_upload_text(item)
+            if suffix in EXCEL_INPUT_SUFFIXES:
+                content = extract_workbook_text(data, name)
+                documents.append(InputDocument(name, content, data, suffix))
+            else:
+                documents.append(InputDocument(name, _read_upload_text_from_bytes(data, name)))
         except ValueError:
             raise
         except Exception as exc:
-            raise ValueError(f"读取文件 {item.filename} 失败: {exc}") from exc
-        documents.append(InputDocument(source_file=item.filename, text=content))
-
-    for item in folder_target_files:
-        try:
-            content = await _read_upload_text(item)
-        except ValueError:
-            raise
-        except Exception as exc:
-            raise ValueError(f"读取文件 {item.filename} 失败: {exc}") from exc
-        documents.append(InputDocument(source_file=item.filename, text=content))
-
+            raise ValueError(f"读取文件 {name} 失败: {exc}") from exc
     if not documents:
         raise ValueError("未提供任何待脱敏的文本或文件")
     return documents
@@ -3101,23 +3056,22 @@ async def _read_restore_map_text(map_json: str, map_file: UploadFile | None) -> 
         raise ValueError("请提供有效的映射表内容或文件")
     return map_text
 
-async def _read_upload_text(file: UploadFile) -> str:
-    data = await file.read()
-    suffix = _suffix_for_filename(file.filename)
+def _read_upload_text_from_bytes(data: bytes, filename: str) -> str:
+    suffix = _suffix_for_filename(filename)
     if suffix in (".txt", ".md"):
-        return _decode_text_bytes(data, file.filename)
+        return _decode_text_bytes(data, filename)
     if suffix == ".docx":
         try:
             return _docx_bytes_to_text(data)
         except BadZipFile as exc:
             raise ValueError(
-                f"读取文件 {file.filename} 失败: 该文件不是有效的 .docx。"
+                f"读取文件 {filename} 失败: 该文件不是有效的 .docx。"
                 "如果它是旧版 .doc、RTF、WPS 格式或文件已损坏，请先用 Word/WPS 另存为标准 .docx，或导出为 .txt 后再上传。"
             ) from exc
         except Exception as exc:
-            raise ValueError(f"读取文件 {file.filename} 失败: {exc}") from exc
+            raise ValueError(f"读取文件 {filename} 失败: {exc}") from exc
     if suffix == ".doc":
-        return _legacy_doc_bytes_to_text(data, file.filename)
+        return _legacy_doc_bytes_to_text(data, filename)
     if suffix == ".pdf":
         try:
             from pypdf import PdfReader
@@ -3125,13 +3079,16 @@ async def _read_upload_text(file: UploadFile) -> str:
             raise ValueError("读取 pdf 需要安装 pypdf：pip install pypdf") from exc
         try:
             reader = PdfReader(BytesIO(data))
-            text = []
-            for page in reader.pages:
-                text.append(page.extract_text() or "")
-            return "\n".join(text)
+            return "\n".join(page.extract_text() or "" for page in reader.pages)
         except Exception as exc:
-            raise ValueError(f"读取文件 {file.filename} 失败: PDF 格式无效或文件已损坏") from exc
+            raise ValueError(f"读取文件 {filename} 失败: PDF 格式无效或文件已损坏") from exc
     return ""
+
+
+async def _read_upload_text(file: UploadFile) -> str:
+    data = await file.read()
+    return _read_upload_text_from_bytes(data, file.filename)
+
 
 def _redaction_map_from_rows(
     version: str, created_at: str, mode: str, source_file: str,
@@ -3472,8 +3429,18 @@ def _binary_download(mime: str, content: bytes) -> str:
     return f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}"
 
 
-def _documents_bundle_json(documents: list[RedactedDocument]) -> str:
-    return json.dumps([{"source_file": d.source_file, "text": d.original_text} for d in documents], ensure_ascii=False)
+def _documents_bundle_json(documents: list[RedactedDocument], sources: list[InputDocument] | None = None) -> str:
+    source_items = sources or [InputDocument(d.source_file, d.original_text) for d in documents]
+    payload = []
+    for source in source_items:
+        source_suffix = source.source_suffix if source.source_suffix in EXCEL_INPUT_SUFFIXES else ".txt"
+        payload.append({
+            "source_file": source.source_file,
+            "text": source.text,
+            "source_suffix": source_suffix,
+            "source_base64": base64.b64encode(source.source_bytes).decode("ascii") if source.source_bytes is not None else "",
+        })
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _documents_from_bundle_json(value: str) -> list[InputDocument]:
@@ -3481,19 +3448,44 @@ def _documents_from_bundle_json(value: str) -> list[InputDocument]:
         return []
     try:
         payload = json.loads(value)
-    except json.JSONDecodeError:
-        return []
+    except json.JSONDecodeError as exc:
+        raise ValueError("Excel 源文件状态无效，请重新上传") from exc
     if not isinstance(payload, list):
-        return []
-    return [
-        InputDocument(source_file=str(item.get("source_file", "")), text=str(item.get("text", "")))
-        for item in payload
-        if isinstance(item, dict)
-    ]
+        raise ValueError("Excel 源文件状态无效，请重新上传")
+    documents: list[InputDocument] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            raise ValueError("Excel 源文件状态无效，请重新上传")
+        source_file = str(item.get("source_file") or "")
+        text = str(item.get("text") or "")
+        suffix = str(item.get("source_suffix") or ".txt").lower()
+        encoded = str(item.get("source_base64") or "")
+        if suffix in EXCEL_INPUT_SUFFIXES:
+            if not encoded or not source_file.lower().endswith(suffix):
+                raise ValueError("Excel 源文件状态无效，请重新上传")
+            try:
+                source_bytes = base64.b64decode(encoded, validate=True)
+                if extract_workbook_text(source_bytes, source_file) != text:
+                    raise ValueError
+            except Exception as exc:
+                raise ValueError("Excel 源文件状态无效，请重新上传") from exc
+            documents.append(InputDocument(source_file, text, source_bytes, suffix))
+        else:
+            documents.append(InputDocument(source_file, text))
+    return documents
 
 
 def _apply_map_to_documents(pipeline: RedactionPipeline, documents: list[InputDocument], redaction_map: RedactionMap) -> list[RedactedDocument]:
-    return [RedactedDocument(source_file=d.source_file, original_text=d.text, redacted_text=pipeline.apply_redaction_map(d.text, redaction_map), leaks=pipeline.scan_high_risk_leaks(pipeline.apply_redaction_map(d.text, redaction_map))) for d in documents]
+    result: list[RedactedDocument] = []
+    for document in documents:
+        redacted_text = pipeline.apply_redaction_map(document.text, redaction_map)
+        result.append(RedactedDocument(
+            source_file=document.source_file,
+            original_text=document.text,
+            redacted_text=redacted_text,
+            leaks=pipeline.scan_high_risk_leaks(redacted_text),
+        ))
+    return result
 
 
 def _highlight_replaced_text(text: str, entries: list[MappingEntry], *, reverse: bool = False) -> str:

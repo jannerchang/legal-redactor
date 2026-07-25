@@ -234,7 +234,7 @@ def _page(title: str, body: str) -> str:
           return msg;
         }}
         function uploadSuffix(name){{var i=String(name||'').lastIndexOf('.');return i>=0?String(name).slice(i).toLowerCase():'.txt';}}
-        function isSupportedUpload(name){{return ['.txt','.md','.doc','.docx','.pdf'].indexOf(uploadSuffix(name))>=0&&String(name||'').split('/').pop().indexOf('._')!==0;}}
+        function isSupportedUpload(name){{return ['.txt','.md','.doc','.docx','.pdf','.xlsx','.xlsm'].indexOf(uploadSuffix(name))>=0&&String(name||'').split('/').pop().indexOf('._')!==0;}}
         function fileList(input){{return Array.prototype.slice.call((input&&input.files)||[]);}}
         function selectedUploadItems(){{return uploadSelection.items.filter(function(item){{return item&&item.checked&&item.file;}});}}
         function syncRelativePaths(){{
@@ -354,13 +354,13 @@ def _page(title: str, body: str) -> str:
               }}
               if(sourceDir&&data.matched_dir)sourceDir.value=data.matched_dir||'';
               if(discordUrl&&!discordUrl.value.trim()&&data.discord_thread_url)discordUrl.value=data.discord_thread_url;
-              toast(data.discord_thread_url?'已识别案件目录和 Discord 链接: '+data.case_folder:'已识别案件目录: '+data.case_folder);
+              toast(data.discord_thread_url?'已识别原案件目录和 Discord 链接: '+data.case_folder:'已识别原案件目录: '+data.case_folder);
             }}else if(data.status==='conflict'){{
               toast(data.conflict_message||'案件目录或 Discord 链接存在冲突，请手动确认','warn');
             }}else if(data.status==='ambiguous'){{
-              toast('匹配到多个案件目录，请手动填写案件文件夹名和根目录','warn');
+              toast('匹配到多个原案件目录，请手动填写原文件所在目录','warn');
             }}else if(data.status==='not_found'){{
-              toast('未能自动识别案件目录，请手动填写','warn');
+              toast('未找到对应的原案件目录，不会自动写入其他案件目录','warn');
             }}
           }}catch(err){{
             console.debug(err);
@@ -385,7 +385,7 @@ def _page(title: str, body: str) -> str:
           }});
           renderUploadFileList();
           if(!supported.length){{
-            if(isDirectory&&all.length)toast('案件文件夹中没有可处理的 txt/md/doc/docx/pdf 文书','warn');
+            if(isDirectory&&all.length)toast('案件文件夹中没有可处理的 txt/md/doc/docx/pdf/xlsx/xlsm 文书','warn');
             return;
           }}
           suggestCaseFromSelection(isDirectory);
@@ -939,10 +939,10 @@ def render_home_page(
           <h2>脱敏</h2>
           <form id="redact-form" action="/redact" method="post" enctype="multipart/form-data">
             <label>文书内容</label>
-            <textarea name="text" id="text-input" rows="12" placeholder="粘贴文书原文，或拖拽 txt/md/doc/docx/pdf 文件到此处"></textarea>
+              <textarea name="text" id="text-input" rows="12" placeholder="粘贴文书原文，或拖拽 txt/md/doc/docx/pdf/xlsx/xlsm 文件到此处"></textarea>
             <div class="upload-picker">
-              <input type="file" id="source-files" name="files" accept=".txt,.md,.doc,.docx,.pdf" multiple>
-              <input type="file" id="source-directory-files" name="case_folder_files" accept=".txt,.md,.doc,.docx,.pdf" webkitdirectory directory multiple>
+              <input type="file" id="source-files" name="files" accept=".txt,.md,.doc,.docx,.pdf,.xlsx,.xlsm" multiple>
+              <input type="file" id="source-directory-files" name="case_folder_files" accept=".txt,.md,.doc,.docx,.pdf,.xlsx,.xlsm" webkitdirectory directory multiple>
               <button type="button" class="btn btn-secondary btn-sm" data-upload-target="source-files">选择文件</button>
               <button type="button" class="btn btn-secondary btn-sm" data-upload-target="source-directory-files">选择案件文件夹</button>
             </div>
@@ -979,14 +979,14 @@ def render_home_page(
             <fieldset class="case-workflow-fields">
               <legend>案件工作流（选填）</legend>
               <label>案件文件夹名</label>
-              <input type="text" id="case-folder-input" name="case_folder" placeholder="例如：2025 8765">
+              <input type="text" id="case-folder-input" name="case_folder" placeholder="自动识别；仅在无法识别时填写">
               <label>Discord 帖子链接</label>
               <input type="url" id="discord-thread-url-input" name="discord_thread_url" placeholder="可留空，脱敏完成后可请求 Hermes 新建并回写 Discord 链接">
               <label>案件库根目录</label>
               <input type="text" id="case-root-input" name="case_root" value="{html.escape(default_root_str)}" data-auto-value="{html.escape(default_root_str, quote=True)}">
               <label>原文件所在目录</label>
-              <input type="text" id="upload-source-dir-input" name="upload_source_dir" value="" placeholder="可选：自动识别失败时粘贴完整案件目录">
-              <p class="hint">浏览器不会提供上传文件的本机绝对路径，所以系统会用文件名在案件库中反查目录。自动识别失败时，可在“原文件所在目录”粘贴完整目录。若未填写 Discord 链接，脱敏结果页可请求 Hermes 新建案件帖并通过 MCP 写回链接；映射表不会上传到 Discord。</p>
+              <input type="text" id="upload-source-dir-input" name="upload_source_dir" value="" placeholder="目录上传会自动绑定原案件目录；选择文件时可手动填写">
+              <p class="hint">选择“案件文件夹”上传时，系统用目录相对路径优先识别已有原案件目录，并把 manifest、脱敏结果、映射表和还原信息写回该原目录；不会另建默认案件目录。识别失败时才需要填写案件文件夹名和原文件所在目录。若未填写 Discord 链接，结果页仍可请求 Hermes 建帖。</p>
             </fieldset>
             <div class="redact-submit-row">
               <button type="submit" class="btn btn-primary" id="redact-submit-btn">一键脱敏</button>
@@ -1059,13 +1059,14 @@ def render_redaction_result_page(
     redaction_map,
     mapping_edit_rows,
     review_html,
+    bundle_json="",
 ):
     return _page(
         title,
         f"""
         <nav><a href="/">返回首页</a></nav>
         <div class="downloads">
-          <a download="{html.escape(redacted_filename)}" href="{redacted_url}" class="btn">下载脱敏文本</a>
+          <a download="{html.escape(redacted_filename)}" href="{redacted_url}" class="btn" data-no-intercept="true">{'下载脱敏 Excel' if redacted_filename.lower().endswith('.xlsx') else '下载脱敏文本'}</a>
           <a download="redaction_map.json" href="{map_url}" class="btn btn-secondary" onclick="prepareCurrentMapDownload(this)">下载 redaction_map</a>
           <a href="{debug_url}" download="debug_trace.json" class="debug-link">诊断文件</a>
           <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制脱敏文本</button>
@@ -1097,7 +1098,7 @@ def render_redaction_result_page(
           {sample_summary_panel}
           <form id="mapping-edit-form" action="/redact/apply-edited-map" method="post">
             <textarea name="original_text" class="hidden-raw">{html.escape(original_text)}</textarea>
-            <textarea name="original_bundle_json" class="hidden-raw"></textarea>
+            <textarea name="original_bundle_json" class="hidden-raw">{html.escape(bundle_json)}</textarea>
             <textarea id="mapping-json-output" name="original_mapping_json" class="hidden-raw">{html.escape(map_json)}</textarea>
             <textarea id="mapping-review-candidates" class="hidden-raw">{html.escape(review_candidate_texts_json)}</textarea>
             <textarea id="debug-trace-output" class="hidden-raw">{html.escape(debug_json)}</textarea>

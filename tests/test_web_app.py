@@ -2566,6 +2566,37 @@ def test_mapping_edit_rows_include_immutable_pre_edit_original():
     assert 'name="map_restore_original" value=""' in existing_row
 # ── Security: XSS prevention in _diagnose_sample_entry ──────────────────
 
+def test_excel_upload_controls_and_folder_filter_stay_aligned():
+    from legal_redactor.web_templates import render_home_page
+    from legal_redactor.web_app import SUPPORTED_UPLOAD_SUFFIXES, _is_supported_folder_upload_filename
+
+    html = render_home_page("", "", "", "", [], "")
+    assert ".xlsx,.xlsm" in html
+    assert {".xlsx", ".xlsm"}.issubset(SUPPORTED_UPLOAD_SUFFIXES)
+    assert _is_supported_folder_upload_filename("2026 1/source.xlsx")
+    assert _is_supported_folder_upload_filename("2026 1/source.xlsm")
+    assert not _is_supported_folder_upload_filename("2026 1/source.xls")
+
+
+def test_directory_upload_prefers_existing_original_case_folder_for_persistence(tmp_path):
+    case_dir = tmp_path / "2026 8888"
+    case_dir.mkdir()
+    result = _suggest_case_location_from_relative_paths(
+        ["2026 8888/judgment.xlsx"], [tmp_path]
+    )
+    assert result["case_folder"] == "2026 8888"
+    assert result["matched_dir"] == str(case_dir.resolve())
+def test_relative_folder_not_found_does_not_fallback_to_same_filename(tmp_path):
+    from pathlib import Path
+    from legal_redactor.web_app import _resolve_case_location
+
+    wrong_case = tmp_path / "2026 1111"
+    wrong_case.mkdir()
+    (wrong_case / "judgment.xlsx").write_bytes(b"placeholder")
+    with patch("legal_redactor.web_app.case_location_search_roots", return_value=[tmp_path]):
+        result = _resolve_case_location("", ["judgment.xlsx"], '["2026 9999/judgment.xlsx"]')
+    assert result["status"] == "not_found"
+
 class TestDiagnoseSampleEntryXSS:
     """Ensure user-controlled sample values are HTML-escaped in diagnosis output."""
 
