@@ -167,7 +167,7 @@ def test_manager_starts_worker_without_inheriting_output(tmp_path: Path, monkeyp
     assert calls[0][0][calls[0][0].index("--model") + 1] == str(model_path)
     assert calls[0][0][calls[0][0].index("--max-tokens") + 1] == "8192"
     assert manager._startup_timeout_seconds == 1
-    assert manager._request_timeout_seconds == 300
+    assert manager._request_timeout_seconds == 660
 
     manager.shutdown()
 

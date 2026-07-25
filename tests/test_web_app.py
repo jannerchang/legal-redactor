@@ -1840,9 +1840,13 @@ class WebAppUploadTests(unittest.TestCase):
             },
         ]
 
-        with patch("legal_redactor.web_app._discord_bot_token", return_value="token"):
-            with patch("legal_redactor.web_app._get_discord_json", side_effect=responses):
-                thread_url = _find_discord_thread_for_case("2026 4343", "房屋买卖合同纠纷")
+        with (
+            patch("legal_redactor.web_app.load_json_config", return_value={}),
+            patch("legal_redactor.web_app._discord_command_channel_id", return_value="command-channel"),
+            patch("legal_redactor.web_app._discord_bot_token", return_value="token"),
+            patch("legal_redactor.web_app._get_discord_json", side_effect=responses),
+        ):
+            thread_url = _find_discord_thread_for_case("2026 4343", "房屋买卖合同纠纷")
 
         self.assertEqual(thread_url, "https://discord.com/channels/guild-1/222")
 

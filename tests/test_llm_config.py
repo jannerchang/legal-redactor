@@ -71,7 +71,7 @@ def test_balanced_config_targets_same_manager_model() -> None:
 
     assert config.llm.model == QWEN_MODEL_ID
     assert config.llm.context_window == 8192
-    assert config.llm.full_document_timeout_seconds == 240
+    assert config.llm.full_document_timeout_seconds == 600
 
 
 def test_from_llm_mode_accepts_registered_model_choice() -> None:
