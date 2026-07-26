@@ -120,7 +120,7 @@ manager component state:
 - Web/API local config: `LEGAL_REDACTOR_API_CONFIG`, default
   `~/.config/legal-redactor/api.local.json`
 - Local model API: `LEGAL_REDACTOR_MODEL_MANAGER_HOST` / `PORT`, default
-  `http://127.0.0.1:18080`; the registered logical model ID is `bonsai-27b`
+  `http://127.0.0.1:18080`; the registered logical model ID is `qwen3.5-9b`
 - MLX worker: `LEGAL_REDACTOR_MLX_WORKER_HOST` / `PORT`, default
   `127.0.0.1:18081`, owned and started lazily by the manager only
 - Case root: `LEGAL_REDACTOR_CASE_ROOT` or the default local case root

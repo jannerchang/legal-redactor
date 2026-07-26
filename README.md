@@ -17,35 +17,41 @@
 > 律师的专业判断，也不得用于未经授权的案件材料。未公开材料不得发送到公共 AI 或未经批准的
 > 第三方服务；使用者应自行遵守保密、数据安全、个人信息保护及所在机构的内部制度。
 
+## v0.2.2 单一认证模型与行政区划深度策略
+
+`v0.2.2` 将业务模型收敛为经过真实全文验证的 `qwen3.5-9b`，不再注册或发现 27B/2-bit 模型；同时明确全国行政区划自动处理至地级、河北权威数据库继续深入区县与乡镇/街道。
+
+- Web、CLI、模型管理器和识别基准只暴露 `qwen3.5-9b`，避免长全文处理被低收益的慢速模型阻塞。
+- 全国数据库自动识别省级和地级行政区；河北数据库继续自动识别至区县、县级市、乡镇和街道。
+- LLM 地点补充只接受省级和地级名称，区县以下不由模型猜测。
+
 ## v0.2.1 全文生成稳定性与架构保护
 
 `v0.2.1` 完整保留 `v0.2.0` 的双轮全文 LLM 识别架构，并修复模型在完成实体登记 JSON 后仍继续生成、最终耗尽输出预算或达到请求超时的问题。
 
 - 全文初次登记、JSON 修复和二次补漏统一使用单行紧凑 JSON 与换行停止序列；仅对确属截断的 JSON 做不虚构实体文本的结构闭合。
 - 实体名称必须逐字存在于原文，span 由本地代码重新定位；冲突与不确定实体只进入复核，`do_not_merge` 约束继续穿透映射与后处理。
-- `CandidateCollector`、`LinearRuleEngine`、`RedactionPipeline` 和 `apply_mappings` 的模块责任及固定逐句降级链写入架构决策记录并由回归测试保护。
+- `CandidateCollector`、`LinearRuleEngine`、`RedactionPipeline` 和 `apply_mappings` 的模块责任及全文失败关闭契约写入架构决策记录并由回归测试保护。
 
 ## v0.2.0 全文识别更新
 
 `v0.2.0` 默认使用 `qwen3.5-9b` 执行整篇文书双轮识别：首轮建立案件级实体登记表，第二轮重新阅读全文补充遗漏实体与明确的同一主体关系，再校验所有名称确实逐字存在于原文后生成确定性映射。
 
-- Web、CLI 与配置工厂默认统一为 `full_document` 和 `qwen3.5-9b`，仍可按次切换模型或回退逐句窗口。
-- 人名与机构采用两轮合并登记；身份证号、电话、银行账号、案号及通过 gate 的行政区划继续走确定性规则。
-- 第二轮失败时保留首轮有效结果；首轮失败、无效或超过 120000 字符时明确回退逐句窗口，不截断原文。
+- Web、CLI 与配置工厂统一为 `full_document` 和 `qwen3.5-9b`，仍可按次切换已注册模型。
+- 人名与机构采用两轮合并登记；身份证号、电话、银行账号、案号及 SQLite 行政区划数据库继续提供确定性安全能力。
+- 第二轮失败时保留首轮有效结果；首轮失败、无效或超过 120000 字符时停止生成，不截断原文，也不保存或发送新的脱敏 artifact。
 - ModelManager 继续只接收逻辑模型 ID，支持模型切换回滚与 worker 自愈，不向应用或页面暴露权重路径。
 - TXT 下载加入 UTF-8 BOM，兼容按系统默认编码打开中文文本的编辑器。
 
-此前 `v0.1.2` 完成的候选发现、实体确认与流程编排分层仍保持不变：`CandidateCollector.collect(context)` 是候选发现入口，`LinearRuleEngine.discover(...)` 负责候选接受和映射扩展，`RedactionPipeline.redact` / `redact_many` 负责编排与降级。
+此前 `v0.1.2` 完成的候选接受与流程编排边界仍保持不变：`CandidateCollector.collect(context)` 统一全文登记与权威数据库候选，`LinearRuleEngine.discover(...)` 只负责候选接受和映射扩展，`RedactionPipeline.redact` / `redact_many` 负责编排与失败关闭。
 
 ## 工作原理
 
-系统不是先对全文制造大量疑似候选再逐个排除，而是采用线性规则发现：
-
-1. 从文首读取到事实认定部分结束。
-2. 读到明确的人名、行政区划或机构全称时确认实体。
-3. 立即建立该实体的全称和常见简称替换规则。
-4. 继续向后阅读，已经确认的实体不再重复猜测。
-5. 读完后按长词优先统一执行全文替换。
+1. 本地全文 LLM 两次独立阅读全文，建立并补充案件级人名、机构和地点登记。
+2. 程序逐字校验登记名称、冲突、`uncertain` 和 `do_not_merge`，所有 span 都在本地重新定位。
+3. 身份证号、电话、银行账号、案号以及 SQLite 行政区划数据库继续提供确定性安全能力。
+4. `CandidateCollector` 汇总允许的候选，`LinearRuleEngine` 验收并扩展确定性替换规则。
+5. 读完后只由 `apply_mappings` 按长词优先统一执行全文替换；生成的假名不会干扰识别。
 
 实现中不会真的反复改写原文。系统先累积替换表，最后统一替换，
 这样生成的假名不会干扰后续阅读。
@@ -76,7 +82,7 @@
 
 ## 脱敏策略
 
-默认自动范围是人名、机构/公司名、行政区划的省/市/区县、身份证号、手机号和案号省份简称映射。街道及以下地点、详细地址、项目/工程/楼盘、银行账号、统一社会信用代码和邮箱保留原文；需要处理时在映射审核页手动选取添加。
+默认自动范围是人名、机构/公司名、身份证号、手机号和案号省份简称映射。行政区划采用分层策略：全国权威库只自动识别和脱敏省级、地级市；河北权威库继续自动处理区县及乡镇/街道。村、社区、详细地址、项目/工程/楼盘、银行账号、统一社会信用代码和邮箱保留原文；需要处理时在映射审核页手动选取添加。
 
 ### 法院名与案号的特殊过滤规则
 
@@ -96,11 +102,11 @@
 - Python：3.13.2（项目 `.venv`）
 - 本地模型 API：`model-manager`，默认 `127.0.0.1:18080`
 - 默认逻辑模型 ID：`qwen3.5-9b`（展示名：Qwen3.5 9B（MLX 4-bit））
-- 已注册可选模型还包括 `bonsai-27b`（展示名：Ternary Bonsai 27B（MLX 2-bit））
+- 认证模型仅包括 `qwen3.5-9b`；27B/2-bit 模型不再注册或出现在业务模型列表中
 - 默认 Web 端口：`127.0.0.1:7860`
 - Office 私网还原 API：建议绑定 `127.0.0.1:8787`，通过 SSH 反向隧道暴露到 Home Mac 的 `127.0.0.1:18787`
 
-应用和 Web 表单只向本地 `model-manager` 发送逻辑模型 ID。管理器通过 OpenAI-compatible `GET /v1/models` 公布当前可用模型，并把每次请求选择的 ID 映射到本机 MLX 权重；切换模型时会卸载当前 worker 后加载所选模型。权重路径不会出现在应用请求或 Web 页面中。模型 API 不可用时，系统明确提示并降级为纯规则模式，仍可完成基础脱敏、映射保存、MCP 还原和 Discord 发帖流程。
+应用和 Web 表单只向本地 `model-manager` 发送逻辑模型 ID。管理器通过 OpenAI-compatible `GET /v1/models` 公布当前可用模型，并把每次请求选择的 ID 映射到本机 MLX 权重；切换模型时会卸载当前 worker 后加载所选模型。权重路径不会出现在应用请求或 Web 页面中。模型 API 或所选模型不可用时，新的脱敏生成会明确停止；已有加密映射的恢复能力不受影响。
 
 ## 安装与启动
 
@@ -116,7 +122,7 @@ cd legal-redactor
 # 浏览器打开 http://127.0.0.1:7860
 ```
 
-`start.sh` 会创建/复用 `.venv`、检查 Web 依赖、复用或启动本地模型管理器，然后启动 WebUI。管理器只在首次推理请求时启动内部 MLX worker；设置 `LEGAL_REDACTOR_SKIP_MLX=1` 会跳过模型 API，并让 Web 使用纯规则模式。
+`start.sh` 会创建/复用 `.venv`、检查 Web 依赖、复用或启动本地模型管理器，然后启动 WebUI。管理器只在首次推理请求时启动内部 MLX worker；设置 `LEGAL_REDACTOR_SKIP_MLX=1` 会跳过模型 API，并使新的脱敏请求以明确错误停止。
 
 首页会显示一个只读系统状态区，也可直接访问机器接口：
 
@@ -135,7 +141,7 @@ Web 支持粘贴文本、拖拽 txt/md、上传 txt/md/doc/docx/pdf、多文件�
 帖子后，脱敏文本和加密映射表会保存到本地案件库，供后续 Hermes/Discord
 还原工作流使用。
 
-首页默认选择“整篇文书（LLM 双轮补漏）”和 `qwen3.5-9b`。本地 LLM 首轮读取完整文书并返回案件级实体登记表，第二轮再次独立阅读全文，只补充首轮遗漏的人名、机构、行政区划及明确的同一主体关系；程序校验所有名称都逐字存在于原文后合并两轮登记、定位全部精确 span，并沿用现有确定性映射与替换流程。首轮成功但补漏失败时保留首轮有效结果；首轮失败、超限或无效登记表时明确回退逐句窗口。行政区划库以及身份证号、电话、银行账号、案号等确定性规则始终保留。全文模式单篇硬上限为 120000 字符，不截断。结果页只展示模式、逻辑模型 ID、状态、文档数、调用数、识别耗时、降级与冲突计数，不展示 prompt、response、实体登记表、证据或模型权重路径。TXT 下载使用 UTF-8 BOM，兼容按系统默认编码打开的编辑器。
+首页默认选择“整篇文书（LLM 双轮补漏）”和 `qwen3.5-9b`。本地 LLM 首轮读取完整文书并返回案件级实体登记表，第二轮再次独立阅读全文，只补充首轮遗漏的人名、机构、行政区划及明确的同一主体关系；程序校验所有名称都逐字存在于原文后合并两轮登记、定位全部精确 span，并沿用现有确定性映射与替换流程。首轮成功但补漏失败时保留首轮有效结果；首轮失败、超限或无效登记表时停止生成，不保存也不发送新的脱敏 artifact。SQLite 行政区划数据库以及身份证号、电话、银行账号、案号等确定性安全能力始终保留；宽泛的任意汉字加行政后缀发现规则已删除。全文模式单篇硬上限为 120000 字符，不截断。结果页只展示模式、逻辑模型 ID、状态、文档数、调用数、识别耗时、降级与冲突计数，不展示 prompt、response、实体登记表、证据或模型权重路径。TXT 下载使用 UTF-8 BOM，兼容按系统默认编码打开的编辑器。
 
 脱敏结果页的映射表带有复核筛选：全部、低置信、手工新增、已修改、删除候选、
 还原风险和样本复用。保存为样本时页面不会跳转，会在当前结果页显示本次保存摘要，
@@ -154,8 +160,8 @@ Web 支持粘贴文本、拖拽 txt/md、上传 txt/md/doc/docx/pdf、多文件�
 # 按统一标准脱敏
 .venv/bin/python -m legal_redactor 文件.txt
 
-# 纯规则（关闭本地 LLM 辅助验证）
-.venv/bin/python -m legal_redactor --llm off 文件.txt
+# 当前认证逻辑模型 ID 固定为 qwen3.5-9b
+.venv/bin/python -m legal_redactor --model qwen3.5-9b 文件.txt
 
 # 指定输出目录
 .venv/bin/python -m legal_redactor -o output/2026-05 文件.txt
@@ -232,7 +238,7 @@ Hermes 工具调用只传协作 thread id 和法律文书草稿；本地工作�
 
 唯一的对外模型端点是 `model-manager`，默认 `http://127.0.0.1:18080`。它公开 OpenAI-compatible `GET /v1/models` 和 `POST /v1/chat/completions`。Web 每次载入页面时读取模型列表，处理文书时提交本次选择的逻辑模型 ID；CLI 可使用 `--model` 指定同一个 ID。浏览器和命令行仍不接受任意权重路径。
 
-管理器启动时会自动扫描 `~/Models/HuggingFace` 和 `~/.cache/huggingface/hub` 中包含 `config.json` 的本地模型；Hugging Face 缓存目录会转换为逻辑 ID，例如 `models--owner--model` 显示为 `owner/model`。因此以后下载到这些目录的新 MLX 模型，重启模型管理器后会自动出现在下拉列表，不需要改代码。内置的 `bonsai-27b` 和 `qwen3.5-9b` 保留更友好的短 ID 与展示名。
+管理器只向 Web/CLI 暴露经过全文实体登记协议验证的模型。当前唯一认证模型为内置逻辑 ID `qwen3.5-9b`；27B/2-bit 与 `mlx-community/Qwen3.5-4B-MLX-4bit` 均不会注册或出现在下拉列表中。本地权重存在不等于业务兼容；新增模型必须先通过真实公开全文的两轮 JSON 登记、原文一致性、性能与 fail-closed 验证，再加入认证列表。
 
 管理器本身通过 `scripts/start_model_manager.sh` 启动或复用。内部 MLX worker 默认仅监听 `127.0.0.1:18081`，由管理器按请求惰性拥有、切换和关闭；不要直接启动 worker。可通过以下环境变量分别覆盖本机监听地址，并可用 `LEGAL_REDACTOR_QWEN_MODEL` 覆盖 Qwen 模型的本地路径或 Hugging Face 仓库 ID：
 
@@ -253,21 +259,12 @@ curl -fsS http://127.0.0.1:18080/v1/chat/completions \
   -d '{"model":"qwen3.5-9b","messages":[{"role":"user","content":"Return exactly {}"}],"stream":false,"temperature":0,"max_tokens":16}'
 ```
 
-管理器或模型不可用时，应用显式使用纯规则模式；不会尝试 Ollama、Open WebUI 或其他后端。LLM 只负责整句实体识别和低置信候选审核，不负责控制全文替换。
+管理器或模型不可用时，应用停止新的脱敏生成；不会尝试纯规则、逐句窗口、Ollama、Open WebUI 或其他后端。模型只负责整篇文书实体登记；最终替换仍由本地确定性映射流程完成。
 
-CLI 可用 `--recognition-mode sentence_windows|full_document` 选择同一识别路径；默认仍为 `sentence_windows`。`full_document` 仅是实验选项，尚未通过人工盲评和配对 benchmark 门禁，因此不会自动成为默认值。要回滚实验路径，只需重新选择或传入 `sentence_windows`，无需改动模型管理器端口或恢复旧后端。
-## HanLP 本地 NER
+CLI 的识别模式固定为 `full_document`；历史 `sentence_windows` 值会被拒绝，不再作为运行时降级路径。
+## 全文 LLM 与确定性候选
 
-Web 脱敏页可启用 HanLP 本地 NER 作为候选生成器。HanLP 只负责补充人名、地名、机构名候选；候选仍会进入现有线性规则、候选消解和 LLM 校验流程，不会直接绕过映射规则。它默认关闭；尚无项目法律文书的配对 gold A/B 证据证明启用后能提升最终 precision、recall 或 F1。
-
-HanLP 是可选依赖，未安装时系统会跳过并继续使用现有规则。当前 HanLP 兼容 `transformers<5`，项目的可选依赖已固定该约束：
-
-```bash
-.venv/bin/pip install '.[hanlp]'
-```
-
-默认模型名为 `MSRA_NER_ELECTRA_SMALL_ZH`。首次启用时 HanLP 会下载本地模型，因此需要预留磁盘空间和网络时间。模型的公开 MSRA F1 不能外推到本项目；完整结论和受控 A/B 协议见 [`docs/research/hanlp-ner-evaluation.md`](docs/research/hanlp-ner-evaluation.md)。
-
+新的人名、机构和一般地点只由全文 LLM 登记。可选 HanLP、标题/当事人解析、兜底人名和本地机构启发式不再参与运行时发现。身份证号、电话、银行账号、案号以及 SQLite 行政区划数据库仍作为确定性安全能力；模型或管理器不可用时直接停止，不以较低质量路径继续生成。
 ## 识别率评估与调试
 
 可以用 gold set JSON 对脱敏结果做 Precision / Recall / F1 评估。gold set
@@ -288,12 +285,10 @@ HanLP 是可选依赖，未安装时系统会跳过并继续使用现有规则�
 }
 ```
 
-运行评估：
+运行评估（需要本地 ModelManager 与所选逻辑模型可用）：
 
 ```bash
 .venv/bin/python -m legal_redactor --eval-gold path/to/gold.json --eval-report output/eval-report.json
-# 或禁用本地 LLM，只评估规则兜底：
-.venv/bin/python -m legal_redactor --llm off --eval-gold path/to/gold.json
 ```
 
 需要把评估结果、样本修正摘要和恢复占位符情况汇总成 M6 回归测量报告时，使用
@@ -303,7 +298,6 @@ HanLP 是可选依赖，未安装时系统会跳过并继续使用现有规则�
 
 ```bash
 .venv/bin/python -m legal_redactor \
-  --llm off \
   --eval-gold path/to/gold.json \
   --eval-fail-under-recall 0.90 \
   --eval-fail-under-precision 0.90 \
@@ -326,7 +320,7 @@ HanLP 是可选依赖，未安装时系统会跳过并继续使用现有规则�
 
 ### M8 运行时基准报告
 
-比较 `mlx_lm.server`、Rapid-MLX、纯规则兜底或其他本地候选时，先为每个候选生成
+比较 `mlx_lm.server`、Rapid-MLX 或其他全文模型运行时时，先为每个候选生成
 同一 gold set / input set / profile 下的 M6 回归报告，再用
 `--runtime-benchmark-report` 生成本地 JSON 基准报告。M8 只给出可复核的候选比较；
 不会自动切换默认模型、`--llm` 默认值或启动脚本。

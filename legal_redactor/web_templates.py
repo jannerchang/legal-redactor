@@ -435,7 +435,7 @@ def _page(title: str, body: str) -> str:
           }}
           if(text)text.textContent='检查本地模型 API…';
           checkModelStatus().then(function(status){{
-            if(status.state!=='ready'&&status.state!=='skipped')toast('本地模型 API 未就绪，将使用纯规则模式','warn');
+            if(status.state!=='ready'&&status.state!=='skipped')toast('本地模型 API 未就绪，新的脱敏将停止生成','warn');
             if(text)text.textContent='上传并读取文书…';
             runRedact();
           }});
@@ -909,7 +909,6 @@ def render_status_panel(payload: dict) -> str:
 def render_home_page(
     status_panel,
     sample_info,
-    hanlp_attr,
     default_root_str,
     model_options,
     default_model_id,
@@ -926,11 +925,11 @@ def render_home_page(
         for item in available_models
     )
     if not model_options_html:
-        model_options_html = '<option value="" selected>暂无可用模型（将使用纯规则）</option>'
+        model_options_html = '<option value="" selected>暂无可用模型（停止新的脱敏生成）</option>'
     model_hint = (
         f"本地模型 API 当前提供 {len(available_models)} 个模型；每次处理都可重新选择。"
         if available_models
-        else "本地模型 API 当前没有可用模型，提交会明确降级为纯规则模式。"
+        else "本地模型 API 当前没有可用模型；系统会停止新的脱敏生成。"
     )
     return _page(
         "本地法律文书脱敏系统",
@@ -953,7 +952,7 @@ def render_home_page(
               </div>
               <div id="upload-file-list-items" class="upload-file-list-items"></div>
             </div>
-            <p class="hint">识别模式默认使用整篇文书双轮补漏；统一标准脱敏：人名、地名、机构名称及敏感编号按同一套规则处理。{html.escape(model_hint)}</p>
+            <p class="hint">识别模式固定使用整篇文书双轮补漏；统一标准脱敏：人名、地名、机构名称及敏感编号按同一套规则处理。{html.escape(model_hint)}</p>
             <input type="hidden" name="recognition_mode" value="full_document">
             <input type="hidden" name="llm_mode" value="max-effect">
             <details class="advanced-options">
@@ -962,13 +961,7 @@ def render_home_page(
               <select id="model-choice" name="model">
                 {model_options_html}
               </select>
-              <p class="hint">整篇文书双轮识别是默认路径；单篇最多 120000 字符，超限或首轮失败时自动回退逐句窗口。切换模型会重载本地 MLX worker，仅影响本次文书。</p>
-              <label class="checkbox-label">
-                <input type="checkbox" name="enable_hanlp" value="1" {hanlp_attr}>
-                <span>启用 HanLP 本地候选识别（占用更多内存）</span>
-              </label>
-              <label>HanLP 模型</label>
-              <input type="text" name="hanlp_model" value="MSRA_NER_ELECTRA_SMALL_ZH">
+              <p class="hint">整篇文书双轮识别是唯一的新识别路径；单篇最多 120000 字符，超限或首轮失败时停止生成，不保存也不发送新的脱敏文件。切换模型会重载本地 MLX worker，仅影响本次文书。</p>
               <label>已有映射表（保持替换一致性）</label>
               <textarea name="base_map_json" rows="3" placeholder="粘贴已有映射表 JSON（可选）"></textarea>
               <label class="file-pill">

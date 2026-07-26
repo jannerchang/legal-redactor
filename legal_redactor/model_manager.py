@@ -19,13 +19,10 @@ from fastapi.responses import Response
 from ._logging import get_logger
 
 
-BONSAI_MODEL_ID = "bonsai-27b"
-BONSAI_MODEL_LABEL = "Ternary Bonsai 27B（MLX 2-bit；长全文不推荐）"
 QWEN_MODEL_ID = "qwen3.5-9b"
 QWEN_MODEL_LABEL = "Qwen3.5 9B（MLX 4-bit；全文默认）"
 DEFAULT_MODEL_ID = QWEN_MODEL_ID
-DEFAULT_MODEL_PATH = Path.home() / "Models/HuggingFace/prism-ml/Ternary-Bonsai-27B-mlx-2bit"
-DEFAULT_QWEN_MODEL_PATH = (
+DEFAULT_MODEL_PATH = DEFAULT_QWEN_MODEL_PATH = (
     Path.home()
     / "Models/HuggingFace/hub/models--mlx-community--Qwen3.5-9B-MLX-4bit"
 )
@@ -64,9 +61,14 @@ SUPPORTED_MODEL_TYPES = frozenset(
 )
 BUILTIN_MODEL_SOURCE_NAMES = frozenset(
     {
-        "Ternary-Bonsai-27B-mlx-2bit",
-        "models--prism-ml--Ternary-Bonsai-27B-mlx-2bit",
         "models--mlx-community--Qwen3.5-9B-MLX-4bit",
+    }
+)
+INCOMPATIBLE_FULL_DOCUMENT_MODEL_IDS = frozenset(
+    {
+        "mlx-community/Qwen3.5-4B-MLX-4bit",
+        "prism-ml/Ternary-Bonsai-27B-mlx-2bit",
+        "Ternary-Bonsai-27B-mlx-2bit",
     }
 )
 _logger = get_logger(__name__)
@@ -128,14 +130,13 @@ class ModelManager:
     def _refresh_models(self) -> None:
         if self._model_discovery is None:
             return
-        discovered = dict(self._model_discovery())
-        discovered[BONSAI_MODEL_ID] = ModelSpec(BONSAI_MODEL_ID, BONSAI_MODEL_LABEL, DEFAULT_MODEL_PATH)
-        discovered[QWEN_MODEL_ID] = ModelSpec(
-            QWEN_MODEL_ID,
-            QWEN_MODEL_LABEL,
-            os.environ.get("LEGAL_REDACTOR_QWEN_MODEL", str(DEFAULT_QWEN_MODEL_PATH)),
-        )
-        self._models = discovered
+        self._models = {
+            QWEN_MODEL_ID: ModelSpec(
+                QWEN_MODEL_ID,
+                QWEN_MODEL_LABEL,
+                os.environ.get("LEGAL_REDACTOR_QWEN_MODEL", str(DEFAULT_QWEN_MODEL_PATH)),
+            )
+        }
 
 
     def models_payload(self) -> dict[str, Any]:
@@ -151,13 +152,22 @@ class ModelManager:
             }
 
     def health_payload(self) -> dict[str, str | None]:
-        with self._lock:
+        acquired = self._lock.acquire(blocking=False)
+        if not acquired:
+            return {
+                "status": "ok",
+                "active_model": self._active_model,
+                "worker_state": "busy",
+            }
+        try:
             self._refresh_worker_state()
             return {
                 "status": "error" if self._worker_state == "error" else "ok",
                 "active_model": self._active_model,
                 "worker_state": self._worker_state,
             }
+        finally:
+            self._lock.release()
 
     def ensure_model(self, model_id: str) -> ModelSpec:
         with self._lock:
@@ -368,7 +378,7 @@ def create_model_manager_app(manager: ModelManager) -> FastAPI:
         finally:
             manager.shutdown()
 
-    app = FastAPI(title="legal-redactor local model manager", version="0.2.1", lifespan=lifespan)
+    app = FastAPI(title="legal-redactor local model manager", version="0.2.2", lifespan=lifespan)
 
     @app.get("/health")
     def health() -> dict[str, str | None]:
@@ -394,14 +404,14 @@ def default_model_manager() -> ModelManager:
         raise RuntimeError("LEGAL_REDACTOR_MLX_WORKER_PORT must be an integer") from exc
     if not 1 <= worker_port <= 65535:
         raise RuntimeError("LEGAL_REDACTOR_MLX_WORKER_PORT must be between 1 and 65535")
-    models = discover_model_specs()
-    models[BONSAI_MODEL_ID] = ModelSpec(BONSAI_MODEL_ID, BONSAI_MODEL_LABEL, DEFAULT_MODEL_PATH)
-    models[QWEN_MODEL_ID] = ModelSpec(
-        QWEN_MODEL_ID,
-        QWEN_MODEL_LABEL,
-        os.environ.get("LEGAL_REDACTOR_QWEN_MODEL", str(DEFAULT_QWEN_MODEL_PATH)),
-    )
-    return ModelManager(models, worker_host, worker_port, model_discovery=discover_model_specs)
+    models = {
+        QWEN_MODEL_ID: ModelSpec(
+            QWEN_MODEL_ID,
+            QWEN_MODEL_LABEL,
+            os.environ.get("LEGAL_REDACTOR_QWEN_MODEL", str(DEFAULT_QWEN_MODEL_PATH)),
+        )
+    }
+    return ModelManager(models, worker_host, worker_port)
 
 
 def discover_model_specs(
@@ -423,7 +433,11 @@ def discover_model_specs(
             if not _model_source_is_available(candidate) or not _is_supported_discovered_model(candidate):
                 continue
             model_id = _logical_model_id(candidate.name)
-            if not model_id or model_id in discovered:
+            if (
+                not model_id
+                or model_id in discovered
+                or model_id in INCOMPATIBLE_FULL_DOCUMENT_MODEL_IDS
+            ):
                 continue
             discovered[model_id] = ModelSpec(
                 model_id,

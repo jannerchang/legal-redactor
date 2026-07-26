@@ -189,11 +189,12 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertIn('data-upload-target="source-files"', page)
         self.assertIn('data-upload-target="source-directory-files"', page)
         self.assertIn("每次处理都可重新选择", page)
-        self.assertIn("识别模式默认使用整篇文书双轮补漏", page)
+        self.assertIn("识别模式固定使用整篇文书双轮补漏", page)
         self.assertIn('name="recognition_mode" value="full_document"', page)
         self.assertNotIn('id="recognition-mode-choice"', page)
         self.assertNotIn('value="sentence_windows"', page)
         self.assertIn("单篇最多 120000 字符", page)
+        self.assertIn("首轮失败时停止生成", page)
         self.assertIn("/api/model-status", page)
         self.assertIn("已用时", page)
         self.assertNotIn("super-secret-token", page)
@@ -773,7 +774,7 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertIn("INVALID_INPUT", response.text)
         self.assertIn("status", response.text)
 
-    def test_redact_failure_hint_does_not_blame_hanlp_when_disabled(self) -> None:
+    def test_redact_failure_hint_points_to_required_model(self) -> None:
         from fastapi.testclient import TestClient
 
         class FakePipeline:
@@ -787,8 +788,8 @@ class WebAppUploadTests(unittest.TestCase):
             response = TestClient(app).post("/redact", data={"text": "张三"})
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("当前未启用 HanLP", response.text)
-        self.assertNotIn("取消勾选 HanLP", response.text)
+        self.assertIn("确认所选 API 模型仍可用", response.text)
+        self.assertNotIn("HanLP", response.text)
 
     def test_analyze_page_uses_pipeline_analyze(self) -> None:
         from fastapi.testclient import TestClient
@@ -829,7 +830,7 @@ class WebAppUploadTests(unittest.TestCase):
         ):
             response = TestClient(app).post(
                 "/analyze",
-                data={"text": "张三", "recognition_mode": "full_document"},
+                data={"text": "张三", "recognition_mode": "full_document", "model": "bonsai-27b"},
             )
 
         self.assertEqual(response.status_code, 200)
@@ -869,13 +870,22 @@ class WebAppUploadTests(unittest.TestCase):
                     warnings=[],
                 )
 
+        ready = SimpleNamespace(state="ready", details={"model_ids": ["bonsai-27b"]})
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("legal_redactor.web_app.RedactionPipeline", FakePipeline):
+            with (
+                patch("legal_redactor.web_app.probe_model_manager", return_value=ready),
+                patch(
+                    "legal_redactor.web_app._available_model_options",
+                    return_value=[{"id": "bonsai-27b", "label": "Bonsai"}],
+                ),
+                patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
+            ):
                 response = TestClient(app).post(
                     "/redact",
                     data={
                         "text": "张三",
                         "case_root": tmpdir,
+                        "model": "bonsai-27b",
                         "case_folder": "2026 3624",
                     },
                 )
@@ -886,51 +896,13 @@ class WebAppUploadTests(unittest.TestCase):
             self.assertEqual(manifest.discord_thread_url, "")
             self.assertEqual(manifest.discord_thread_id, "")
 
-    def test_redact_route_falls_back_when_model_manager_is_unavailable_and_saves_case(self) -> None:
+    def test_redact_route_stops_when_model_manager_is_unavailable_without_saving_case(self) -> None:
         from pathlib import Path
         from fastapi.testclient import TestClient
-        from legal_redactor.cases import load_manifest
 
-        configs = []
-
-        class FakePipeline:
-            def __init__(self, config) -> None:
-                self.config = config
-                configs.append(config)
-
-            def redact(self, text, source_file=None, base_redaction_map=None):
-                assert text == "原告张三。"
-                assert base_redaction_map is None
-                assert self.config.enable_llm is False
-                return RedactionResult(
-                    original_text=text,
-                    redacted_text="原告张某1。",
-                    redaction_map=RedactionMap.create(
-                        [
-                            MappingEntry(
-                                type="person",
-                                original="张三",
-                                masked="张某1",
-                                role=None,
-                                source="test",
-                                confidence=1.0,
-                                restore_by_default=True,
-                            )
-                        ]
-                    ),
-                    candidates=[],
-                    review_candidates=[],
-                    leaks=[],
-                    mode="test",
-                    warnings=[],
-                )
-
-        unavailable = SimpleNamespace(state="missing")
+        unavailable = SimpleNamespace(state="missing", details={})
         with tempfile.TemporaryDirectory() as tmpdir:
-            with (
-                patch("legal_redactor.web_app.probe_model_manager", return_value=unavailable),
-                patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
-            ):
+            with patch("legal_redactor.web_app.probe_model_manager", return_value=unavailable):
                 response = TestClient(app).post(
                     "/redact",
                     data={
@@ -941,33 +913,13 @@ class WebAppUploadTests(unittest.TestCase):
                 )
 
             self.assertEqual(response.status_code, 200)
-            self.assertIn("原告张某1。", response.text)
+            self.assertIn("脱敏失败", response.text)
             self.assertIn("本地模型 API 未就绪", response.text)
-            self.assertEqual(len(configs), 1)
-            self.assertFalse(configs[0].enable_llm)
-            manifest = load_manifest(Path(tmpdir) / "2026 3624")
-            self.assertEqual(manifest.case_folder, "2026 3624")
-            self.assertTrue((Path(tmpdir) / "2026 3624" / "redacted" / "redacted.txt").exists())
-            self.assertTrue((Path(tmpdir) / "2026 3624" / "mapping" / "redaction_map.enc").exists())
-    def test_redact_confirmed_falls_back_when_model_manager_is_unavailable(self) -> None:
+            self.assertFalse((Path(tmpdir) / "2026 3624").exists())
+
+
+    def test_redact_confirmed_stops_when_model_manager_is_unavailable(self) -> None:
         from fastapi.testclient import TestClient
-
-        configs = []
-
-        class FakePipeline:
-            def __init__(self, config) -> None:
-                self.config = config
-                configs.append(config)
-
-            def apply_redaction_map(self, text, redaction_map):
-                return text.replace("张三", "张某1")
-
-            def scan_high_risk_leaks(self, text):
-                return []
-
-            def analyze(self, text):
-                assert self.config.enable_llm is False
-                return {"entity_groups": [], "locations": [], "warnings": []}
 
         bundle = json.dumps([{"source_file": "a.txt", "text": "原告张三。"}], ensure_ascii=False)
         analysis = json.dumps(
@@ -985,10 +937,7 @@ class WebAppUploadTests(unittest.TestCase):
             },
             ensure_ascii=False,
         )
-        with (
-            patch("legal_redactor.web_app.probe_model_manager", return_value=SimpleNamespace(state="missing")),
-            patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
-        ):
+        with patch("legal_redactor.web_app.probe_model_manager", return_value=SimpleNamespace(state="missing", details={})):
             response = TestClient(app).post(
                 "/redact/confirmed",
                 data={
@@ -1004,9 +953,11 @@ class WebAppUploadTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertGreaterEqual(len(configs), 2)
-        self.assertTrue(all(cfg.enable_llm is False for cfg in configs))
-        self.assertEqual(configs[-1].llm.recognition_mode, "full_document")
+        self.assertIn("识别失败", response.text)
+        self.assertIn("本地模型 API 未就绪", response.text)
+        self.assertNotIn("脱敏完成", response.text)
+
+
 
     def test_redact_confirmed_preserves_full_document_mode_when_manager_is_ready(self) -> None:
         from fastapi.testclient import TestClient
@@ -1130,35 +1081,16 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertIn("调用数：1", response.text)
         self.assertIn("冲突数：1", response.text)
 
-    def test_runtime_fallback_stats_are_distinct_from_manager_unavailable(self) -> None:
+    def test_runtime_full_document_failure_renders_no_result_or_case_save(self) -> None:
         from fastapi.testclient import TestClient
+        from legal_redactor.pipeline import RecognitionUnavailableError
 
         class FakePipeline:
             def __init__(self, config) -> None:
                 self.config = config
 
             def redact(self, text, source_file=None, base_redaction_map=None):
-                return RedactionResult(
-                    original_text=text,
-                    redacted_text=text,
-                    redaction_map=RedactionMap.create([]),
-                    candidates=[],
-                    review_candidates=[],
-                    leaks=[],
-                    mode="test",
-                    warnings=["整篇 LLM 识别失败，已回退逐句窗口"],
-                    recognition_stats=RecognitionRunStats(
-                        mode="sentence_windows",
-                        model_id="bonsai-27b",
-                        status="success",
-                        call_count=1,
-                        fallback_count=1,
-                        duration_ms=800,
-                        reason="invalid_registry",
-                        fallback_from_mode="full_document",
-                        http_status=200,
-                    ),
-                )
+                raise RecognitionUnavailableError("invalid_registry")
 
         ready = SimpleNamespace(state="ready", details={"model_ids": ["bonsai-27b"]})
         with (
@@ -1168,6 +1100,7 @@ class WebAppUploadTests(unittest.TestCase):
                 return_value=[{"id": "bonsai-27b", "label": "Bonsai"}],
             ),
             patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
+            patch("legal_redactor.web_app._persist_optional_case_redaction") as persist,
         ):
             response = TestClient(app).post(
                 "/redact",
@@ -1175,17 +1108,17 @@ class WebAppUploadTests(unittest.TestCase):
                     "text": "原告张三。",
                     "recognition_mode": "full_document",
                     "model": "bonsai-27b",
+                    "case_folder": "case-a",
                 },
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("模式：逐句窗口（稳定）", response.text)
-        self.assertIn("状态：成功", response.text)
-        self.assertIn("降级：是", response.text)
-        self.assertIn("Fallback 来源：整篇文书（LLM 双轮补漏）", response.text)
-        self.assertIn("原因：invalid_registry（invalid_registry）", response.text)
-        self.assertIn("HTTP：200", response.text)
-        self.assertNotIn("本地模型 API 未就绪，已降级为纯规则模式。", response.text)
+        self.assertIn("脱敏失败", response.text)
+        self.assertIn("invalid_registry", response.text)
+        self.assertNotIn('id="redacted-output"', response.text)
+        persist.assert_not_called()
+
+
 
     def test_redact_route_uses_selected_manager_model_and_reports_duration(self) -> None:
         from fastapi.testclient import TestClient
@@ -1333,6 +1266,7 @@ class WebAppUploadTests(unittest.TestCase):
 
     def test_pipeline_config_rejects_invalid_recognition_mode_and_llm_mode(self) -> None:
         import legal_redactor.web_app as web_app_module
+        from legal_redactor.pipeline import RecognitionUnavailableError
 
         ready = SimpleNamespace(state="ready", details={"model_ids": ["bonsai-27b"]})
         with (
@@ -1342,19 +1276,17 @@ class WebAppUploadTests(unittest.TestCase):
                 return_value=[{"id": "bonsai-27b", "label": "Bonsai"}],
             ),
         ):
-            bad_recognition, recognition_warnings = web_app_module._pipeline_config_for_model_status(
-                model="bonsai-27b",
-                recognition_mode="../../weights",
-            )
-            bad_llm, llm_warnings = web_app_module._pipeline_config_for_model_status(
-                model="bonsai-27b",
-                llm_mode="arbitrary",
-            )
+            with self.assertRaises(RecognitionUnavailableError):
+                web_app_module._pipeline_config_for_model_status(
+                    model="bonsai-27b",
+                    recognition_mode="../../weights",
+                )
+            with self.assertRaises(RecognitionUnavailableError):
+                web_app_module._pipeline_config_for_model_status(
+                    model="bonsai-27b",
+                    llm_mode="arbitrary",
+                )
 
-        self.assertFalse(bad_recognition.enable_llm)
-        self.assertFalse(bad_llm.enable_llm)
-        self.assertIn("配置无效", recognition_warnings[0])
-        self.assertIn("配置无效", llm_warnings[0])
 
     def test_batch_result_renders_aggregated_recognition_stats(self) -> None:
         from fastapi.testclient import TestClient
@@ -1406,7 +1338,7 @@ class WebAppUploadTests(unittest.TestCase):
         ):
             response = TestClient(app).post(
                 "/redact",
-                data={"recognition_mode": "full_document"},
+                data={"recognition_mode": "full_document", "model": "bonsai-27b"},
                 files=[
                     ("files", ("a.txt", "张三", "text/plain")),
                     ("files", ("b.txt", "李四", "text/plain")),
@@ -1473,41 +1405,27 @@ class WebAppUploadTests(unittest.TestCase):
             self.assertEqual(data["entries"], [])
             self.assertEqual(data["total"], 0)
 
-    def test_legacy_cli_redact_writes_encrypted_map_file(self) -> None:
+    def test_cli_failure_writes_no_artifact(self) -> None:
         from pathlib import Path
         from legal_redactor import cli
+        from legal_redactor.pipeline import RecognitionUnavailableError
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             input_path = root / "judgment.txt"
             output_dir = root / "out"
             input_path.write_text("原告张三。", encoding="utf-8")
-            encrypted_map_calls = []
 
-            def fake_redact(self, text, source_file=None):
-                return RedactionResult(
-                    original_text=text,
-                    redacted_text="原告张某1。",
-                    redaction_map=RedactionMap.create(
-                        [MappingEntry("person", "张三", "张某1", None, "test", 1.0, True)]
-                    ),
-                    candidates=[],
-                    review_candidates=[],
-                    leaks=[],
-                    mode="test",
-                    warnings=[],
-                )
-
-            with (
-                patch("legal_redactor.cli.RedactionPipeline.redact", fake_redact),
-                patch("legal_redactor.cli.save_redaction_map_auto", side_effect=lambda path, redaction_map: encrypted_map_calls.append(Path(path))),
+            with patch(
+                "legal_redactor.cli.RedactionPipeline.redact",
+                side_effect=RecognitionUnavailableError("timeout"),
             ):
-                exit_code = cli.main(["redact", str(input_path), "--out", str(output_dir), "--no-llm"])
+                exit_code = cli.main(["redact", str(input_path), "--out", str(output_dir)])
 
-            self.assertEqual(exit_code, 0)
-            self.assertTrue((output_dir / "judgment.redacted.txt").exists())
-            self.assertEqual(encrypted_map_calls, [output_dir / "redaction_map.enc"])
-            self.assertFalse((output_dir / "redaction_map.json").exists())
+            self.assertEqual(exit_code, 2)
+            self.assertFalse(output_dir.exists())
+
+
 
     def test_redact_route_directory_upload_prefers_inferred_root_over_default_root(self) -> None:
         from pathlib import Path
@@ -1530,11 +1448,16 @@ class WebAppUploadTests(unittest.TestCase):
                     warnings=[],
                 )
 
+        ready = SimpleNamespace(state="ready", details={"model_ids": ["bonsai-27b"]})
         with tempfile.TemporaryDirectory() as default_root, tempfile.TemporaryDirectory() as actual_root:
             actual = Path(actual_root)
             (actual / "2026 8888").mkdir()
             with (
-                patch.dict(os.environ, {"LEGAL_REDACTOR_CASE_ROOT": default_root}),
+                patch("legal_redactor.web_app.probe_model_manager", return_value=ready),
+                patch(
+                    "legal_redactor.web_app._available_model_options",
+                    return_value=[{"id": "bonsai-27b", "label": "Bonsai"}],
+                ),
                 patch("legal_redactor.web_app.case_location_search_roots", return_value=[actual]),
                 patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
             ):
@@ -1543,6 +1466,7 @@ class WebAppUploadTests(unittest.TestCase):
                     data={
                         "case_root": default_root,
                         "upload_relative_paths": json.dumps(["2026 8888/judgment.txt"], ensure_ascii=False),
+                        "model": "bonsai-27b",
                     },
                     files=[
                         (
@@ -2570,7 +2494,8 @@ def test_excel_upload_controls_and_folder_filter_stay_aligned():
     from legal_redactor.web_templates import render_home_page
     from legal_redactor.web_app import SUPPORTED_UPLOAD_SUFFIXES, _is_supported_folder_upload_filename
 
-    html = render_home_page("", "", "", "", [], "")
+    html = render_home_page("", "", "", [], "")
+    assert "HanLP" not in html
     assert ".xlsx,.xlsm" in html
     assert {".xlsx", ".xlsm"}.issubset(SUPPORTED_UPLOAD_SUFFIXES)
     assert _is_supported_folder_upload_filename("2026 1/source.xlsx")
@@ -2586,8 +2511,8 @@ def test_directory_upload_prefers_existing_original_case_folder_for_persistence(
     )
     assert result["case_folder"] == "2026 8888"
     assert result["matched_dir"] == str(case_dir.resolve())
+
 def test_relative_folder_not_found_does_not_fallback_to_same_filename(tmp_path):
-    from pathlib import Path
     from legal_redactor.web_app import _resolve_case_location
 
     wrong_case = tmp_path / "2026 1111"

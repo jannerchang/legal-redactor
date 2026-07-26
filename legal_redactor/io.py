@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 import os
-
-from ._logging import get_logger
-
-_logger = get_logger("io")
 from pathlib import Path
 
+from ._logging import get_logger
 from .models import RedactionMap
+
+_logger = get_logger("io")
+
 
 
 SUPPORTED_INPUT_SUFFIXES = {".txt", ".md", ".docx", ".pdf"}

@@ -10,11 +10,11 @@ from __future__ import annotations
 import base64
 import os
 import secrets
+from pathlib import Path
 
 from ._logging import get_logger
 
 _logger = get_logger("crypto")
-from pathlib import Path
 
 _KEY_ENV = "LEGAL_REDACTOR_KEY"
 _KEY_FILE = Path.home() / ".config" / "legal-redactor" / "key"

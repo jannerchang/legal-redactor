@@ -4,6 +4,8 @@
 > **Date**: `2026-07-13`  
 > **Decision**: targeted architectural replacement — retain deterministic detectors and existing public pipeline entrypoints, replace the candidate-to-mapping decision path incrementally.
 
+> **2026-07-26 implementation note**: The flow below is historical evidence for the replacement decision. Runtime discovery now requires successful full-document registration, retains fixed structured identifiers and SQLite administrative divisions, routes supported candidates through `CandidateCollector`, and fails closed instead of invoking title/party/fallback-person/local-organization/HanLP or suffix-grammar discovery.
+
 ## Decision
 
 The current system should **not** continue through one-off regex, prefix, suffix, blacklist, or postprocess additions. This is not primarily a detector-recall problem. It is a missing decision model between a raw span match and a redaction mapping.
@@ -221,7 +223,7 @@ Measure separately:
 
 ### Stage 2 — replace administrative rule acceptance first
 
-- Make SQLite administrative detectors authoritative. Downgrade `china_admin_rules.py` to proposal-only path continuation validated against the database; remove suffix-only auto-acceptance.
+- Make SQLite administrative detectors authoritative. The suffix-only `china_admin_rules.py` runtime source has been removed; administrative names now require database or validated full-document registry evidence.
 - Resolve organization/place containment before mapping creation.
 - Gate: no arbitrary prose+suffix automatic location; legitimate multi-level division fixtures pass.
 

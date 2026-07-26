@@ -14,8 +14,8 @@ from .regression import build_regression_report
 SCHEMA_VERSION = "recognition-benchmark-report/v2"
 MANIFEST_SCHEMA_VERSION = "recognition-benchmark-manifest/v1"
 LENGTH_STRATA = ("<10k", "10k-30k", "30k-60k", ">=60k")
-MODES = ("sentence_windows", "full_document", "rules_ner", "full_document_audited")
-MODELS = ("bonsai-27b", "qwen3.5-9b")
+MODES = ("full_document",)
+MODELS = ("qwen3.5-9b",)
 
 
 @dataclass(frozen=True)
@@ -26,12 +26,7 @@ class BenchmarkMatrixRow:
 
 
 def benchmark_matrix() -> tuple[BenchmarkMatrixRow, ...]:
-    rows: list[BenchmarkMatrixRow] = []
-    rows.extend(BenchmarkMatrixRow("sentence_windows", model) for model in MODELS)
-    rows.extend(BenchmarkMatrixRow("full_document", model) for model in MODELS)
-    rows.append(BenchmarkMatrixRow("rules_ner", "none"))
-    rows.extend(BenchmarkMatrixRow("full_document_audited", model, audited=True) for model in MODELS)
-    return tuple(rows)
+    return tuple(BenchmarkMatrixRow("full_document", model) for model in MODELS)
 
 
 def load_benchmark_manifest(path: str | Path) -> dict[str, Any]:
@@ -217,10 +212,9 @@ def length_stratum(character_count: int) -> str:
 
 
 def _config_for_row(row: BenchmarkMatrixRow) -> PipelineConfig:
-    if row.recognition_mode == "rules_ner":
-        return PipelineConfig.offline_without_llm()
-    mode = "full_document" if row.recognition_mode.startswith("full_document") else "sentence_windows"
-    return PipelineConfig.max_effect(model=row.model_id, recognition_mode=mode)
+    if not row.recognition_mode.startswith("full_document"):
+        raise ValueError(f"unsupported benchmark recognition mode: {row.recognition_mode}")
+    return PipelineConfig.max_effect(model=row.model_id, recognition_mode="full_document")
 
 
 def _recognition_summary(evaluation: dict[str, Any] | None) -> dict[str, Any]:
@@ -402,15 +396,12 @@ def _recommendation(runs: list[dict[str, Any]]) -> dict[str, Any]:
         return {"action": "manual_review", "reason": "failed_runs_present"}
     if any(run["status"] == "missing_evidence" for run in runs):
         return {"action": "manual_review", "reason": "missing_evidence"}
-    baseline_runs = [run for run in runs if run["recognition_mode"] == "sentence_windows"]
-    candidate_runs = [run for run in runs if run["recognition_mode"].startswith("full_document")]
-    if not baseline_runs or not candidate_runs:
-        return {"action": "manual_review", "reason": "missing_comparison_rows"}
-    if _has_quality_or_workflow_regression(baseline_runs, candidate_runs):
-        return {"action": "no_switch", "reason": "quality_or_workflow_regression"}
-    if not _has_meaningful_improvement(baseline_runs, candidate_runs):
-        return {"action": "no_switch", "reason": "no_meaningful_improvement"}
-    return {"action": "manual_review", "reason": "default_change_requires_human_gate"}
+    full_document_runs = [run for run in runs if run["recognition_mode"].startswith("full_document")]
+    if not full_document_runs:
+        return {"action": "manual_review", "reason": "missing_full_document_rows"}
+    if _has_quality_or_workflow_regression(full_document_runs, full_document_runs):
+        return {"action": "manual_review", "reason": "quality_or_workflow_regression"}
+    return {"action": "keep_full_document", "reason": "only_supported_recognition_mode"}
 
 
 def _has_quality_or_workflow_regression(

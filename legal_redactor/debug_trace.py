@@ -4,7 +4,7 @@ import json
 from collections import Counter
 from typing import Any
 
-from .models import BatchRedactionResult, Candidate, Leak, MappingEntry, RedactedDocument, RedactionResult
+from .models import BatchRedactionResult, Candidate, Leak, MappingEntry, RedactionResult
 
 
 def redaction_debug_trace(result: RedactionResult) -> dict[str, Any]:

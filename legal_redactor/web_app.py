@@ -50,7 +50,7 @@ from .local_config import config_value, load_json_config
 from .models import MappingEntry, RecognitionRunStats, RedactedDocument, RedactionMap, sort_mapping_entries
 from .org_masking import derived_organization_alias_cores
 from .llm import is_noise_entity_text
-from .pipeline import RedactionPipeline
+from .pipeline import RecognitionUnavailableError, RedactionPipeline
 from .postprocess import _filter_noise_entity_mappings
 from .restore import preview_restore, restore_docx
 from .status import build_status_payload, probe_model_manager
@@ -72,7 +72,7 @@ except ImportError as exc:
     raise RuntimeError("启动 Web UI 需要先安装依赖：pip install -r requirements.txt") from exc
 
 
-app = FastAPI(title="本地法律文书脱敏系统", version="0.2.1")
+app = FastAPI(title="本地法律文书脱敏系统", version="0.2.2")
 
 @dataclass(frozen=True)
 class InputDocument:
@@ -104,10 +104,7 @@ SAMPLE_SUMMARY_KEYS = (
 
 SUPPORTED_UPLOAD_SUFFIXES = {".txt", ".md", ".doc", ".docx", ".pdf", *EXCEL_INPUT_SUFFIXES}
 RECOGNITION_MODE_LABELS = {
-    "sentence_windows": "逐句窗口（稳定）",
     "full_document": "整篇文书（LLM 双轮补漏）",
-    "rules_ner": "规则/HanLP",
-    "candidate_review": "候选复核",
 }
 
 RECOGNITION_STATUS_LABELS = {
@@ -215,13 +212,13 @@ def _pipeline_config_for_model_status(
     status = probe_model_manager()
     recoverable_worker_error = status.state == "error" and status.details.get("reason") == "worker_error"
     if status.state != "ready" and not recoverable_worker_error:
-        return PipelineConfig.offline_without_llm(profile), ["本地模型 API 未就绪，已降级为纯规则模式。"]
+        raise RecognitionUnavailableError("本地模型 API 未就绪")
     try:
         model_ids = {item["id"] for item in _available_model_options()}
-    except (KeyError, TypeError):
-        model_ids = set()
+    except (KeyError, TypeError) as exc:
+        raise RecognitionUnavailableError("本地模型列表无效") from exc
     if model not in model_ids:
-        return PipelineConfig.offline_without_llm(profile), ["所选模型当前不可用，已降级为纯规则模式。"]
+        raise RecognitionUnavailableError("所选模型当前不可用")
     try:
         return PipelineConfig.from_llm_mode(
             llm_mode,
@@ -229,15 +226,12 @@ def _pipeline_config_for_model_status(
             model=model,
             recognition_mode=recognition_mode,
         ), []
-    except ValueError:
-        return PipelineConfig.offline_without_llm(profile), ["本地模型 API 配置无效，已降级为纯规则模式。"]
+    except ValueError as exc:
+        raise RecognitionUnavailableError("本地模型 API 配置无效") from exc
 
 
-def _redaction_failure_body(exc: Exception, *, enable_hanlp: bool) -> str:
-    if enable_hanlp:
-        suggestion = "建议：先取消勾选 HanLP，并确认所选 API 模型仍可用后重试。"
-    else:
-        suggestion = "建议：确认所选 API 模型仍可用后重试；当前未启用 HanLP，问题不在 HanLP 勾选项。"
+def _redaction_failure_body(exc: Exception) -> str:
+    suggestion = "建议：确认所选 API 模型仍可用后重试。"
     return f"<p>{html.escape(str(exc))}</p><p>{html.escape(suggestion)}</p>"
 
 
@@ -548,20 +542,15 @@ async def suggest_mapping_entry(request: Request) -> JSONResponse:
 def index() -> str:
     sample_info = ""
     status_panel = _render_status_panel(_status_payload())
-    hanlp_attr = _hanlp_checked_attr()
     default_root_str = str(default_case_root())
     return render_home_page(
         status_panel,
         sample_info,
-        hanlp_attr,
         default_root_str,
         _available_model_options(),
         DEFAULT_MODEL_ID,
     )
 
-def _hanlp_checked_attr() -> str:
-    # LLM 主路径下 HanLP 为可选增强；默认不勾选，避免与 MLX 同时占满内存导致进程被系统杀掉。
-    return ""
 
 
 def _status_payload() -> dict:
@@ -597,17 +586,23 @@ async def analyze_page(
         return _page("上传失败", str(exc))
 
     profile = "standard"
-    config, warnings = _pipeline_config_for_model_status(
-        profile=profile,
-        llm_mode=llm_mode,
-        model=model,
-        recognition_mode=recognition_mode,
-    )
+    try:
+        config, warnings = _pipeline_config_for_model_status(
+            profile=profile,
+            llm_mode=llm_mode,
+            model=model,
+            recognition_mode=recognition_mode,
+        )
+    except RecognitionUnavailableError as exc:
+        return _page("识别不可用", _redaction_failure_body(exc))
     pipeline = RedactionPipeline(config=config)
 
     # 执行语义审计（后台线程，避免阻塞 /health 等轻量请求）
     raw_text = "\n\n".join(doc.text for doc in documents)
-    analysis = await asyncio.to_thread(pipeline.analyze, raw_text)
+    try:
+        analysis = await asyncio.to_thread(pipeline.analyze, raw_text)
+    except RecognitionUnavailableError as exc:
+        return _page("识别失败", _redaction_failure_body(exc))
 
     analysis.setdefault("warnings", [])
     analysis["warnings"] = [*warnings, *analysis.get("warnings", [])]
@@ -867,7 +862,7 @@ async def redact_confirmed_page(request: Request) -> str:
     ]
 
     # 应用所有已确认映射
-    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm(profile))
+    pipeline = RedactionPipeline(config=PipelineConfig.mapping_only(profile))
     redaction_map = _sanitize_redaction_map(
         RedactionMap.create(mappings=all_mappings, mode=profile)
     )
@@ -921,15 +916,18 @@ async def redact_confirmed_page(request: Request) -> str:
             warnings=[],
         )
 
-    # 对已脱敏文本做新一轮分析；API 不可用时与 /redact 一样降级为纯规则。
-    config, fallback_warnings = _pipeline_config_for_model_status(
-        profile=profile,
-        llm_mode=llm_mode,
-        model=model,
-        recognition_mode=recognition_mode,
-    )
-    pipeline2 = RedactionPipeline(config=config)
-    new_analysis = await asyncio.to_thread(pipeline2.analyze, redacted_text)
+    # 对已脱敏文本做新一轮全文分析；失败时停止，不生成新的结果。
+    try:
+        config, fallback_warnings = _pipeline_config_for_model_status(
+            profile=profile,
+            llm_mode=llm_mode,
+            model=model,
+            recognition_mode=recognition_mode,
+        )
+        pipeline2 = RedactionPipeline(config=config)
+        new_analysis = await asyncio.to_thread(pipeline2.analyze, redacted_text)
+    except RecognitionUnavailableError as exc:
+        return _page("识别失败", _redaction_failure_body(exc))
     new_analysis.setdefault("warnings", [])
     new_analysis["warnings"] = [*fallback_warnings, *new_analysis.get("warnings", [])]
 
@@ -1020,8 +1018,6 @@ async def redact_page(
     llm_mode: str = Form(default="max-effect"),
     recognition_mode: str = Form(default="full_document"),
     model: str = Form(default=DEFAULT_MODEL_ID),
-    enable_hanlp: str | None = Form(default=None),
-    hanlp_model: str = Form(default=""),
     # enable_samples kept out of the form: samples never affect runtime redaction.
     base_map_json: str = Form(default=""),
     case_folder: str = Form(default=""),
@@ -1051,17 +1047,15 @@ async def redact_page(
         except Exception as exc:
             return _page("已有映射表解析失败", f"解析错误: {exc}")
 
-    config, fallback_warnings = _pipeline_config_for_model_status(
-        profile="standard",
-        llm_mode=llm_mode,
-        model=model,
-        recognition_mode=recognition_mode,
-    )
-    config = replace(
-        config,
-        enable_hanlp_ner=bool(enable_hanlp),
-        hanlp_model=hanlp_model.strip() or "MSRA_NER_ELECTRA_SMALL_ZH",
-    )
+    try:
+        config, fallback_warnings = _pipeline_config_for_model_status(
+            profile="standard",
+            llm_mode=llm_mode,
+            model=model,
+            recognition_mode=recognition_mode,
+        )
+    except RecognitionUnavailableError as exc:
+        return _page("脱敏失败", _redaction_failure_body(exc))
     pipeline = RedactionPipeline(config=config)
     source_files = [item.source_file for item in documents]
     inferred_case_location = _resolve_case_location(upload_source_dir, source_files, upload_relative_paths)
@@ -1085,7 +1079,7 @@ async def redact_page(
                 base_redaction_map=base_redaction_map,
             )
     except Exception as exc:
-        return _page("脱敏失败", _redaction_failure_body(exc, enable_hanlp=bool(enable_hanlp)))
+        return _page("脱敏失败", _redaction_failure_body(exc))
     result = replace(result, redaction_map=_sanitize_redaction_map(result.redaction_map))
     try:
         if len(documents) > 1:
@@ -1198,7 +1192,7 @@ async def apply_map_page(
         redaction_map = _sanitize_redaction_map(redaction_map_from_json(map_json))
     except Exception as exc:
         return _page("映射表解析失败", f"错误详情: {exc}")
-    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
+    pipeline = RedactionPipeline(config=PipelineConfig.mapping_only())
     if original_bundle_json.strip():
         try:
             documents = _documents_from_bundle_json(original_bundle_json)
@@ -1267,7 +1261,7 @@ async def apply_edited_map_page(request: Request) -> str:
             mappings=sort_mapping_entries(_renumber_mapping_placeholders(redaction_map.mappings)),
         )
         warnings.append("已按当前保留的映射重新排列占位符。")
-    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
+    pipeline = RedactionPipeline(config=PipelineConfig.mapping_only())
     try:
         documents = _documents_from_bundle_json(original_bundle_json)
     except ValueError as exc:
@@ -1678,18 +1672,18 @@ def _diagnose_sample_entry(entry: dict) -> str:
         # 4. 案号
         if re.search(r"[（(][12]\d{3}[）)][\u4e00-\u9fa5A-Za-z0-9]{1,16}?(?:知民初|知民终|执异|执复|民辖终|民辖初|民辖|民初|民终|民申|民再|行初|行终|行申|刑初|刑终|刑申|刑再|商初|商终|破申|执|民撤|民特|民保|强清|管辖)", orig):
             matched_rules.append("案号结构化正则")
-        # 5. 地名/行政区划
-        if re.search(r"[\u4e00-\u9fa5]{2,6}?(?:省|自治区|市|自治州|盟|区|县|旗|镇|乡|街道|村|社区)$", orig):
-            matched_rules.append("启发式地名匹配")
-        # 6. 常见人名兜底
+        # 5. 行政区划数据库或全文地点登记
+        if re.search(r"[\u4e00-\u9fa5]{2,6}?(?:省|自治区|市|自治州|盟|区|县|旗)$", orig):
+            matched_rules.append("行政区划数据库或全文地点登记")
+        # 6. 全文人名登记
         if len(orig) in (2, 3):
-            matched_rules.append("姓名兜底匹配")
-        # 7. 机构/公司
+            matched_rules.append("全文人名登记")
+        # 7. 全文机构登记
         if any(orig.endswith(sfx) for sfx in ["有限责任公司", "股份有限公司", "集团有限公司", "有限公司", "公司", "集团", "律师事务所", "会计师事务所", "经营部", "商行", "工作室", "厂", "店"]):
-            matched_rules.append("机构后缀特征")
+            matched_rules.append("全文机构登记")
 
         if not matched_rules:
-            matched_rules.append("LLM语义审计或规则兜底")
+            matched_rules.append("全文 LLM 实体登记")
 
         rules_str = "、".join(matched_rules)
         return (

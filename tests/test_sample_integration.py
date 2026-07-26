@@ -51,6 +51,27 @@ def mock_samples(tmp_path):
     # 临时覆盖默认的样本读取逻辑（可以通过 monkeypatch 替换默认样本路径）
     return tmp_path, filepath
 
+def _redact_with_registry(text: str, entities: tuple[tuple[str, str], ...]):
+    from unittest.mock import patch
+
+    from legal_redactor.entity_registry import FullDocumentEntityRegistry, RegistryEntity, RegistryValidationResult
+    from legal_redactor.llm import FullDocumentRegistryExtraction
+
+    registry = FullDocumentEntityRegistry(
+        entities=tuple(
+            RegistryEntity(f"{entity_type}-{index}", entity_type, original, (original,))
+            for index, (entity_type, original) in enumerate(entities, start=1)
+        )
+    )
+    extraction = FullDocumentRegistryExtraction(
+        validation=RegistryValidationResult(registry=registry)
+    )
+    with patch(
+        "legal_redactor.llm.LegalEntityAuditor.extract_full_document_registry",
+        return_value=extraction,
+    ):
+        return RedactionPipeline(config=PipelineConfig.max_effect()).redact(text, mode="standard")
+
 
 def test_pipeline_ignores_sample_library_contents_at_runtime(mock_samples, monkeypatch):
     """Runtime redaction must not reuse sample masks or honor sample deletes."""
@@ -60,8 +81,10 @@ def test_pipeline_ignores_sample_library_contents_at_runtime(mock_samples, monke
 
     monkeypatch.setattr(samples_module, "DEFAULT_SAMPLES_DIR", tmp_path)
 
-    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
-    result = pipeline.redact("原告：张小明。被告：来我去公司。案件涉及绝密代号。", mode="standard")
+    result = _redact_with_registry(
+        "原告：张小明。被告：来我去公司。案件涉及绝密代号。",
+        (("person", "张小明"), ("organization", "来我去公司")),
+    )
 
     # Sample-only mappings/masks must not be injected into runtime results.
     assert "【小明特制掩码】" not in result.redacted_text
@@ -95,10 +118,14 @@ def test_delete_blacklist_does_not_block_party_org_redaction(tmp_path, monkeypat
 
     assert "华北制药股份有限公司" in load_sample_blacklist_for_optimization(samples_dir=tmp_path)
 
-    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
-    result = pipeline.redact(
+    result = _redact_with_registry(
         "原告华北制药股份有限公司诉被告张三、李四，第三人赵仁川合同纠纷一案。",
-        mode="standard",
+        (
+            ("organization", "华北制药股份有限公司"),
+            ("person", "张三"),
+            ("person", "李四"),
+            ("person", "赵仁川"),
+        ),
     )
 
     orgs = [mapping for mapping in result.redaction_map.mappings if mapping.type == "organization"]
@@ -107,10 +134,9 @@ def test_delete_blacklist_does_not_block_party_org_redaction(tmp_path, monkeypat
 
 
 def test_generic_false_positive_rules_do_not_require_runtime_blacklist():
-    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
-    result = pipeline.redact(
+    result = _redact_with_registry(
         "甲方签约后提交银行流水。合同一、合同二并列出现。",
-        mode="standard",
+        (),
     )
 
     blocked = {mapping.original for mapping in result.redaction_map.mappings}
@@ -254,12 +280,18 @@ def test_pipeline_redaction_is_independent_of_sample_directory_contents(tmp_path
         "石家庄裕华精密铸造有限公司位于唐山。"
         "诺亚人力资源发展集团有限公司提交了证据。"
     )
-    pipeline = RedactionPipeline(config=PipelineConfig.offline_without_llm())
 
     monkeypatch.setattr(samples_module, "DEFAULT_SAMPLES_DIR", empty_dir)
-    empty_result = pipeline.redact(text, mode="standard")
+    entities = (
+        ("organization", "胖哥公司"),
+        ("organization", "河北星河建筑工程有限公司"),
+        ("organization", "石家庄裕华精密铸造有限公司"),
+        ("location", "唐山"),
+        ("organization", "诺亚人力资源发展集团有限公司"),
+    )
+    empty_result = _redact_with_registry(text, entities)
     monkeypatch.setattr(samples_module, "DEFAULT_SAMPLES_DIR", populated_dir)
-    populated_result = pipeline.redact(text, mode="standard")
+    populated_result = _redact_with_registry(text, entities)
 
     assert empty_result.redacted_text == populated_result.redacted_text
     assert [m.original for m in empty_result.redaction_map.mappings] == [
@@ -293,20 +325,13 @@ def test_llm_prompt_builders_never_inject_sample_few_shot(tmp_path, monkeypatch)
     assert unique_positive in few_shot
 
     auditor = LegalEntityAuditor(LLMAPIConfig(enabled=False))
-    sentence_prompt = auditor._build_sentence_extraction_prompt(
-        [{"id": "s1", "previous": "", "target": "原告胖哥公司。", "next": ""}],
-        enable_samples=True,
-    )
-    merged_prompt = auditor._build_merged_prompt(
+    full_document_prompt = auditor._build_full_document_registry_prompt(
         "原告胖哥公司。",
-        [{"text": "胖哥公司", "type": "organization", "context": "原告胖哥公司。"}],
         enable_samples=True,
     )
 
-    assert unique_negative not in sentence_prompt
-    assert unique_positive not in sentence_prompt
-    assert unique_negative not in merged_prompt
-    assert unique_positive not in merged_prompt
+    assert unique_negative not in full_document_prompt
+    assert unique_positive not in full_document_prompt
 
 
 def test_clear_sample_library_removes_entries_and_allows_future_writes(tmp_path):
@@ -419,12 +444,12 @@ def test_diagnose_sample_entry():
 
     e_del_company = {"action": "delete", "original": "河北省某某建设工程有限公司"}
     diag_company = _diagnose_sample_entry(e_del_company)
-    assert "机构后缀特征" in diag_company
+    assert "全文机构登记" in diag_company
     assert "误匹配为实体" in diag_company
 
     e_del_person = {"action": "delete", "original": "张小"}
     diag_person = _diagnose_sample_entry(e_del_person)
-    assert "姓名兜底匹配" in diag_person
+    assert "全文人名登记" in diag_person
     assert "误匹配为实体" in diag_person
 
     # 测试 modify 诊断
