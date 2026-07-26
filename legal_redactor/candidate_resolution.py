@@ -7,18 +7,9 @@ import re
 from .models import Candidate
 
 SOURCE_PRIORITY: dict[str, int] = {
-    "party_section": 100,
     "hebei_admin_db": 95,
     "china_admin_db": 93,
-    "china_admin_rules": 85,
-    "linear_llm_exact": 90,
-    "linear_llm_calibrated": 88,
-    "linear_full_org": 75,
-    "linear_bare_org_alias": 72,
-    "title_section": 65,
-    "hanlp_ner": 60,
-    "heuristic_ner": 50,
-    "fallback_person": 40,
+    "full_document_llm": 90,
 }
 
 TYPE_PRIORITY: dict[str, int] = {

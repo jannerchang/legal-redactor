@@ -19,9 +19,8 @@ from .filters import is_false_org as _is_false_org
 from .counters import TypeCounters
 from .filters import is_false_person as _is_false_person
 from .filters import looks_like_false_location as _looks_like_false_location
-from .lexicon import FACT_SECTION_BOUNDARY_RE, INSTITUTION_SUFFIXES, LEGAL_SUFFIXES
+from .lexicon import INSTITUTION_SUFFIXES, LEGAL_SUFFIXES
 from .location_utils import (
-    ADMIN_SUFFIXES,
     get_location_core,
     is_compound_admin_path,
     location_suffix,
@@ -40,7 +39,6 @@ from .org_masking import (
     has_explicit_bare_brand_alias,
     is_short_company_surface,
     organization_mask_for_surface,
-    looks_like_complete_bare_company_body,
     mask_institution,
     simple_legal_suffix,
 )
@@ -70,19 +68,12 @@ class LinearRuleEngine:
         text: str,
         candidates: Iterable[Candidate] = (),
         llm_analysis: dict | None = None,
-        respect_fact_section_boundary: bool = True,
         registry_constraints: object | None = None,
     ) -> list[MappingEntry]:
         """Accept ordered discoveries; registry identity travels on candidate metadata."""
         _ = registry_constraints
-        scan_text = text
-        if respect_fact_section_boundary:
-            boundary_match = FACT_SECTION_BOUNDARY_RE.search(text)
-            if boundary_match:
-                scan_text = text[: boundary_match.start()]
-
-        self.source_text = scan_text
-        accepted_candidates = self._apply_llm_verdicts(list(candidates), scan_text, llm_analysis or {})
+        self.source_text = text
+        accepted_candidates = self._apply_llm_verdicts(list(candidates), text, llm_analysis or {})
         accepted_candidates = resolve_candidate_overlaps(accepted_candidates)
 
         for candidate in sorted(
@@ -155,15 +146,7 @@ class LinearRuleEngine:
             return
         value = candidate.text.strip()
         parts = candidate.metadata.get("parts") if isinstance(candidate.metadata, dict) else None
-        is_rule_admin_candidate = (
-            candidate.source == "china_admin_rules"
-            and isinstance(parts, dict)
-            and bool(parts)
-        )
-        if (
-            not is_rule_admin_candidate
-            and _looks_like_false_location(self.source_text, candidate.start, candidate.end, value)
-        ):
+        if _looks_like_false_location(self.source_text, candidate.start, candidate.end, value):
             return
         if is_compound_admin_path(value) or len(parts or {}) >= 2:
             masked = mask_admin_cascade_path(value, self.get_location_prefix)
@@ -249,17 +232,6 @@ class LinearRuleEngine:
                 self._add("organization", value, f"{self.counters.next('group_prefix')}{suffix}", candidate)
             return
 
-        body = value[: -len(legal_suffix)]
-        if candidate.source.startswith("hanlp_ner") and body.endswith(ADMIN_SUFFIXES):
-            return
-
-        if (
-            legal_suffix in {"公司", "集团"}
-            and candidate.source in {"linear_full_org", "hanlp_ner", "heuristic_ner"}
-            and not looks_like_complete_bare_company_body(body)
-            and not self._known_organization_allows_short_alias(body)
-        ):
-            return
 
         if entity_id and entity_id in self._entity_org_plans:
             plan = self._entity_org_plans[entity_id]

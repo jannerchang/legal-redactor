@@ -285,6 +285,15 @@ def test_discovery_registers_direct_and_huggingface_cache_models(tmp_path: Path)
     (embedding / "refs" / "main").write_text("def456", encoding="utf-8")
     (embedding_snapshot / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
 
+    incompatible = tmp_path / "models--mlx-community--Qwen3.5-4B-MLX-4bit"
+    incompatible_snapshot = incompatible / "snapshots" / "fourb"
+    incompatible_snapshot.mkdir(parents=True)
+    (incompatible / "refs").mkdir()
+    (incompatible / "refs" / "main").write_text("fourb", encoding="utf-8")
+    (incompatible_snapshot / "config.json").write_text(
+        '{"model_type":"qwen3_5"}', encoding="utf-8"
+    )
+
     discovered = discover_model_specs((tmp_path,))
 
     assert set(discovered) == {
@@ -316,6 +325,23 @@ def test_manager_refreshes_discovered_models_without_restart(tmp_path: Path) -> 
     (second / "config.json").write_text('{"model_type":"llama"}', encoding="utf-8")
 
     assert {item["id"] for item in manager.models_payload()["data"]} >= {"First-MLX", "Second-MLX"}
+
+
+def test_manager_health_remains_available_while_inference_lock_is_held(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, _unused_port(), [])
+    manager._active_model = "bonsai-27b"
+    manager._lock.acquire()
+    observed: list[dict[str, str | None]] = []
+
+    thread = threading.Thread(target=lambda: observed.append(manager.health_payload()))
+    thread.start()
+    thread.join(timeout=1)
+    manager._lock.release()
+
+    assert not thread.is_alive()
+    assert observed == [
+        {"status": "ok", "active_model": "bonsai-27b", "worker_state": "busy"}
+    ]
 
 
 def test_manager_scrubs_unknown_and_worker_errors(tmp_path: Path, monkeypatch) -> None:

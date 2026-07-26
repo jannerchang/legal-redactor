@@ -115,6 +115,21 @@ def test_model_manager_probe_checks_health_and_logical_registry(monkeypatch) -> 
 
 
 
+def test_model_manager_probe_accepts_busy_worker(monkeypatch) -> None:
+    responses = iter(
+        [
+            (200, json.dumps({"status": "ok", "active_model": "qwen3.5-9b", "worker_state": "busy"})),
+            (200, json.dumps({"data": [{"id": "qwen3.5-9b"}]})),
+        ]
+    )
+    monkeypatch.setattr("legal_redactor.status._http_get", lambda *args: next(responses))
+
+    item = probe_model_manager(environ={}, timeout=0.01)
+
+    assert item.state == "ready"
+    assert item.details["worker_state"] == "busy"
+
+
 def test_model_manager_probe_reports_worker_error_as_unavailable(monkeypatch) -> None:
     responses = iter(
         [
@@ -128,7 +143,7 @@ def test_model_manager_probe_reports_worker_error_as_unavailable(monkeypatch) ->
     assert item.state == "error"
     assert item.details["worker_state"] == "error"
     assert item.details["reason"] == "worker_error"
-    assert probe_recognition_mode(item).state == "degraded"
+    assert probe_recognition_mode(item).state == "error"
 def test_model_manager_probe_classifies_invalid_and_unavailable_responses(monkeypatch) -> None:
     assert probe_model_manager(environ={"LEGAL_REDACTOR_MODEL_MANAGER_PORT": "bad"}).state == "error"
     assert probe_model_manager(environ={"LEGAL_REDACTOR_SKIP_MLX": "1", "LEGAL_REDACTOR_MODEL_MANAGER_PORT": "bad"}).state == "skipped"
@@ -160,12 +175,12 @@ def test_model_manager_probe_classifies_invalid_and_unavailable_responses(monkey
     assert probe_model_manager(environ={}, timeout=0.01).state == "missing"
 
 
-def test_model_manager_failure_reports_degraded_recognition_mode() -> None:
+def test_model_manager_failure_reports_blocked_recognition_mode() -> None:
     api = StatusItem("model_manager", "本地模型 API", "missing", "down", "configure")
-    fallback = probe_recognition_mode(api)
+    recognition = probe_recognition_mode(api)
 
-    assert fallback.state == "degraded"
-    assert "低于 LLM 辅助模式" in fallback.message
+    assert recognition.state == "error"
+    assert "已停止新的脱敏生成" in recognition.message
 
 
 def test_case_root_probe_ready_missing_and_unwritable(tmp_path) -> None:

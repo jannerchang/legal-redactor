@@ -69,6 +69,9 @@ BUILTIN_MODEL_SOURCE_NAMES = frozenset(
         "models--mlx-community--Qwen3.5-9B-MLX-4bit",
     }
 )
+INCOMPATIBLE_FULL_DOCUMENT_MODEL_IDS = frozenset(
+    {"mlx-community/Qwen3.5-4B-MLX-4bit"}
+)
 _logger = get_logger(__name__)
 
 
@@ -151,13 +154,22 @@ class ModelManager:
             }
 
     def health_payload(self) -> dict[str, str | None]:
-        with self._lock:
+        acquired = self._lock.acquire(blocking=False)
+        if not acquired:
+            return {
+                "status": "ok",
+                "active_model": self._active_model,
+                "worker_state": "busy",
+            }
+        try:
             self._refresh_worker_state()
             return {
                 "status": "error" if self._worker_state == "error" else "ok",
                 "active_model": self._active_model,
                 "worker_state": self._worker_state,
             }
+        finally:
+            self._lock.release()
 
     def ensure_model(self, model_id: str) -> ModelSpec:
         with self._lock:
@@ -423,7 +435,11 @@ def discover_model_specs(
             if not _model_source_is_available(candidate) or not _is_supported_discovered_model(candidate):
                 continue
             model_id = _logical_model_id(candidate.name)
-            if not model_id or model_id in discovered:
+            if (
+                not model_id
+                or model_id in discovered
+                or model_id in INCOMPATIBLE_FULL_DOCUMENT_MODEL_IDS
+            ):
                 continue
             discovered[model_id] = ModelSpec(
                 model_id,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +22,56 @@ from legal_redactor.regression import (
 RAW_PERSON = "张三"
 RAW_COMPANY = "星河建设有限公司"
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _full_document_manager_script(path: Path) -> Path:
+    path.write_text(
+        """from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        request = json.loads(self.rfile.read(length))
+        prompt = request["messages"][0]["content"]
+        names = ["张三"] if "张三" in prompt else []
+        registry = {
+            "persons": names,
+            "organizations": [],
+            "locations": [],
+            "same_entities": [],
+        }
+        content = json.dumps(registry, ensure_ascii=False, separators=(",", ":"))
+        body = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+print(server.server_address[1], flush=True)
+server.serve_forever()
+""",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _start_full_document_manager(tmp_path: Path) -> tuple[subprocess.Popen[str], int]:
+    script = _full_document_manager_script(tmp_path / "fake_model_manager.py")
+    process = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None
+    port = int(process.stdout.readline().strip())
+    return process, port
 
 def test_module_cli_uses_manager_logical_model_for_redaction(monkeypatch, tmp_path) -> None:
     from legal_redactor import __main__ as module_cli
@@ -50,6 +101,34 @@ def test_module_cli_uses_manager_logical_model_for_redaction(monkeypatch, tmp_pa
     assert configs[0].enable_llm is True
     assert configs[0].llm.model == QWEN_MODEL_ID
     assert configs[0].llm.recognition_mode == "full_document"
+
+
+
+def test_module_cli_recognition_failure_exits_without_artifacts(monkeypatch, tmp_path) -> None:
+    import pytest
+
+    from legal_redactor import __main__ as module_cli
+    from legal_redactor.pipeline import RecognitionUnavailableError
+
+    input_path = tmp_path / "judgment.txt"
+    output_dir = tmp_path / "output"
+    input_path.write_text("原告张三。", encoding="utf-8")
+
+    class FailingPipeline:
+        def __init__(self, config) -> None:
+            del config
+
+        def redact(self, text, source_file=None):
+            del text, source_file
+            raise RecognitionUnavailableError("timeout")
+
+    monkeypatch.setattr(module_cli, "RedactionPipeline", FailingPipeline)
+
+    with pytest.raises(SystemExit) as raised:
+        module_cli.main([str(input_path), "--output-dir", str(output_dir)])
+
+    assert raised.value.code == 2
+    assert not output_dir.exists()
 
 
 def test_module_cli_uses_manager_logical_model_for_evaluation(monkeypatch, tmp_path) -> None:
@@ -393,40 +472,49 @@ def test_cli_writes_privacy_safe_regression_report_and_thresholds(tmp_path) -> N
         ),
         encoding="utf-8",
     )
+    manager, manager_port = _start_full_document_manager(tmp_path)
+    manager_env = {
+        **os.environ,
+        "LEGAL_REDACTOR_MODEL_MANAGER_HOST": "127.0.0.1",
+        "LEGAL_REDACTOR_MODEL_MANAGER_PORT": str(manager_port),
+    }
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "legal_redactor",
-            "--llm",
-            "off",
-            "--eval-gold",
-            str(gold_path),
-            "--eval-fail-under-recall",
-            "0.0",
-            "--eval-fail-under-precision",
-            "0.0",
-            "--regression-report",
-            str(report_path),
-            "--regression-sample-summary",
-            str(summary_path),
-            "--regression-sample-file",
-            str(sample_path),
-            "--regression-redacted",
-            str(redacted_path),
-            "--regression-map",
-            str(map_path),
-            "--regression-input-at",
-            "2026-06-29T08:00:00+00:00",
-            "--regression-saved-at",
-            "2026-06-29T08:00:01+00:00",
-        ],
-        check=False,
-        text=True,
-        capture_output=True,
-        cwd=REPO_ROOT,
-    )
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "legal_redactor",
+                "--eval-gold",
+                str(gold_path),
+                "--eval-fail-under-recall",
+                "0.0",
+                "--eval-fail-under-precision",
+                "0.0",
+                "--regression-report",
+                str(report_path),
+                "--regression-sample-summary",
+                str(summary_path),
+                "--regression-sample-file",
+                str(sample_path),
+                "--regression-redacted",
+                str(redacted_path),
+                "--regression-map",
+                str(map_path),
+                "--regression-input-at",
+                "2026-06-29T08:00:00+00:00",
+                "--regression-saved-at",
+                "2026-06-29T08:00:01+00:00",
+            ],
+            check=False,
+            text=True,
+            capture_output=True,
+            cwd=REPO_ROOT,
+            env=manager_env,
+        )
+    finally:
+        manager.terminate()
+        manager.wait(timeout=5)
     assert result.returncode == 0, result.stderr + result.stdout
     assert "[回归报告]" in result.stdout
 
@@ -440,26 +528,31 @@ def test_cli_writes_privacy_safe_regression_report_and_thresholds(tmp_path) -> N
     assert '"matched"' not in encoded
     assert '"missing"' not in encoded
     assert '"extra"' not in encoded
+    manager, manager_port = _start_full_document_manager(tmp_path)
+    manager_env["LEGAL_REDACTOR_MODEL_MANAGER_PORT"] = str(manager_port)
 
-    failing = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "legal_redactor",
-            "--llm",
-            "off",
-            "--eval-gold",
-            str(gold_path),
-            "--eval-fail-under-recall",
-            "1.1",
-            "--regression-report",
-            str(tmp_path / "regression-fail.json"),
-        ],
-        check=False,
-        text=True,
-        capture_output=True,
-        cwd=REPO_ROOT,
-    )
+    try:
+        failing = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "legal_redactor",
+                "--eval-gold",
+                str(gold_path),
+                "--eval-fail-under-recall",
+                "1.1",
+                "--regression-report",
+                str(tmp_path / "regression-fail.json"),
+            ],
+            check=False,
+            text=True,
+            capture_output=True,
+            cwd=REPO_ROOT,
+            env=manager_env,
+        )
+    finally:
+        manager.terminate()
+        manager.wait(timeout=5)
     assert failing.returncode == 2
 
 
@@ -475,8 +568,6 @@ def test_cli_reports_malformed_inputs_without_traceback(tmp_path) -> None:
             sys.executable,
             "-m",
             "legal_redactor",
-            "--llm",
-            "off",
             "--eval-gold",
             str(bad_gold),
             "--regression-report",

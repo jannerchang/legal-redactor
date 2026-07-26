@@ -172,7 +172,7 @@ DEFAULT_MODEL_MANAGER_PORT = 18080
 @dataclass(frozen=True)
 class LLMAPIConfig:
     enabled: bool = True
-    role: str = "candidate_review_only"
+    role: str = "full_document_registry"
     mode: str = "max-effect"
     recognition_mode: str = "full_document"
     model: str = DEFAULT_MODEL_ID
@@ -181,15 +181,14 @@ class LLMAPIConfig:
     output_format: str = "json"
     timeout_seconds: int = 120
     full_document_max_chars: int = 120000
-    full_document_max_output_tokens: int = 8192
+    full_document_max_output_tokens: int = 1024
     full_document_timeout_seconds: int = 600
     full_document_retry_count: int = 1
-    fail_open: bool = True
     model_manager_host: str = field(default_factory=lambda: os.environ.get("LEGAL_REDACTOR_MODEL_MANAGER_HOST", DEFAULT_MODEL_MANAGER_HOST))
     model_manager_port: int = field(default_factory=lambda: int(os.environ.get("LEGAL_REDACTOR_MODEL_MANAGER_PORT", str(DEFAULT_MODEL_MANAGER_PORT))))
 
     def __post_init__(self) -> None:
-        if self.recognition_mode not in {"sentence_windows", "full_document"}:
+        if self.recognition_mode != "full_document":
             raise ValueError(f"unsupported recognition mode: {self.recognition_mode}")
         if self.full_document_max_chars <= 0:
             raise ValueError("full_document_max_chars must be positive")
@@ -203,17 +202,11 @@ class LLMAPIConfig:
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    semantic_llm_first: bool = False
     enable_regex: bool = True
     enable_hebei_admin_db: bool = True
     hebei_admin_db_path: str = "data/hebei_admin_divisions.sqlite"
     enable_china_admin_db: bool = True
     china_admin_db_path: str = "data/china_admin_divisions.sqlite"
-    enable_china_admin_rules: bool = True
-    enable_heuristic_ner: bool = True
-    enable_hanlp_ner: bool = False
-    hanlp_model: str = "MSRA_NER_ELECTRA_SMALL_ZH"
-    hanlp_max_chars: int = 12000
     enable_llm: bool = True
     llm: LLMAPIConfig = field(default_factory=LLMAPIConfig)
     redaction_profile: RedactionProfile = field(default_factory=RedactionProfile.standard)
@@ -223,7 +216,8 @@ class PipelineConfig:
         return self.redaction_profile.name
 
     @classmethod
-    def offline_without_llm(cls, profile_name: str = "standard") -> "PipelineConfig":
+    def mapping_only(cls, profile_name: str = "standard") -> "PipelineConfig":
+        """Build a pipeline for applying an existing confirmed mapping only."""
         llm = LLMAPIConfig(enabled=False)
         return cls(
             enable_llm=False,
@@ -240,16 +234,14 @@ class PipelineConfig:
     ) -> "PipelineConfig":
         llm = LLMAPIConfig(
             enabled=True,
-            role="sentence_entity_extraction",
+            role="full_document_registry",
             model=model,
             mode="max-effect",
             recognition_mode=recognition_mode,
             context_window=8192,
             timeout_seconds=120,
-            fail_open=True,
         )
         return cls(
-            semantic_llm_first=True,
             enable_llm=True,
             llm=llm,
             redaction_profile=RedactionProfile.from_preset(profile_name),
@@ -264,16 +256,14 @@ class PipelineConfig:
     ) -> "PipelineConfig":
         llm = LLMAPIConfig(
             enabled=True,
-            role="sentence_entity_extraction",
+            role="full_document_registry",
             model=model,
             mode="balanced",
             recognition_mode=recognition_mode,
             context_window=8192,
             timeout_seconds=180,
-            fail_open=False,
         )
         return cls(
-            semantic_llm_first=True,
             enable_llm=True,
             llm=llm,
             redaction_profile=RedactionProfile.from_preset(profile_name),
@@ -288,7 +278,7 @@ class PipelineConfig:
         recognition_mode: str = "full_document",
     ) -> "PipelineConfig":
         if llm_mode == "off":
-            return cls.offline_without_llm(profile_name)
+            raise ValueError("LLM recognition cannot be disabled for new redaction")
         if llm_mode == "balanced":
             return cls.balanced_llm(
                 profile_name,

@@ -13,7 +13,7 @@ from .io import (
     save_redaction_map_auto,
     write_document,
 )
-from .pipeline import RedactionPipeline
+from .pipeline import RecognitionUnavailableError, RedactionPipeline
 from .restore import preview_restore, restore_docx, restore_text
 from .recognition_benchmark import (
     load_benchmark_manifest,
@@ -29,18 +29,11 @@ def main(argv: list[str] | None = None) -> int:
     redact_parser = subparsers.add_parser("redact", help="脱敏 txt/md/docx")
     redact_parser.add_argument("input", help="输入文档路径")
     redact_parser.add_argument("--out", default="output", help="输出目录")
-    redact_parser.add_argument("--no-llm", action="store_true", help="禁用本地 LLM，使用离线规则兜底")
     redact_parser.add_argument(
         "--llm-mode",
-        choices=("max-effect", "balanced", "off"),
+        choices=("max-effect", "balanced"),
         default="max-effect",
         help="本地 model-manager 的语义识别模式",
-    )
-    redact_parser.add_argument(
-        "--recognition-mode",
-        choices=("sentence_windows", "full_document"),
-        default="full_document",
-        help="实体识别路径；默认整篇文书双轮补漏",
     )
     redact_parser.add_argument("--model", default=DEFAULT_MODEL_ID, help="model-manager 返回的逻辑模型 ID")
     redact_parser.add_argument("--debug-trace", action="store_true", help="额外输出 debug_trace.json")
@@ -65,18 +58,11 @@ def main(argv: list[str] | None = None) -> int:
     eval_parser = subparsers.add_parser("eval", help="用 gold set 评估识别率")
     eval_parser.add_argument("gold", help="gold set JSON 路径")
     eval_parser.add_argument("--out", default="", help="保存完整 JSON 报告的路径")
-    eval_parser.add_argument("--no-llm", action="store_true", help="禁用本地 LLM，评估离线规则")
     eval_parser.add_argument(
         "--llm-mode",
-        choices=("max-effect", "balanced", "off"),
+        choices=("max-effect", "balanced"),
         default="max-effect",
         help="评估使用的本地 model-manager 模式",
-    )
-    eval_parser.add_argument(
-        "--recognition-mode",
-        choices=("sentence_windows", "full_document"),
-        default="full_document",
-        help="评估使用的实体识别路径",
     )
     eval_parser.add_argument("--model", default=DEFAULT_MODEL_ID, help="model-manager 返回的逻辑模型 ID")
     eval_parser.add_argument("--fail-under-recall", type=float, default=None, help="低于该 recall 时返回非零")
@@ -111,13 +97,16 @@ def main(argv: list[str] | None = None) -> int:
 def _run_redact(args: argparse.Namespace) -> int:
     input_path = Path(args.input)
     text = read_document(input_path)
-    config = PipelineConfig.offline_without_llm() if args.no_llm else PipelineConfig.from_llm_mode(
+    config = PipelineConfig.from_llm_mode(
         args.llm_mode,
         model=args.model,
-        recognition_mode=args.recognition_mode,
     )
     pipeline = RedactionPipeline(config=config)
-    result = pipeline.redact(text, source_file=input_path.name)
+    try:
+        result = pipeline.redact(text, source_file=input_path.name)
+    except RecognitionUnavailableError as exc:
+        print(f"redaction failed: {exc}", file=sys.stderr)
+        return 2
 
     output_dir = Path(args.out)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -197,10 +186,9 @@ def _run_clear_samples(args: argparse.Namespace) -> int:
 def _run_eval(args: argparse.Namespace) -> int:
     from .evaluation import evaluate_gold_file, evaluation_report_to_json
 
-    config = PipelineConfig.offline_without_llm() if args.no_llm else PipelineConfig.from_llm_mode(
+    config = PipelineConfig.from_llm_mode(
         args.llm_mode,
         model=args.model,
-        recognition_mode=args.recognition_mode,
     )
     report = evaluate_gold_file(args.gold, config=config)
     print(

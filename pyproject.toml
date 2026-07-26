@@ -19,10 +19,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-hanlp = [
-  "hanlp>=2.1",
-  "transformers<5",
-]
 test = [
   "pytest>=7.4",
   "pytest-cov>=4.1",

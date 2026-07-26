@@ -94,23 +94,6 @@ BARE_COMPANY_ALIAS_RE = re.compile(
 
 FACT_SECTION_BOUNDARY_RE = re.compile(r"本院(?:经审理|经审查|审理)?认为")
 
-# Common Chinese surnames (single + compound) for person-name validation.
-# Shared between detectors.py fallback matching and false-person filtering.
-COMMON_SURNAMES = frozenset(
-    "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜"
-    "戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳史唐"
-    "费薛雷贺倪汤罗毕郝安常于时傅齐康伍余元顾孟平黄和萧尹姚邵汪祁毛"
-    "狄米明计成戴谈宋庞熊纪舒屈项祝董梁杜阮蓝季强贾路娄危江童颜郭梅盛林"
-    "钟徐邱骆高夏蔡田樊胡凌霍万柯管卢莫经房裘干解应宗丁宣邓郁单洪包诸左"
-    "石崔吉龚程邢裴陆荣翁惠甄曲家封储松段富巫焦巴弓秋仲伊宁仇暴甘厉戎祖"
-    "武符刘景詹龙叶幸司黎薄白从赖卓屠池乔阴能苍双闻党谭贡劳姬申冉郦"
-    "桂牛寿通边燕浦尚农温庄晏柴瞿阎慕连茹习艾向古易戈廖终居衡步都耿满弘"
-    "国文寇广禄阙东欧利师巩聂勾融冷辛简饶空曾沙养鞠须丰巢关查后荆红游权"
-    "盖益公万俟司马上官欧阳夏侯诸葛闻人东方赫连皇甫尉迟公羊澹台公冶宗政"
-    "濮阳淳于单于太叔申屠公孙仲孙轩辕令狐钟离宇文长孙慕容鲜于闾丘司徒司空"
-    "端木巫马公西漆雕乐正拓跋夹谷谷梁晋楚闫法涂钦呼延羊舌岳帅有琴梁丘左丘"
-    "南宫"
-)
 
 # Generic industry/brand words that should not be treated as company brand names.
 # Consolidated from pipeline.GENERIC_BRAND_BLACKLIST and detectors._FALSE_ORG_BRANDS.
@@ -224,31 +207,3 @@ INDUSTRY_CORE_SUFFIXES = frozenset({
     "开发", "投资", "科技", "信息", "服务", "咨询", "代理", "管理", "贸易",
     "商贸", "建筑", "劳务", "环保", "能源", "置业", "产业", "电力", "水利",
 })
-
-# Fallback person-name detection patterns for Chinese legal documents, used by
-# detectors.detect_fallback_person_candidates. Compiled here so the lexicon is
-# the single source of person-detection vocabulary. All CJK char ranges use the
-# literal form [一-龥] (== [一-龥]); unified across every pattern.
-# Members preserved verbatim from the former detectors copy.
-PERSON_AFTER_KINSHIP_RE = re.compile(
-    r"(?:及其|与其|和其|其|的)"
-    r"(?:儿子|儿|子|女儿|女|父亲|父|母亲|母|妻子|妻|丈夫|夫|配偶|兄弟|哥哥|弟弟|姐姐|妹妹)"
-    r"([一-龥]{2,4}?)(?=之间|间|，|,|。|；|;|、|和|与|及|$)"
-)
-
-FALLBACK_PERSON_PATTERNS = [
-    # "，XXX，男/女" 或 "，XXX，汉族"
-    re.compile(r"[，,]\s*([一-龥]{2,4})\s*[，,]\s*(?:男|女|汉族)"),
-    # 句号/换行后的人名动作
-    re.compile(r"(?:^|[。\n])\s*(?:原告|被告|第三人|上诉人|被上诉人|申请人|被申请人)?\s*([一-龥]{2,4})\s*(?:答辩称|辩称|诉称|申请称|复议称|向本院|补充)"),
-    # 名字+的+特定角色或动作主张
-    re.compile(r"(?:^|[，。；\n、])\s*([一-龥]{2,4})的(?:委托|法定|诉讼|代理|主张|请求|意见|陈述|辩称|诉称|要求|签字|签章|签名)"),
-    # 角色标签后的明确冒号人名
-    re.compile(r"(?:证人|联系人|经办人|代理人|法定代表人|负责人|经营者|执行人|收件人)[：:]\s*([一-龥]{2,4})(?=[，。；\n、]|$)"),
-    # 常用关系/介词引导人名（对单字介词限制前导字符，防止误匹配"涉及"、"合同"等，并移除了纯连接词"及"）
-    re.compile(r"(?:(?:听取|询问|传唤|通知|告知|召集|委托|交由|伙同|连同|会同)|(?<!涉|以|波|触|及|共|合|不|陪|相|针|面|敌|交|送|分|留|付|参|赠|施|总|温)(?:由|向|与|和|同|对|给|致))\s*([一-龥]{2,3})(?=[，。；\n、\s一-龥])"),
-    # 句中名字起句与动作
-    re.compile(r"(?:^|[，。；\n、\s])\s*([一-龥]{2,3})\s*(?:于|在|已|将|以|向|与|提交|提供|出具|收到|签收|签署|签字|支付|偿还|欠|借|称|说|表示|辩称|要求|主张|确认|拒绝|不服|同意|补办|说明|转账|汇款|下载|发送|立案|驳回)"),
-    # 亲属关系
-    PERSON_AFTER_KINSHIP_RE,
-]

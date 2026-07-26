@@ -252,6 +252,116 @@ def _entity_id_prefix(entity_type: str) -> str:
     return "org" if entity_type == "organization" else entity_type
 
 
+_PERSON_IDENTITY_MARKERS = (
+    "又名",
+    "别名",
+    "原名",
+    "曾用名",
+    "化名",
+    "本名",
+    "真实姓名",
+    "系同一人",
+    "为同一人",
+    "是同一人",
+    "同一自然人",
+)
+_IDENTITY_CONTEXT_BREAKS = "。！？；;\n"
+
+
+def _split_unverified_person_identity_groups(
+    text: str,
+    registry: FullDocumentEntityRegistry,
+) -> tuple[FullDocumentEntityRegistry, int]:
+    entities: list[RegistryEntity] = []
+    do_not_merge = list(registry.do_not_merge)
+    blocked_pairs = {pair.normalized() for pair in do_not_merge}
+    used_ids = {entity.entity_id for entity in registry.entities}
+    next_index = max(
+        (
+            int(match.group(1))
+            for entity in registry.entities
+            if (match := re.fullmatch(r"person-(\d+)", entity.entity_id))
+        ),
+        default=0,
+    )
+    split_count = 0
+
+    for entity in registry.entities:
+        if entity.entity_type != "person" or len(entity.variants) < 2:
+            entities.append(entity)
+            continue
+        verified_groups: list[list[str]] = []
+        for variant in entity.variants:
+            target = next(
+                (
+                    group
+                    for group in verified_groups
+                    if any(_has_explicit_person_identity_evidence(text, variant, known) for known in group)
+                ),
+                None,
+            )
+            if target is None:
+                verified_groups.append([variant])
+            else:
+                target.append(variant)
+        if len(verified_groups) == 1:
+            entities.append(entity)
+            continue
+
+        split_count += len(verified_groups) - 1
+        split_entities: list[RegistryEntity] = []
+        for group_index, group in enumerate(verified_groups):
+            if group_index == 0:
+                entity_id = entity.entity_id
+            else:
+                next_index += 1
+                entity_id = f"person-{next_index}"
+                while entity_id in used_ids:
+                    next_index += 1
+                    entity_id = f"person-{next_index}"
+                used_ids.add(entity_id)
+            split_entity = replace(
+                entity,
+                entity_id=entity_id,
+                primary_text=max(group, key=len),
+                variants=tuple(group),
+            )
+            split_entities.append(split_entity)
+            entities.append(split_entity)
+        for left_index, left in enumerate(split_entities):
+            for right in split_entities[left_index + 1 :]:
+                pair = DoNotMergePair(left.entity_id, right.entity_id)
+                if pair.normalized() not in blocked_pairs:
+                    blocked_pairs.add(pair.normalized())
+                    do_not_merge.append(pair)
+
+    return (
+        FullDocumentEntityRegistry(
+            entities=tuple(entities),
+            do_not_merge=tuple(do_not_merge),
+            uncertain=registry.uncertain,
+        ),
+        split_count,
+    )
+
+
+def _has_explicit_person_identity_evidence(text: str, left: str, right: str) -> bool:
+    if left == right:
+        return True
+    for left_match in re.finditer(re.escape(left), text):
+        for right_match in re.finditer(re.escape(right), text):
+            start = min(left_match.start(), right_match.start())
+            end = max(left_match.end(), right_match.end())
+            if end - start > 48:
+                continue
+            context = text[start:end]
+            if any(break_char in context for break_char in _IDENTITY_CONTEXT_BREAKS):
+                continue
+            if any(marker in context for marker in _PERSON_IDENTITY_MARKERS):
+                return True
+    return False
+
+
 def validate_registry_against_text(
     text: str,
     registry_or_result: FullDocumentEntityRegistry | RegistryValidationResult,
@@ -265,6 +375,9 @@ def validate_registry_against_text(
     else:
         registry = registry_or_result
         inherited_warnings = []
+    registry, split_person_identity_count = _split_unverified_person_identity_groups(text, registry)
+    if split_person_identity_count:
+        inherited_warnings.append(f"registry_person_identity_splits:{split_person_identity_count}")
 
     entity_ids = {entity.entity_id for entity in registry.entities}
     for pair in registry.do_not_merge:
@@ -527,10 +640,10 @@ def _payload_object(payload: object) -> dict[str, Any]:
 
 
 def _normalize_registry(data: dict[str, Any]) -> FullDocumentEntityRegistry:
-    if set(data) <= {"persons", "organizations", "locations", "same_entities"} and {
-        "persons", "organizations", "locations", "same_entities"
-    } <= set(data):
-        return _normalize_minimal_registry(data)
+    minimal_fields = {"persons", "organizations", "locations", "same_entities"}
+    if set(data) & minimal_fields or not data:
+        minimal_data = {key: data.get(key, []) for key in minimal_fields}
+        return _normalize_minimal_registry(minimal_data)
     return _normalize_detailed_registry(data)
 
 

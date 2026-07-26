@@ -21,7 +21,7 @@ from pathlib import Path
 from .config import PipelineConfig
 from .io import load_redaction_map_auto, read_document, write_document
 from .model_manager import DEFAULT_MODEL_ID
-from .pipeline import RedactionPipeline
+from .pipeline import RecognitionUnavailableError, RedactionPipeline
 from .recognition_benchmark import (
     load_benchmark_manifest,
     recognition_benchmark_report_to_json,
@@ -55,15 +55,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--llm",
-        choices=("max-effect", "balanced", "off"),
+        choices=("max-effect", "balanced"),
         default="max-effect",
         help="本地模型识别模式",
-    )
-    parser.add_argument(
-        "--recognition-mode",
-        choices=("sentence_windows", "full_document"),
-        default="full_document",
-        help="实体识别路径；默认整篇文书双轮补漏",
     )
     parser.add_argument(
         "--model",
@@ -279,32 +273,34 @@ def _do_redact(args: argparse.Namespace) -> None:
         args.llm,
         profile_name="standard",
         model=args.model,
-        recognition_mode=args.recognition_mode,
     )
     pipeline = RedactionPipeline(config=config)
     output_dir = Path(args.output_dir)
 
-    if args.batch and len(input_paths) > 1:
-        documents = [(p.name, read_document(str(p))) for p in input_paths]
-        result = pipeline.redact_many(documents)
-        session_dir = output_dir / _session_name(args)
-        session_dir.mkdir(parents=True, exist_ok=True)
-        for doc in result.documents:
-            out_path = session_dir / _redacted_filename(doc.source_file)
-            write_document(str(out_path), doc.redacted_text)
-            print(f"[写入] {out_path}")
-        map_path = session_dir / "redaction_map.enc"
-        from .io import save_redaction_map_auto
-        save_redaction_map_auto(str(map_path), result.redaction_map)
-        print(f"[映射表] {map_path}")
-        if args.debug_trace:
-            from .debug_trace import batch_debug_trace, debug_trace_to_json
+    try:
+        if args.batch and len(input_paths) > 1:
+            documents = [(p.name, read_document(str(p))) for p in input_paths]
+            result = pipeline.redact_many(documents)
+            session_dir = output_dir / _session_name(args)
+            session_dir.mkdir(parents=True, exist_ok=True)
+            for doc in result.documents:
+                out_path = session_dir / _redacted_filename(doc.source_file)
+                write_document(str(out_path), doc.redacted_text)
+                print(f"[写入] {out_path}")
+            map_path = session_dir / "redaction_map.enc"
+            from .io import save_redaction_map_auto
 
-            trace_path = session_dir / "debug_trace.json"
-            trace_path.write_text(debug_trace_to_json(batch_debug_trace(result)), encoding="utf-8")
-            print(f"[调试追踪] {trace_path}")
-        _print_warnings_and_leaks(result.warnings, result.leaks)
-    else:
+            save_redaction_map_auto(str(map_path), result.redaction_map)
+            print(f"[映射表] {map_path}")
+            if args.debug_trace:
+                from .debug_trace import batch_debug_trace, debug_trace_to_json
+
+                trace_path = session_dir / "debug_trace.json"
+                trace_path.write_text(debug_trace_to_json(batch_debug_trace(result)), encoding="utf-8")
+                print(f"[调试追踪] {trace_path}")
+            _print_warnings_and_leaks(result.warnings, result.leaks)
+            return
+
         for input_path in input_paths:
             text = read_document(str(input_path))
             result = pipeline.redact(text, source_file=input_path.name)
@@ -315,6 +311,7 @@ def _do_redact(args: argparse.Namespace) -> None:
             print(f"[写入] {out_path}")
             map_path = session_dir / "redaction_map.enc"
             from .io import save_redaction_map_auto
+
             save_redaction_map_auto(str(map_path), result.redaction_map)
             print(f"[映射表] {map_path}")
             if args.debug_trace:
@@ -324,6 +321,9 @@ def _do_redact(args: argparse.Namespace) -> None:
                 trace_path.write_text(debug_trace_to_json(redaction_debug_trace(result)), encoding="utf-8")
                 print(f"[调试追踪] {trace_path}")
             _print_warnings_and_leaks(result.warnings, result.leaks)
+    except RecognitionUnavailableError as exc:
+        print(f"[脱敏失败] {exc}", file=sys.stderr)
+        sys.exit(2)
 
 
 def _do_restore(map_path: str, redacted_path: str, output_dir: str) -> None:
@@ -370,7 +370,6 @@ def _do_eval(args: argparse.Namespace) -> None:
         args.llm,
         profile_name="standard",
         model=args.model,
-        recognition_mode=args.recognition_mode,
     )
     eval_started = time.monotonic()
     try:

@@ -133,7 +133,7 @@ def probe_model_manager(
             "model_manager",
             "本地模型 API",
             "skipped",
-            "本地模型 API 已由 LEGAL_REDACTOR_SKIP_MLX=1 跳过；将使用纯规则模式。",
+            "本地模型 API 已由 LEGAL_REDACTOR_SKIP_MLX=1 跳过；新的脱敏将停止生成。",
             "取消该环境变量后启动本地模型 API",
             {"host": DEFAULT_MODEL_MANAGER_HOST, "port": DEFAULT_MODEL_MANAGER_PORT, "reason": "skip_requested"},
         )
@@ -167,7 +167,7 @@ def probe_model_manager(
     if not isinstance(health_payload, dict) or health_payload.get("status") not in {"ok", "error"}:
         return StatusItem("model_manager", "本地模型 API", "error", "本地模型 API /health 返回结构不符合协议。", "检查模型管理器", details)
     worker_state = health_payload.get("worker_state")
-    if worker_state in {"ready", "stopped", "starting", "error"}:
+    if worker_state in {"ready", "stopped", "starting", "busy", "error"}:
         details["worker_state"] = worker_state
     if health_payload.get("status") == "error" or worker_state == "error":
         details["reason"] = "worker_error"
@@ -208,14 +208,13 @@ def probe_model_manager(
 
 def probe_recognition_mode(model_manager_item: StatusItem) -> StatusItem:
     if model_manager_item.state == "ready":
-        return StatusItem("recognition_mode", "识别模式", "ready", "LLM 辅助识别可用。", "无需处理")
+        return StatusItem("recognition_mode", "识别模式", "ready", "全文 LLM 识别可用。", "无需处理")
     return StatusItem(
         "recognition_mode",
         "识别模式",
-        "degraded",
-        "当前将退回规则/HanLP 可用部分，识别支持低于 LLM 辅助模式。",
-        "需要更高召回时先修复本地模型 API 状态",
-        {"model_manager_state": model_manager_item.state},
+        "error",
+        "全文 LLM 不可用，已停止新的脱敏生成。",
+        "启动本地模型管理器并确认所选逻辑模型可用",
     )
 
 
