@@ -166,12 +166,23 @@ def _span_overlaps_admin(
 
 
 
-_AUTOMATIC_ADMIN_LEVELS = frozenset({"province", "city", "county", "county_city"})
+_NATIONWIDE_AUTOMATIC_ADMIN_LEVELS = frozenset({"province", "city"})
+_HEBEI_AUTOMATIC_ADMIN_LEVELS = frozenset(
+    {"province", "city", "county", "county_city", "township"}
+)
 
 
 def _automatic_admin_candidate(candidate: Candidate) -> bool:
-    """Keep automatic location redaction to province, city, district, and county."""
-    return candidate.type == "location" and str(candidate.metadata.get("level", "")) in _AUTOMATIC_ADMIN_LEVELS
+    """Apply the configured depth: nationwide province/city, Hebei through township."""
+    if candidate.type != "location":
+        return False
+    level = str(candidate.metadata.get("level", ""))
+    allowed_levels = (
+        _HEBEI_AUTOMATIC_ADMIN_LEVELS
+        if candidate.source == "hebei_admin_db"
+        else _NATIONWIDE_AUTOMATIC_ADMIN_LEVELS
+    )
+    return level in allowed_levels
 
 
 def _append_admin_detection(
@@ -764,8 +775,8 @@ class RedactionPipeline:
             AdminDivisionDetector(
                 self.config.china_admin_db_path,
                 source="china_admin_db",
-                region_label="全国三级行政区划",
-                max_level="county_city",
+                region_label="全国省市行政区划",
+                max_level="city",
                 require_canonical_substring=True,
             )
             if self.config.enable_china_admin_db else None

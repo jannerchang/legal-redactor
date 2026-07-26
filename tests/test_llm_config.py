@@ -389,6 +389,8 @@ def test_full_document_prompt_requires_minimal_identity_groups() -> None:
     assert '"persons":["张三","李四"]' in prompt
     assert "无法确认就不列" in prompt
     assert "same_entities 两项文字必须不同，禁止名称与自身配对" in prompt
+    assert "地点只登记省级或地级市名称" in prompt
+    assert "禁止登记区、县、旗、乡镇、街道、村、社区" in prompt
     assert "不要证据、entity_id、type、confidence、解释、Markdown、脱敏稿、换行或其他字段" in prompt
     assert "输出最后一个 } 后立即停止" in prompt
     assert '"same_entities":[["星河建设有限公司","星河公司"]]' in prompt
@@ -414,6 +416,7 @@ def test_full_document_supplement_prompt_excludes_known_names_and_keeps_full_tex
     assert "每个字段只允许出现一次" in prompt
 
     assert "禁止名称与自身配对" in prompt
+    assert "地点只登记省级或地级市名称" in prompt
 
 def test_truncated_registry_repair_only_closes_existing_json_structure() -> None:
     truncated = '{"persons":["张三"],"organizations":["星河建设有限公司"],"locations":[],"same_entities":['

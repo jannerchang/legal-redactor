@@ -65,7 +65,8 @@ class ChinaAdminRulesTests(unittest.TestCase):
                 result = RedactionPipeline(config=config).redact("原告张三住广东省深圳市南山区。")
 
         originals = {entry.original for entry in result.redaction_map.mappings}
-        self.assertTrue({"张三", "广东省", "深圳市", "南山区"}.issubset(originals))
+        self.assertTrue({"张三", "广东省", "深圳市"}.issubset(originals))
+        self.assertNotIn("南山区", originals)
 
     def test_llm_location_still_passes_registry_suffix_gate(self) -> None:
         from unittest.mock import patch
@@ -89,6 +90,39 @@ class ChinaAdminRulesTests(unittest.TestCase):
             result = RedactionPipeline(config=config).redact("双方重新确认合同内容。")
 
         self.assertNotIn("重新确认", {entry.original for entry in result.redaction_map.mappings})
+    def test_llm_location_supplement_is_limited_to_province_and_city(self) -> None:
+        from unittest.mock import patch
+
+        extraction = FullDocumentRegistryExtraction(
+            validation=RegistryValidationResult(
+                registry=FullDocumentEntityRegistry(
+                    entities=(
+                        RegistryEntity(
+                            "location-1",
+                            "location",
+                            "广东省",
+                            ("广东省", "深圳市", "南山区"),
+                        ),
+                    )
+                )
+            )
+        )
+        config = replace(
+            PipelineConfig.max_effect(),
+            enable_hebei_admin_db=False,
+            enable_china_admin_db=False,
+        )
+        with patch(
+            "legal_redactor.llm.LegalEntityAuditor.extract_full_document_registry",
+            return_value=extraction,
+        ):
+            result = RedactionPipeline(config=config).redact(
+                "住所地广东省深圳市南山区。"
+            )
+
+        originals = {entry.original for entry in result.redaction_map.mappings}
+        self.assertTrue({"广东省", "深圳市"}.issubset(originals))
+        self.assertNotIn("南山区", originals)
 
 
 def _write_sample_china_db(path: Path) -> None:
@@ -127,21 +161,65 @@ def _write_sample_china_db(path: Path) -> None:
 
 
 class ChinaAdminDetectorTests(unittest.TestCase):
-    def test_detector_reads_province_city_county(self) -> None:
+    def test_detector_reads_only_province_and_city_for_nationwide_database(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "china.sqlite"
             _write_sample_china_db(db_path)
             detector = AdminDivisionDetector(
                 db_path,
                 source="china_admin_db",
-                region_label="全国三级行政区划",
-                max_level="county_city",
+                region_label="全国省市行政区划",
+                max_level="city",
             )
             candidates = detector.detect("住所地广东省深圳市南山区。")
             texts = {candidate.text for candidate in candidates}
             self.assertIn("广东省", texts)
             self.assertIn("深圳市", texts)
-            self.assertIn("南山区", texts)
+            self.assertNotIn("南山区", texts)
+
+    def test_hebei_pipeline_redacts_through_county_and_street(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "hebei.sqlite"
+            _write_sample_hebei_db(db_path)
+            config = replace(
+                PipelineConfig.max_effect(),
+                enable_hebei_admin_db=True,
+                hebei_admin_db_path=str(db_path),
+                enable_china_admin_db=False,
+            )
+            extraction = FullDocumentRegistryExtraction(
+                validation=RegistryValidationResult(registry=FullDocumentEntityRegistry())
+            )
+            with patch(
+                "legal_redactor.llm.LegalEntityAuditor.extract_full_document_registry",
+                return_value=extraction,
+            ):
+                result = RedactionPipeline(config=config).redact(
+                    "住所地河北省石家庄市长安区跃进街道。"
+                )
+
+        originals = {entry.original for entry in result.redaction_map.mappings}
+        self.assertTrue(
+            {"河北省", "石家庄市", "长安区", "跃进街道"}.issubset(originals)
+        )
+
+
+def _write_sample_hebei_db(path: Path) -> None:
+    _write_sample_china_db(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("DELETE FROM admin_divisions")
+        rows = [
+            ("13", "河北省", "河北省", "province", "", "", "", "", "", "", "location", "", "test", "2026", 1),
+            ("1301", "石家庄市", "河北省石家庄市", "city", "13", "河北省", "石家庄市", "", "", "", "location", "", "test", "2026", 1),
+            ("130102", "长安区", "河北省石家庄市长安区", "county", "1301", "石家庄市", "石家庄市", "长安区", "", "", "location", "", "test", "2026", 1),
+            ("130102001", "跃进街道", "河北省石家庄市长安区跃进街道", "township", "130102", "长安区", "石家庄市", "长安区", "跃进街道", "", "location", "", "test", "2026", 1),
+        ]
+        conn.executemany(
+            "INSERT INTO admin_divisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            rows,
+        )
 
 
 if __name__ == "__main__":

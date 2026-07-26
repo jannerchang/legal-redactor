@@ -46,7 +46,7 @@ _COURT_PERSONNEL_PREFIXES = (
     "执行员",
     "执行法官",
 )
-_ALLOWED_LOCATION_SUFFIXES = ("省", "市", "区", "县", "旗", "自治区", "特别行政区", "自治州")
+_ALLOWED_LOCATION_SUFFIXES = ("省", "市", "自治区", "特别行政区", "自治州", "盟", "地区")
 
 
 @dataclass(frozen=True)
