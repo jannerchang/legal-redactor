@@ -293,6 +293,14 @@ def test_discovery_registers_direct_and_huggingface_cache_models(tmp_path: Path)
     (incompatible_snapshot / "config.json").write_text(
         '{"model_type":"qwen3_5"}', encoding="utf-8"
     )
+    bonsai = tmp_path / "models--prism-ml--Ternary-Bonsai-27B-mlx-2bit"
+    bonsai_snapshot = bonsai / "snapshots" / "bonsai"
+    bonsai_snapshot.mkdir(parents=True)
+    (bonsai / "refs").mkdir()
+    (bonsai / "refs" / "main").write_text("bonsai", encoding="utf-8")
+    (bonsai_snapshot / "config.json").write_text(
+        '{"model_type":"qwen3"}', encoding="utf-8"
+    )
 
     discovered = discover_model_specs((tmp_path,))
 
@@ -318,13 +326,13 @@ def test_manager_refreshes_discovered_models_without_restart(tmp_path: Path) -> 
         model_discovery=discovery,
     )
 
-    assert {item["id"] for item in manager.models_payload()["data"]} >= {"First-MLX"}
+    assert {item["id"] for item in manager.models_payload()["data"]} == {"qwen3.5-9b"}
 
     second = tmp_path / "Second-MLX"
     second.mkdir()
     (second / "config.json").write_text('{"model_type":"llama"}', encoding="utf-8")
 
-    assert {item["id"] for item in manager.models_payload()["data"]} >= {"First-MLX", "Second-MLX"}
+    assert {item["id"] for item in manager.models_payload()["data"]} == {"qwen3.5-9b"}
 
 
 def test_manager_health_remains_available_while_inference_lock_is_held(tmp_path: Path) -> None:

@@ -90,7 +90,8 @@ class ChinaAdminRulesTests(unittest.TestCase):
             result = RedactionPipeline(config=config).redact("双方重新确认合同内容。")
 
         self.assertNotIn("重新确认", {entry.original for entry in result.redaction_map.mappings})
-    def test_llm_location_supplement_is_limited_to_province_and_city(self) -> None:
+
+    def test_llm_location_supplement_requires_authoritative_province_or_city(self) -> None:
         from unittest.mock import patch
 
         extraction = FullDocumentRegistryExtraction(
@@ -101,28 +102,33 @@ class ChinaAdminRulesTests(unittest.TestCase):
                             "location-1",
                             "location",
                             "广东省",
-                            ("广东省", "深圳市", "南山区"),
+                            ("广东省", "深圳市", "南山区", "辛集市"),
                         ),
                     )
                 )
             )
         )
-        config = replace(
-            PipelineConfig.max_effect(),
-            enable_hebei_admin_db=False,
-            enable_china_admin_db=False,
-        )
-        with patch(
-            "legal_redactor.llm.LegalEntityAuditor.extract_full_document_registry",
-            return_value=extraction,
-        ):
-            result = RedactionPipeline(config=config).redact(
-                "住所地广东省深圳市南山区。"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "china.sqlite"
+            _write_sample_china_db(db_path)
+            config = replace(
+                PipelineConfig.max_effect(),
+                enable_hebei_admin_db=False,
+                enable_china_admin_db=True,
+                china_admin_db_path=str(db_path),
             )
+            with patch(
+                "legal_redactor.llm.LegalEntityAuditor.extract_full_document_registry",
+                return_value=extraction,
+            ):
+                result = RedactionPipeline(config=config).redact(
+                    "住所地广东省深圳市南山区，另提及辛集市。"
+                )
 
         originals = {entry.original for entry in result.redaction_map.mappings}
         self.assertTrue({"广东省", "深圳市"}.issubset(originals))
         self.assertNotIn("南山区", originals)
+        self.assertNotIn("辛集市", originals)
 
 
 def _write_sample_china_db(path: Path) -> None:

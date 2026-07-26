@@ -6,7 +6,7 @@ import pytest
 
 from legal_redactor.config import LLMAPIConfig, PipelineConfig
 from legal_redactor.llm import LegalEntityAuditor
-from legal_redactor.model_manager import BONSAI_MODEL_ID, QWEN_MODEL_ID
+from legal_redactor.model_manager import QWEN_MODEL_ID
 from legal_redactor.entity_registry import (
     DoNotMergePair,
     FullDocumentEntityRegistry,
@@ -99,7 +99,7 @@ def test_auditor_sends_openai_manager_request_and_parses_choice(monkeypatch) -> 
     ]
     monkeypatch.setattr("legal_redactor.llm.http.client.HTTPConnection", _Connection)
     auditor = LegalEntityAuditor(
-        LLMAPIConfig(model=BONSAI_MODEL_ID, model_manager_host="manager.local", model_manager_port=18080)
+        LLMAPIConfig(model=QWEN_MODEL_ID, model_manager_host="manager.local", model_manager_port=18080)
     )
 
     result = auditor._call_model_manager("sensitive document prompt", max_tokens=321)
@@ -118,7 +118,7 @@ def test_auditor_sends_openai_manager_request_and_parses_choice(monkeypatch) -> 
             "method": "POST",
             "path": "/v1/chat/completions",
             "body": {
-                "model": BONSAI_MODEL_ID,
+                "model": QWEN_MODEL_ID,
                 "messages": [{"role": "user", "content": "sensitive document prompt"}],
                 "stream": False,
                 "temperature": 0.0,
@@ -151,7 +151,7 @@ def test_auditor_manager_errors_do_not_echo_prompt(monkeypatch, response) -> Non
     assert prompt not in str(raised.value)
 
 
-def test_full_document_call_stops_after_closing_json_object(monkeypatch) -> None:
+def test_full_document_calls_use_newline_stop_sequence(monkeypatch) -> None:
     registry = {
         "persons": ["张三"],
         "organizations": [],
@@ -174,7 +174,7 @@ def test_full_document_call_stops_after_closing_json_object(monkeypatch) -> None
     monkeypatch.setattr("legal_redactor.llm.http.client.HTTPConnection", _Connection)
     auditor = LegalEntityAuditor(
         LLMAPIConfig(
-            model=BONSAI_MODEL_ID,
+            model=QWEN_MODEL_ID,
             recognition_mode="full_document",
             model_manager_host="manager.local",
             model_manager_port=18080,
@@ -185,7 +185,7 @@ def test_full_document_call_stops_after_closing_json_object(monkeypatch) -> None
 
     assert result.status == "success"
     assert len(_Connection.requests) == 2
-    assert all(request["body"]["stop"] == "}" for request in _Connection.requests)
+    assert all(request["body"]["stop"] == "\n" for request in _Connection.requests)
     assert all(
         request["body"]["chat_template_kwargs"] == {"enable_thinking": False}
         for request in _Connection.requests
@@ -220,7 +220,7 @@ def test_full_document_token_limit_fails_without_retry(monkeypatch) -> None:
     assert len(_Connection.requests) == 1
 
 
-def test_full_document_supplement_failure_blocks_partial_registry(monkeypatch) -> None:
+def test_full_document_supplement_failure_preserves_primary_registry(monkeypatch) -> None:
     primary_registry = {
         "persons": ["张三"],
         "organizations": [],
@@ -256,9 +256,9 @@ def test_full_document_supplement_failure_blocks_partial_registry(monkeypatch) -
 
     result = LegalEntityAuditor(LLMAPIConfig()).extract_full_document_registry("原告张三，被告李四。")
 
-    assert result.status == "fallback"
+    assert result.status == "success"
     assert result.reason == "supplement_output_token_limit"
-    assert result.validation.registry.entities == ()
+    assert [entity.variants for entity in result.validation.registry.entities] == [("张三",)]
     assert result.metadata.call_count == 2
 
 
@@ -318,7 +318,7 @@ def test_full_document_transport_failure_preserves_http_reason_and_logs(caplog) 
     _Connection.responses = [_Response(503, '{"error":{"code":"model_unavailable"}}')]
     auditor = LegalEntityAuditor(
         LLMAPIConfig(
-            model=BONSAI_MODEL_ID,
+            model=QWEN_MODEL_ID,
             recognition_mode="full_document",
             model_manager_host="manager.local",
             model_manager_port=18080,
@@ -357,7 +357,7 @@ def test_full_document_success_logs_stage_progress(caplog) -> None:
     _Connection.responses = [_Response(200, response_body), _Response(200, response_body)]
     auditor = LegalEntityAuditor(
         LLMAPIConfig(
-            model=BONSAI_MODEL_ID,
+            model=QWEN_MODEL_ID,
             recognition_mode="full_document",
             model_manager_host="manager.local",
             model_manager_port=18080,

@@ -17,6 +17,14 @@
 > 律师的专业判断，也不得用于未经授权的案件材料。未公开材料不得发送到公共 AI 或未经批准的
 > 第三方服务；使用者应自行遵守保密、数据安全、个人信息保护及所在机构的内部制度。
 
+## v0.2.2 单一认证模型与行政区划深度策略
+
+`v0.2.2` 将业务模型收敛为经过真实全文验证的 `qwen3.5-9b`，不再注册或发现 27B/2-bit 模型；同时明确全国行政区划自动处理至地级、河北权威数据库继续深入区县与乡镇/街道。
+
+- Web、CLI、模型管理器和识别基准只暴露 `qwen3.5-9b`，避免长全文处理被低收益的慢速模型阻塞。
+- 全国数据库自动识别省级和地级行政区；河北数据库继续自动识别至区县、县级市、乡镇和街道。
+- LLM 地点补充只接受省级和地级名称，区县以下不由模型猜测。
+
 ## v0.2.1 全文生成稳定性与架构保护
 
 `v0.2.1` 完整保留 `v0.2.0` 的双轮全文 LLM 识别架构，并修复模型在完成实体登记 JSON 后仍继续生成、最终耗尽输出预算或达到请求超时的问题。
@@ -94,7 +102,7 @@
 - Python：3.13.2（项目 `.venv`）
 - 本地模型 API：`model-manager`，默认 `127.0.0.1:18080`
 - 默认逻辑模型 ID：`qwen3.5-9b`（展示名：Qwen3.5 9B（MLX 4-bit））
-- 已注册可选模型还包括 `bonsai-27b`（展示名：Ternary Bonsai 27B（MLX 2-bit））
+- 认证模型仅包括 `qwen3.5-9b`；27B/2-bit 模型不再注册或出现在业务模型列表中
 - 默认 Web 端口：`127.0.0.1:7860`
 - Office 私网还原 API：建议绑定 `127.0.0.1:8787`，通过 SSH 反向隧道暴露到 Home Mac 的 `127.0.0.1:18787`
 
@@ -152,8 +160,8 @@ Web 支持粘贴文本、拖拽 txt/md、上传 txt/md/doc/docx/pdf、多文件�
 # 按统一标准脱敏
 .venv/bin/python -m legal_redactor 文件.txt
 
-# 指定另一个已注册的逻辑模型 ID
-.venv/bin/python -m legal_redactor --model bonsai-27b 文件.txt
+# 当前认证逻辑模型 ID 固定为 qwen3.5-9b
+.venv/bin/python -m legal_redactor --model qwen3.5-9b 文件.txt
 
 # 指定输出目录
 .venv/bin/python -m legal_redactor -o output/2026-05 文件.txt
@@ -230,7 +238,7 @@ Hermes 工具调用只传协作 thread id 和法律文书草稿；本地工作�
 
 唯一的对外模型端点是 `model-manager`，默认 `http://127.0.0.1:18080`。它公开 OpenAI-compatible `GET /v1/models` 和 `POST /v1/chat/completions`。Web 每次载入页面时读取模型列表，处理文书时提交本次选择的逻辑模型 ID；CLI 可使用 `--model` 指定同一个 ID。浏览器和命令行仍不接受任意权重路径。
 
-管理器只向 Web/CLI 暴露经过全文实体登记协议验证的模型。当前认证模型为内置逻辑 ID `qwen3.5-9b` 与 `bonsai-27b`；本地权重存在不等于业务兼容。`mlx-community/Qwen3.5-4B-MLX-4bit` 在真实全文上会持续生成重复 `same_entities` 并耗尽输出 token，因此会被发现层明确排除，不出现在下拉列表中。新增模型必须先通过真实公开全文的两轮 JSON 登记、原文一致性与 fail-closed 验证，再加入认证列表。
+管理器只向 Web/CLI 暴露经过全文实体登记协议验证的模型。当前唯一认证模型为内置逻辑 ID `qwen3.5-9b`；27B/2-bit 与 `mlx-community/Qwen3.5-4B-MLX-4bit` 均不会注册或出现在下拉列表中。本地权重存在不等于业务兼容；新增模型必须先通过真实公开全文的两轮 JSON 登记、原文一致性、性能与 fail-closed 验证，再加入认证列表。
 
 管理器本身通过 `scripts/start_model_manager.sh` 启动或复用。内部 MLX worker 默认仅监听 `127.0.0.1:18081`，由管理器按请求惰性拥有、切换和关闭；不要直接启动 worker。可通过以下环境变量分别覆盖本机监听地址，并可用 `LEGAL_REDACTOR_QWEN_MODEL` 覆盖 Qwen 模型的本地路径或 Hugging Face 仓库 ID：
 

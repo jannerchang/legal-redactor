@@ -15,7 +15,7 @@ SCHEMA_VERSION = "recognition-benchmark-report/v2"
 MANIFEST_SCHEMA_VERSION = "recognition-benchmark-manifest/v1"
 LENGTH_STRATA = ("<10k", "10k-30k", "30k-60k", ">=60k")
 MODES = ("full_document",)
-MODELS = ("bonsai-27b", "qwen3.5-9b")
+MODELS = ("qwen3.5-9b",)
 
 
 @dataclass(frozen=True)

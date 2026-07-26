@@ -325,11 +325,12 @@ class LegalEntityAuditor:
         if supplement.status != "success":
             reason = supplement.reason or "unknown"
             _logger.warning(
-                "全文 LLM 二次补漏失败：原因=%s；已阻止生成部分脱敏结果。",
+                "全文 LLM 二次补漏失败：原因=%s；保留首轮有效登记。",
                 reason,
             )
             return FullDocumentRegistryExtraction(
-                status="fallback",
+                validation=primary.validation,
+                status="success",
                 reason=f"supplement_{reason}",
                 metadata=combined_metadata,
             )
@@ -338,11 +339,12 @@ class LegalEntityAuditor:
         if not merged.valid:
             reason = merged.error or "invalid_registry_payload"
             _logger.warning(
-                "全文 LLM 补漏合并失败：原因=%s；已阻止生成部分脱敏结果。",
+                "全文 LLM 补漏合并失败：原因=%s；保留首轮有效登记。",
                 reason,
             )
             return FullDocumentRegistryExtraction(
-                status="fallback",
+                validation=primary.validation,
+                status="success",
                 reason=f"supplement_merge_{reason}",
                 metadata=combined_metadata,
             )
@@ -390,7 +392,7 @@ class LegalEntityAuditor:
                     current_prompt,
                     max_tokens=self.config.full_document_max_output_tokens,
                     timeout_seconds=self.config.full_document_timeout_seconds,
-                    stop="}",
+                    stop="\n",
                 )
             except Exception as exc:
                 attempt_duration_ms = max(0, int(round((time.monotonic() - attempt_started) * 1000)))

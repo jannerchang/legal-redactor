@@ -520,6 +520,8 @@ def validate_registry_against_text(
 def materialize_registry_candidates(
     text: str,
     validation: RegistryValidationResult,
+    *,
+    allowed_location_values: frozenset[str] | None = None,
 ) -> RegistryMaterialization:
     """Locate every exact occurrence; model offsets are never accepted."""
     if not validation.valid:
@@ -534,7 +536,12 @@ def materialize_registry_candidates(
         for value in entity.variants:
             if (entity.entity_type, value) in conflict_keys:
                 continue
-            if not _registry_variant_allowed(entity.entity_type, value, text):
+            if not _registry_variant_allowed(
+                entity.entity_type,
+                value,
+                text,
+                allowed_location_values=allowed_location_values,
+            ):
                 continue
             variant_kind = "primary" if value == entity.primary_text else "variant"
             for match in re.finditer(re.escape(value), text):
@@ -603,9 +610,17 @@ def _blocked_entity_ids(
 
 
 
-def _registry_variant_allowed(entity_type: str, value: str, text: str) -> bool:
+def _registry_variant_allowed(
+    entity_type: str,
+    value: str,
+    text: str,
+    *,
+    allowed_location_values: frozenset[str] | None = None,
+) -> bool:
     if entity_type == "location":
-        return value.endswith(_ALLOWED_LOCATION_SUFFIXES)
+        return value.endswith(_ALLOWED_LOCATION_SUFFIXES) and (
+            allowed_location_values is None or value in allowed_location_values
+        )
     if entity_type != "person":
         return True
     if value.endswith(("经理", "主任", "书记", "法官", "律师", "先生", "女士")):

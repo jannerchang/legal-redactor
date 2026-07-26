@@ -77,9 +77,8 @@ def _evaluation_for_config(_gold_path, *, config):
 def test_benchmark_matrix_covers_supported_full_document_models() -> None:
     rows = benchmark_matrix()
 
-    assert len(rows) == 2
+    assert len(rows) == 1
     assert {(row.recognition_mode, row.model_id) for row in rows} == {
-        ("full_document", "bonsai-27b"),
         ("full_document", "qwen3.5-9b"),
     }
     assert all(not row.audited for row in rows)
@@ -133,7 +132,7 @@ def test_runner_keeps_all_runs_and_numeric_recognition_evidence(tmp_path) -> Non
     )
 
     assert report["schema_version"] == SCHEMA_VERSION
-    assert len(report["runs"]) == 4
+    assert len(report["runs"]) == 2
     assert {run["replicate_index"] for run in report["runs"]} == {0, 1}
     assert all(run["code_commit"] == "abc123" for run in report["runs"])
     assert all(run["manifest_hash"] == report["manifest_hash"] for run in report["runs"])
@@ -156,7 +155,7 @@ def test_runner_preserves_failed_rows(tmp_path) -> None:
     def sometimes_fails(_gold_path, *, config):
         nonlocal call_count
         call_count += 1
-        if call_count == 2:
+        if call_count == 1:
             raise TimeoutError("synthetic timeout")
         return _evaluation_for_config(_gold_path, config=config)
 
@@ -168,8 +167,8 @@ def test_runner_preserves_failed_rows(tmp_path) -> None:
         evaluate=sometimes_fails,
     )
 
-    assert len(report["runs"]) == 2
-    assert sum(run["status"] == "failed" for run in report["runs"]) == 1
+    assert len(report["runs"]) == 1
+    assert report["runs"][0]["status"] == "failed"
     assert report["recommendation"] == {"action": "manual_review", "reason": "failed_runs_present"}
 
 
@@ -185,7 +184,7 @@ def test_missing_gold_is_explicit_and_never_runs_evaluator(tmp_path) -> None:
         evaluate=unexpected_evaluate,
     )
 
-    assert len(report["runs"]) == 2
+    assert len(report["runs"]) == 1
     assert all(run["status"] == "missing_evidence" for run in report["runs"])
     assert report["recommendation"] == {"action": "manual_review", "reason": "missing_evidence"}
 
@@ -313,7 +312,7 @@ def test_cli_writes_report_and_bad_json_has_no_traceback(tmp_path) -> None:
     assert result.returncode == 0, result.stderr + result.stdout
     assert "[识别基准]" in result.stdout
     payload = json.loads(output_path.read_text(encoding="utf-8"))
-    assert len(payload["runs"]) == 2
+    assert len(payload["runs"]) == 1
     assert all(run["status"] == "missing_evidence" for run in payload["runs"])
 
     bad_manifest = tmp_path / "bad-manifest.json"

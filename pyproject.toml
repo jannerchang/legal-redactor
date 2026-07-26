@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "legal-redactor"
-version = "0.2.1"
+version = "0.2.2"
 description = "Fully local Chinese legal document redaction MVP."
 requires-python = ">=3.11"
 dependencies = [

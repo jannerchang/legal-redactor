@@ -588,7 +588,17 @@ def _linear_run_full_document_recognition(pipeline, ctx, text):
         )
         raise RecognitionUnavailableError(reason, stats=ctx.recognition_stats)
 
-    materialization = materialize_registry_candidates(ctx.scan_text, extraction.validation)
+    allowed_llm_locations = frozenset(
+        candidate.text
+        for candidate in ctx.admin_candidates
+        if candidate.type == "location"
+        and str(candidate.metadata.get("level", "")) in {"province", "city"}
+    )
+    materialization = materialize_registry_candidates(
+        ctx.scan_text,
+        extraction.validation,
+        allowed_location_values=allowed_llm_locations,
+    )
     ctx.registry_materialization = materialization
     ctx.review_candidates.extend(materialization.review_candidates)
     detector_candidates = CandidateCollector().collect(
