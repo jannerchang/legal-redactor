@@ -1654,6 +1654,36 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertIn("已按当前保留的映射重新排列占位符", response.text)
         self.assertNotIn("丁公司与张某丁签订合同", response.text)
 
+    def test_apply_edited_map_preserves_explicit_manual_selection(self) -> None:
+        from fastapi.testclient import TestClient
+
+        response = TestClient(app).post(
+            "/redact/apply-edited-map",
+            data={
+                "original_text": "原告请求将双方签订的建设施工合同作为敏感内容。",
+                "map_version": "1.0",
+                "map_created_at": "2026-07-27T16:00:00+08:00",
+                "map_mode": "normal",
+                "map_source_file": "",
+                "map_type": ["organization"],
+                "map_original": ["双方签订的建设施工合同"],
+                "map_masked": ["甲机构"],
+                "map_role": [""],
+                "map_source": ["manual_selection"],
+                "map_confidence": ["1.0"],
+                "map_reason": ["鼠标明确选取"],
+                "map_restore_by_default": ["1"],
+                "map_entity_id": [""],
+                "map_do_not_merge": ["[]"],
+                "map_restore_original": [""],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("原告请求将甲机构作为敏感内容", response.text)
+        self.assertIn('name="map_original_before" value="双方签订的建设施工合同"', response.text)
+        self.assertIn('name="map_source" value="manual_selection"', response.text)
+
     def test_apply_edited_map_preserves_registry_identity_metadata(self) -> None:
         from fastapi.testclient import TestClient
 
@@ -2510,6 +2540,21 @@ def test_directory_upload_prefers_existing_original_case_folder_for_persistence(
         ["2026 8888/judgment.xlsx"], [tmp_path]
     )
     assert result["case_folder"] == "2026 8888"
+    assert result["matched_dir"] == str(case_dir.resolve())
+
+
+def test_directory_upload_finds_existing_original_case_folder_below_search_root(tmp_path):
+    nested_root = tmp_path / "客户资料"
+    case_dir = nested_root / "2026 8888"
+    case_dir.mkdir(parents=True)
+
+    result = _suggest_case_location_from_relative_paths(
+        ["2026 8888/judgment.xlsx"], [tmp_path]
+    )
+
+    assert result["status"] == "ok"
+    assert result["case_folder"] == "2026 8888"
+    assert result["case_root"] == str(nested_root.resolve())
     assert result["matched_dir"] == str(case_dir.resolve())
 
 def test_relative_folder_not_found_does_not_fallback_to_same_filename(tmp_path):

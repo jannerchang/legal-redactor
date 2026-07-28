@@ -566,6 +566,8 @@ def _page(title: str, body: str) -> str:
 	          appendTextCell(tr,'map_type',entry.type||'manual',0,'person/org');
 	          appendTextCell(tr,'map_original',entry.original||'',2,'新增要替换的原文');
 	          appendTextCell(tr,'map_masked',entry.masked||'',2,'替换为');
+	          var originalCell=tr.querySelector('textarea[name="map_original"]');
+	          if(originalCell)appendHidden(originalCell.parentElement,'map_original_before','');
 	          appendTextCell(tr,'map_reason','',2,'为什么新增这条');
 	          var sourceCell=document.createElement('td');
 	          sourceCell.textContent=entry.source||'manual_selection';
@@ -587,6 +589,9 @@ def _page(title: str, body: str) -> str:
 	          appendHidden(actionCell,'map_source',entry.source||'manual_selection');
 	          appendHidden(actionCell,'map_confidence',confidence);
 	          appendHidden(actionCell,'map_restore_by_default',entry.restore_by_default===false?'0':'1');
+	          appendHidden(actionCell,'map_entity_id',entry.entity_id||'');
+	          appendHidden(actionCell,'map_do_not_merge',JSON.stringify(Array.isArray(entry.do_not_merge)?entry.do_not_merge:[]));
+	          appendHidden(actionCell,'map_restore_original',entry.restore_original||'');
 	          tr.appendChild(actionCell);
 	          var rows=tbody.querySelectorAll('tr');
 	          var last=rows[rows.length-1];

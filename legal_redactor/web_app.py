@@ -131,7 +131,15 @@ def _entity_group_is_noise(group: dict) -> bool:
 
 
 def _sanitize_redaction_map(redaction_map: RedactionMap) -> RedactionMap:
-    filtered = _filter_noise_entity_mappings(redaction_map.mappings)
+    manual_mappings = [
+        mapping for mapping in redaction_map.mappings
+        if _source_indicates_manual(mapping.source)
+    ]
+    automatic_mappings = [
+        mapping for mapping in redaction_map.mappings
+        if not _source_indicates_manual(mapping.source)
+    ]
+    filtered = [*manual_mappings, *_filter_noise_entity_mappings(automatic_mappings)]
     if len(filtered) == len(redaction_map.mappings):
         return redaction_map
     return replace(redaction_map, mappings=sort_mapping_entries(filtered))
@@ -2409,6 +2417,46 @@ def _resolve_case_location(upload_source_dir: str, source_files: list[str], uplo
     return {"status": "not_found"}
 
 
+def _find_case_directories(
+    root: Path,
+    case_folder: str,
+    *,
+    max_depth: int = 5,
+    max_entries: int = 30000,
+) -> list[Path]:
+    try:
+        resolved_root = root.expanduser().resolve()
+    except OSError:
+        return []
+    if not resolved_root.is_dir():
+        return []
+    if resolved_root.name == case_folder:
+        return [resolved_root]
+
+    matches: list[Path] = []
+    visited = 0
+    for current, dirs, files in os.walk(resolved_root):
+        visited += len(dirs) + len(files)
+        if visited > max_entries:
+            break
+        current_path = Path(current)
+        try:
+            depth = len(current_path.relative_to(resolved_root).parts)
+        except ValueError:
+            continue
+        dirs[:] = [
+            item
+            for item in dirs
+            if not item.startswith(".")
+            and item not in {"__pycache__", ".git", ".venv", ".ff-state", "node_modules"}
+        ]
+        if case_folder in dirs:
+            matches.append((current_path / case_folder).resolve())
+        if depth >= max_depth:
+            dirs[:] = []
+    return matches
+
+
 def _suggest_case_location_from_relative_paths(
     relative_paths: object,
     search_roots: list[Path] | None = None,
@@ -2423,9 +2471,7 @@ def _suggest_case_location_from_relative_paths(
     roots = search_roots or case_location_search_roots()
     existing_dirs: list[Path] = []
     for root in roots:
-        candidate = (Path(root).expanduser() / case_folder)
-        if candidate.exists():
-            existing_dirs.append(candidate.resolve())
+        existing_dirs.extend(_find_case_directories(Path(root), case_folder))
 
     unique_dirs = sorted({path for path in existing_dirs}, key=str)
     if len(unique_dirs) > 1:
