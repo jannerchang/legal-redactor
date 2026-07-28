@@ -118,8 +118,8 @@ class WebAppUploadTests(unittest.TestCase):
             "action": "启动本地模型管理器",
         }
         with (
-            patch("legal_redactor.web_app._status_payload", return_value=payload),
-            patch("legal_redactor.web_app.probe_model_manager", return_value=SimpleNamespace(to_dict=lambda: manager_status)),
+            patch("legal_redactor.web.status_ops._status_payload", return_value=payload),
+            patch("legal_redactor.web.deps.probe_model_manager", return_value=SimpleNamespace(to_dict=lambda: manager_status)),
         ):
             client = TestClient(app)
             status = client.get("/api/status")
@@ -146,10 +146,10 @@ class WebAppUploadTests(unittest.TestCase):
             ],
         }
         with (
-            patch("legal_redactor.web_app._status_payload", return_value=payload),
+            patch("legal_redactor.web.status_ops._status_payload", return_value=payload),
             patch("legal_redactor._samples.load_all_samples", return_value=({}, set())),
             patch(
-                "legal_redactor.web_app._available_model_options",
+                "legal_redactor.web.status_ops._available_model_options",
                 return_value=[
                     {"id": "bonsai-27b", "label": "Ternary Bonsai 27B（MLX 2-bit；长全文不推荐）"},
                     {"id": "qwen3.5-9b", "label": "Qwen3.5 9B（MLX 4-bit；全文默认）"},
@@ -211,7 +211,7 @@ class WebAppUploadTests(unittest.TestCase):
                 {"id": "qwen3.5-9b", "object": "model", "name": "Qwen3.5 9B（MLX 4-bit）"},
             ],
         }
-        with patch("legal_redactor.web_app._model_manager_json", return_value=payload):
+        with patch("legal_redactor.web.status_ops._model_manager_json", return_value=payload):
             response = TestClient(app).get("/api/models")
 
         self.assertEqual(response.status_code, 200)
@@ -225,7 +225,7 @@ class WebAppUploadTests(unittest.TestCase):
 
         with (
             patch(
-                "legal_redactor.web_app._status_payload",
+                "legal_redactor.web.status_ops._status_payload",
                 return_value={
                     "status": "ok",
                     "overall_state": "ready",
@@ -271,7 +271,7 @@ class WebAppUploadTests(unittest.TestCase):
     def test_index_upload_selection_js_builds_only_checked_files_formdata(self) -> None:
         """Lock checklist selection: only checked files enter FormData; relative paths follow selection."""
         with (
-            patch("legal_redactor.web_app._status_payload", return_value={"status": "ok", "overall_state": "ready", "expected_model_id": "bonsai-27b", "components": []}),
+            patch("legal_redactor.web.status_ops._status_payload", return_value={"status": "ok", "overall_state": "ready", "expected_model_id": "bonsai-27b", "components": []}),
             patch("legal_redactor._samples.load_all_samples", return_value=({}, set())),
         ):
             page = index()
@@ -364,7 +364,7 @@ class WebAppUploadTests(unittest.TestCase):
             stdout="张三与李四".encode("utf-8"),
             stderr=b"",
         )
-        with patch("legal_redactor.web_app.subprocess.run", return_value=completed) as run:
+        with patch("legal_redactor.web.discord_ops.subprocess.run", return_value=completed) as run:
             text = asyncio.run(_read_upload_text(MockUploadFile("legacy.doc", b"doc bytes")))
 
         self.assertEqual(text, "张三与李四")
@@ -784,7 +784,7 @@ class WebAppUploadTests(unittest.TestCase):
             def redact(self, text, source_file=None, base_redaction_map=None):
                 raise RuntimeError("simulated failure")
 
-        with patch("legal_redactor.web_app.RedactionPipeline", FakePipeline):
+        with patch("legal_redactor.web.deps.RedactionPipeline", FakePipeline):
             response = TestClient(app).post("/redact", data={"text": "张三"})
 
         self.assertEqual(response.status_code, 200)
@@ -821,12 +821,12 @@ class WebAppUploadTests(unittest.TestCase):
 
         ready = SimpleNamespace(state="ready", details={"model_ids": ["bonsai-27b"]})
         with (
-            patch("legal_redactor.web_app.probe_model_manager", return_value=ready),
+            patch("legal_redactor.web.deps.probe_model_manager", return_value=ready),
             patch(
-                "legal_redactor.web_app._available_model_options",
+                "legal_redactor.web.status_ops._available_model_options",
                 return_value=[{"id": "bonsai-27b", "label": "Bonsai"}],
             ),
-            patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
+            patch("legal_redactor.web.deps.RedactionPipeline", FakePipeline),
         ):
             response = TestClient(app).post(
                 "/analyze",
@@ -873,12 +873,12 @@ class WebAppUploadTests(unittest.TestCase):
         ready = SimpleNamespace(state="ready", details={"model_ids": ["bonsai-27b"]})
         with tempfile.TemporaryDirectory() as tmpdir:
             with (
-                patch("legal_redactor.web_app.probe_model_manager", return_value=ready),
+                patch("legal_redactor.web.deps.probe_model_manager", return_value=ready),
                 patch(
-                    "legal_redactor.web_app._available_model_options",
+                    "legal_redactor.web.status_ops._available_model_options",
                     return_value=[{"id": "bonsai-27b", "label": "Bonsai"}],
                 ),
-                patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
+                patch("legal_redactor.web.deps.RedactionPipeline", FakePipeline),
             ):
                 response = TestClient(app).post(
                     "/redact",
@@ -902,7 +902,7 @@ class WebAppUploadTests(unittest.TestCase):
 
         unavailable = SimpleNamespace(state="missing", details={})
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("legal_redactor.web_app.probe_model_manager", return_value=unavailable):
+            with patch("legal_redactor.web.deps.probe_model_manager", return_value=unavailable):
                 response = TestClient(app).post(
                     "/redact",
                     data={
@@ -937,7 +937,7 @@ class WebAppUploadTests(unittest.TestCase):
             },
             ensure_ascii=False,
         )
-        with patch("legal_redactor.web_app.probe_model_manager", return_value=SimpleNamespace(state="missing", details={})):
+        with patch("legal_redactor.web.deps.probe_model_manager", return_value=SimpleNamespace(state="missing", details={})):
             response = TestClient(app).post(
                 "/redact/confirmed",
                 data={
@@ -996,12 +996,12 @@ class WebAppUploadTests(unittest.TestCase):
         )
         ready = SimpleNamespace(state="ready", details={"model_ids": ["bonsai-27b"]})
         with (
-            patch("legal_redactor.web_app.probe_model_manager", return_value=ready),
+            patch("legal_redactor.web.deps.probe_model_manager", return_value=ready),
             patch(
-                "legal_redactor.web_app._available_model_options",
+                "legal_redactor.web.status_ops._available_model_options",
                 return_value=[{"id": "bonsai-27b", "label": "Bonsai"}],
             ),
-            patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
+            patch("legal_redactor.web.deps.RedactionPipeline", FakePipeline),
         ):
             response = TestClient(app).post(
                 "/redact/confirmed",
@@ -1061,7 +1061,7 @@ class WebAppUploadTests(unittest.TestCase):
             },
             ensure_ascii=False,
         )
-        with patch("legal_redactor.web_app.RedactionPipeline", FakePipeline):
+        with patch("legal_redactor.web.deps.RedactionPipeline", FakePipeline):
             response = TestClient(app).post(
                 "/redact/confirmed",
                 data={
@@ -1094,13 +1094,13 @@ class WebAppUploadTests(unittest.TestCase):
 
         ready = SimpleNamespace(state="ready", details={"model_ids": ["bonsai-27b"]})
         with (
-            patch("legal_redactor.web_app.probe_model_manager", return_value=ready),
+            patch("legal_redactor.web.deps.probe_model_manager", return_value=ready),
             patch(
-                "legal_redactor.web_app._available_model_options",
+                "legal_redactor.web.status_ops._available_model_options",
                 return_value=[{"id": "bonsai-27b", "label": "Bonsai"}],
             ),
-            patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
-            patch("legal_redactor.web_app._persist_optional_case_redaction") as persist,
+            patch("legal_redactor.web.deps.RedactionPipeline", FakePipeline),
+            patch("legal_redactor.web.workflow._persist_optional_case_redaction") as persist,
         ):
             response = TestClient(app).post(
                 "/redact",
@@ -1156,9 +1156,9 @@ class WebAppUploadTests(unittest.TestCase):
             details={"model_ids": ["bonsai-27b", "qwen3.5-9b"]},
         )
         with (
-            patch("legal_redactor.web_app.probe_model_manager", return_value=ready),
-            patch("legal_redactor.web_app._available_model_options", return_value=[{"id": "qwen3.5-9b", "label": "Qwen3.5 9B（MLX 4-bit）"}]),
-            patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
+            patch("legal_redactor.web.deps.probe_model_manager", return_value=ready),
+            patch("legal_redactor.web.status_ops._available_model_options", return_value=[{"id": "qwen3.5-9b", "label": "Qwen3.5 9B（MLX 4-bit）"}]),
+            patch("legal_redactor.web.deps.RedactionPipeline", FakePipeline),
         ):
             client = TestClient(app)
             response = client.post(
@@ -1224,8 +1224,8 @@ class WebAppUploadTests(unittest.TestCase):
                 return None
 
         with (
-            patch("legal_redactor.web_app.probe_model_manager", return_value=worker_error),
-            patch("legal_redactor.web_app.http.client.HTTPConnection", FakeConnection),
+            patch("legal_redactor.web.deps.probe_model_manager", return_value=worker_error),
+            patch("legal_redactor.web.status_ops.http.client.HTTPConnection", FakeConnection),
         ):
             response = TestClient(app).get("/api/models")
 
@@ -1237,9 +1237,9 @@ class WebAppUploadTests(unittest.TestCase):
 
         worker_error = SimpleNamespace(state="error", details={"reason": "worker_error"})
         with (
-            patch("legal_redactor.web_app.probe_model_manager", return_value=worker_error),
+            patch("legal_redactor.web.deps.probe_model_manager", return_value=worker_error),
             patch(
-                "legal_redactor.web_app._available_model_options",
+                "legal_redactor.web.status_ops._available_model_options",
                 return_value=[{"id": "bonsai-27b", "label": "Bonsai"}],
             ),
         ):
@@ -1255,8 +1255,8 @@ class WebAppUploadTests(unittest.TestCase):
         ready = SimpleNamespace(state="ready", details={"model_ids": [f"model-{index}" for index in range(8)]})
         options = [{"id": f"model-{index}", "label": f"Model {index}"} for index in range(9)]
         with (
-            patch("legal_redactor.web_app.probe_model_manager", return_value=ready),
-            patch("legal_redactor.web_app._available_model_options", return_value=options),
+            patch("legal_redactor.web.deps.probe_model_manager", return_value=ready),
+            patch("legal_redactor.web.status_ops._available_model_options", return_value=options),
         ):
             config, warnings = web_app_module._pipeline_config_for_model_status(model="model-8")
 
@@ -1270,9 +1270,9 @@ class WebAppUploadTests(unittest.TestCase):
 
         ready = SimpleNamespace(state="ready", details={"model_ids": ["bonsai-27b"]})
         with (
-            patch("legal_redactor.web_app.probe_model_manager", return_value=ready),
+            patch("legal_redactor.web.deps.probe_model_manager", return_value=ready),
             patch(
-                "legal_redactor.web_app._available_model_options",
+                "legal_redactor.web.status_ops._available_model_options",
                 return_value=[{"id": "bonsai-27b", "label": "Bonsai"}],
             ),
         ):
@@ -1329,12 +1329,12 @@ class WebAppUploadTests(unittest.TestCase):
 
         ready = SimpleNamespace(state="ready", details={"model_ids": ["bonsai-27b"]})
         with (
-            patch("legal_redactor.web_app.probe_model_manager", return_value=ready),
+            patch("legal_redactor.web.deps.probe_model_manager", return_value=ready),
             patch(
-                "legal_redactor.web_app._available_model_options",
+                "legal_redactor.web.status_ops._available_model_options",
                 return_value=[{"id": "bonsai-27b", "label": "Bonsai"}],
             ),
-            patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
+            patch("legal_redactor.web.deps.RedactionPipeline", FakePipeline),
         ):
             response = TestClient(app).post(
                 "/redact",
@@ -1368,7 +1368,7 @@ class WebAppUploadTests(unittest.TestCase):
                 return []
 
         map_json = redaction_map_to_json(RedactionMap.create([]))
-        with patch("legal_redactor.web_app.RedactionPipeline", FakePipeline):
+        with patch("legal_redactor.web.deps.RedactionPipeline", FakePipeline):
             response = TestClient(app).post(
                 "/redact/apply-map",
                 data={"original_text": "张三", "map_json": map_json},
@@ -1453,13 +1453,13 @@ class WebAppUploadTests(unittest.TestCase):
             actual = Path(actual_root)
             (actual / "2026 8888").mkdir()
             with (
-                patch("legal_redactor.web_app.probe_model_manager", return_value=ready),
+                patch("legal_redactor.web.deps.probe_model_manager", return_value=ready),
                 patch(
-                    "legal_redactor.web_app._available_model_options",
+                    "legal_redactor.web.status_ops._available_model_options",
                     return_value=[{"id": "bonsai-27b", "label": "Bonsai"}],
                 ),
-                patch("legal_redactor.web_app.case_location_search_roots", return_value=[actual]),
-                patch("legal_redactor.web_app.RedactionPipeline", FakePipeline),
+                patch("legal_redactor.web.case_location.case_location_search_roots", return_value=[actual]),
+                patch("legal_redactor.web.deps.RedactionPipeline", FakePipeline),
             ):
                 response = TestClient(app).post(
                     "/redact",
@@ -1758,8 +1758,8 @@ class WebAppUploadTests(unittest.TestCase):
             return {"message_id": "m1", "channel_id": channel_id}
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("legal_redactor.web_app._discord_command_channel_id", return_value="command-channel"):
-                with patch("legal_redactor.web_app._post_discord_channel_message", side_effect=fake_post):
+            with patch("legal_redactor.web.discord_ops._discord_command_channel_id", return_value="command-channel"):
+                with patch("legal_redactor.web.discord_ops._post_discord_channel_message", side_effect=fake_post):
                     response = asyncio.run(
                         create_discord_thread(
                             MockJsonRequest(
@@ -1795,10 +1795,10 @@ class WebAppUploadTests(unittest.TestCase):
         ]
 
         with (
-            patch("legal_redactor.web_app.load_json_config", return_value={}),
-            patch("legal_redactor.web_app._discord_command_channel_id", return_value="command-channel"),
-            patch("legal_redactor.web_app._discord_bot_token", return_value="token"),
-            patch("legal_redactor.web_app._get_discord_json", side_effect=responses),
+            patch("legal_redactor.web.deps.load_json_config", return_value={}),
+            patch("legal_redactor.web.discord_ops._discord_command_channel_id", return_value="command-channel"),
+            patch("legal_redactor.web.discord_ops._discord_bot_token", return_value="token"),
+            patch("legal_redactor.web.discord_ops._get_discord_json", side_effect=responses),
         ):
             thread_url = _find_discord_thread_for_case("2026 4343", "房屋买卖合同纠纷")
 
@@ -1817,7 +1817,7 @@ class WebAppUploadTests(unittest.TestCase):
                 command_message_id="m1",
                 command_channel_id="c1",
             )
-            with patch("legal_redactor.web_app._find_discord_thread_for_case", return_value=thread_url):
+            with patch("legal_redactor.web.discord_ops._find_discord_thread_for_case", return_value=thread_url):
                 response = asyncio.run(
                     create_discord_thread(
                         MockJsonRequest(
@@ -1848,9 +1848,9 @@ class WebAppUploadTests(unittest.TestCase):
             return {"message_id": "m1", "channel_id": channel_id}
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("legal_redactor.web_app._discord_command_channel_id", return_value="command-channel"):
-                with patch("legal_redactor.web_app._post_discord_channel_message", side_effect=fake_post):
-                    with patch("legal_redactor.web_app._find_discord_thread_for_case", return_value=""):
+            with patch("legal_redactor.web.discord_ops._discord_command_channel_id", return_value="command-channel"):
+                with patch("legal_redactor.web.discord_ops._post_discord_channel_message", side_effect=fake_post):
+                    with patch("legal_redactor.web.discord_ops._find_discord_thread_for_case", return_value=""):
                         first = asyncio.run(
                             create_discord_thread(
                                 MockJsonRequest(
@@ -1918,8 +1918,8 @@ class WebAppUploadTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.dict(os.environ, {"LEGAL_REDACTOR_DISCORD_BOT_TOKEN": "bot-token"}):
-                with patch("legal_redactor.web_app._discord_command_channel_id", return_value="1"):
-                    with patch("legal_redactor.web_app.urllib.request.urlopen", side_effect=fail):
+                with patch("legal_redactor.web.discord_ops._discord_command_channel_id", return_value="1"):
+                    with patch("legal_redactor.web.discord_ops.urllib.request.urlopen", side_effect=fail):
                         response = asyncio.run(
                             create_discord_thread(
                                 MockJsonRequest(
@@ -1947,7 +1947,7 @@ class WebAppUploadTests(unittest.TestCase):
             calls.append((thread_id, filename, content, message))
             return {"message_id": "m2", "channel_id": thread_id}
 
-        with patch("legal_redactor.web_app._post_discord_thread_file", side_effect=fake_post):
+        with patch("legal_redactor.web.discord_ops._post_discord_thread_file", side_effect=fake_post):
             response = asyncio.run(
                 send_redacted_to_discord(
                     MockJsonRequest(
@@ -1992,7 +1992,7 @@ class WebAppUploadTests(unittest.TestCase):
             calls.append((thread_id, filename, content, message))
             return {"message_id": "m2", "channel_id": thread_id}
 
-        with patch("legal_redactor.web_app._post_discord_thread_file", side_effect=fake_post):
+        with patch("legal_redactor.web.discord_ops._post_discord_thread_file", side_effect=fake_post):
             response = asyncio.run(
                 send_redacted_to_discord(
                     MockJsonRequest(
@@ -2064,7 +2064,7 @@ class WebAppUploadTests(unittest.TestCase):
                 "https://discord.com/channels/1/2/3",
                 source_dir="/cases/2026 5987 劳动争议纠纷",
             )
-            with patch("legal_redactor.web_app._post_discord_thread_file", side_effect=fake_post):
+            with patch("legal_redactor.web.discord_ops._post_discord_thread_file", side_effect=fake_post):
                 response = asyncio.run(
                     attach_to_bound_discord_thread(
                         MockJsonRequest(
@@ -2104,7 +2104,7 @@ class WebAppUploadTests(unittest.TestCase):
             )
 
         with patch.dict(os.environ, {"LEGAL_REDACTOR_DISCORD_BOT_TOKEN": "bot-token"}):
-            with patch("legal_redactor.web_app.urllib.request.urlopen", side_effect=fail):
+            with patch("legal_redactor.web.discord_ops.urllib.request.urlopen", side_effect=fail):
                 response = asyncio.run(
                     send_redacted_to_discord(
                         MockJsonRequest(
@@ -2478,7 +2478,7 @@ class WebAppUploadTests(unittest.TestCase):
     def test_create_thread_rejects_path_like_case_folder_before_posting(self) -> None:
         import asyncio
 
-        with patch("legal_redactor.web_app._post_discord_channel_message") as post:
+        with patch("legal_redactor.web.discord_ops._post_discord_channel_message") as post:
             response = asyncio.run(
                 create_discord_thread(
                     MockJsonRequest(
@@ -2563,7 +2563,7 @@ def test_relative_folder_not_found_does_not_fallback_to_same_filename(tmp_path):
     wrong_case = tmp_path / "2026 1111"
     wrong_case.mkdir()
     (wrong_case / "judgment.xlsx").write_bytes(b"placeholder")
-    with patch("legal_redactor.web_app.case_location_search_roots", return_value=[tmp_path]):
+    with patch("legal_redactor.web.case_location.case_location_search_roots", return_value=[tmp_path]):
         result = _resolve_case_location("", ["judgment.xlsx"], '["2026 9999/judgment.xlsx"]')
     assert result["status"] == "not_found"
 
