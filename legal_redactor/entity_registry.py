@@ -696,10 +696,10 @@ def _normalize_minimal_registry(data: dict[str, Any]) -> FullDocumentEntityRegis
         raise ValueError("invalid_entities")
     for pair in same_entities:
         if not isinstance(pair, list) or len(pair) != 2:
-            raise ValueError("invalid_entity")
+            continue
         left, right = pair
         if not isinstance(left, str) or not isinstance(right, str):
-            raise ValueError("invalid_entity")
+            continue
         if left not in type_by_name or right not in type_by_name:
             continue
         if type_by_name[left] != type_by_name[right]:

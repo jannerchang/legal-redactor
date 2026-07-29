@@ -1482,6 +1482,35 @@ class WebAppUploadTests(unittest.TestCase):
             self.assertEqual(manifest.case_folder, "2026 8888")
             self.assertFalse((Path(default_root) / "2026 8888").exists())
 
+    def test_suggest_mapping_entry_api_parses_current_map_after_modularization(self) -> None:
+        from fastapi.testclient import TestClient
+
+        current_map = RedactionMap.create(
+            [
+                MappingEntry(
+                    type="person",
+                    original="张三",
+                    masked="张某甲",
+                    role=None,
+                    source="test",
+                    confidence=1.0,
+                    restore_by_default=True,
+                )
+            ]
+        )
+        response = TestClient(app).post(
+            "/api/mapping/suggest-entry",
+            json={
+                "selected_text": "张四",
+                "entity_type": "person",
+                "map_json": json.dumps(current_map.to_dict(), ensure_ascii=False),
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "success")
+        self.assertEqual(response.json()["entry"]["masked"], "张某乙")
+
     def test_suggest_manual_person_mapping_continues_same_surname_counter(self) -> None:
         existing = [
             MappingEntry(
@@ -2033,6 +2062,54 @@ class WebAppUploadTests(unittest.TestCase):
         data = json.loads(response.body.decode("utf-8"))
         self.assertEqual(data["status"], "pending")
         self.assertEqual(data["workflow_state"], "waiting_hermes")
+
+    def test_attach_bound_discord_thread_recovers_hermes_thread_during_poll(self) -> None:
+        import asyncio
+
+        calls = []
+        thread_url = "https://discord.com/channels/1/2/333"
+
+        def fake_post(thread_id: str, filename: str, content: str, message: str = "") -> dict[str, str]:
+            calls.append((thread_id, filename, content, message))
+            return {"message_id": "m2", "channel_id": thread_id}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_dir = os.path.join(tmpdir, "2026 5987")
+            record_hermes_thread_request(
+                tmpdir,
+                "2026 5987",
+                "lr_test",
+                source_dir=source_dir,
+                command_message_id="m1",
+                command_channel_id="c1",
+            )
+            with (
+                patch("legal_redactor.web.discord_ops._find_discord_thread_for_case", return_value=thread_url),
+                patch("legal_redactor.web.discord_ops._post_discord_thread_file", side_effect=fake_post),
+            ):
+                response = asyncio.run(
+                    attach_to_bound_discord_thread(
+                        MockJsonRequest(
+                            {
+                                "case_root": tmpdir,
+                                "case_folder": "2026 5987",
+                                "source_dir": source_dir,
+                                "case_cause": "劳动争议纠纷",
+                                "filename": "redacted.txt",
+                                "content": "脱敏内容",
+                                "map_json": redaction_map_to_json(RedactionMap.create([])),
+                            }
+                        )
+                    )
+                )
+            manifest = load_manifest(source_dir)
+
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(data["thread_url"], thread_url)
+        self.assertEqual(manifest.discord_thread_url, thread_url)
+        self.assertEqual(calls, [("333", "redacted.txt", "脱敏内容", "脱敏文件已生成，请见附件：redacted.txt")])
 
     def test_attach_bound_discord_thread_sends_file_and_persists(self) -> None:
         import asyncio

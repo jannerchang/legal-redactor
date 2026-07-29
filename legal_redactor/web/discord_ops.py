@@ -222,6 +222,7 @@ async def attach_to_bound_discord_thread(request: Request) -> JSONResponse:
         return invalid
     case_folder = str(body.get("case_folder", "")).strip()
     source_dir = str(body.get("source_dir", "")).strip() or None
+    case_cause = str(body.get("case_cause", "")).strip()
     source_root = case_root_from_source_dir(source_dir, case_folder) if case_folder else None
     case_root = str(source_root or str(body.get("case_root", "")).strip() or default_case_root())
     filename = Path(str(body.get("filename", "redacted.txt"))).name or "redacted.txt"
@@ -241,6 +242,18 @@ async def attach_to_bound_discord_thread(request: Request) -> JSONResponse:
         return _waiting_hermes_response()
     except Exception as exc:
         return _case_error_response(f"案件 manifest 读取失败: {exc}")
+    if not manifest.discord_thread_url and manifest.hermes_request_id:
+        try:
+            recovered_thread_url = _find_discord_thread_for_case(case_folder, case_cause)
+            if recovered_thread_url:
+                manifest = create_or_update_manifest(
+                    case_root,
+                    case_folder,
+                    recovered_thread_url,
+                    source_dir=source_dir,
+                )
+        except (DiscordApiError, RuntimeError):
+            pass
     if not manifest.discord_thread_url:
         return _waiting_hermes_response()
     try:

@@ -445,17 +445,28 @@ class LegalEntityAuditor:
                 response.metadata.completion_token_count if response.metadata.completion_token_count is not None else "未知",
                 response.metadata.finish_reason or "未知",
             )
-            if response.metadata.finish_reason == "length":
+            completed_payload = self._first_complete_json_object(response.response_text)
+            payload = completed_payload or self._repair_full_document_registry_payload(response.response_text)
+            parsed = parse_full_document_registry(payload or response.response_text)
+            if response.metadata.finish_reason == "length" and completed_payload is None:
+                last_reason = "output_token_limit"
+                if attempt + 1 < attempts:
+                    _logger.warning(
+                        "全文 LLM 输出达到 token 上限且没有有效完整 JSON；将切换 JSON 修复提示词执行唯一一次重试。"
+                    )
+                    continue
                 _logger.warning(
-                    "全文 LLM 输出达到 token 上限；判定为输出失控并停止，不执行同参数重试。"
+                    "全文 LLM 输出再次达到 token 上限且没有有效完整 JSON；已停止调用并阻止脱敏。"
                 )
                 return FullDocumentRegistryExtraction(
                     status="fallback",
-                    reason="output_token_limit",
+                    reason=last_reason,
                     metadata=total_metadata,
                 )
-            repaired_payload = self._repair_full_document_registry_payload(response.response_text)
-            parsed = parse_full_document_registry(repaired_payload or response.response_text)
+            if response.metadata.finish_reason == "length":
+                _logger.warning(
+                    "全文 LLM 达到 token 上限，但已提取并校验触顶前的完整 JSON；忽略其后失控输出。"
+                )
             if not parsed.valid:
                 last_reason = parsed.error or "invalid_registry_payload"
                 if attempt + 1 < attempts:
@@ -586,6 +597,44 @@ class LegalEntityAuditor:
                 finish_reason=finish_reason if isinstance(finish_reason, str) else None,
             ),
         )
+
+    @staticmethod
+    def _first_complete_json_object(value: str) -> str | None:
+        """Return the first complete top-level JSON object, ignoring trailing generation."""
+        text = value.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text, count=1, flags=re.IGNORECASE)
+        start = text.find("{")
+        if start < 0:
+            return None
+        depth = 0
+        in_string = False
+        escape = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : index + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                    except JSONDecodeError:
+                        return None
+                    return candidate if isinstance(parsed, dict) else None
+        return None
+
 
     @classmethod
     def _repair_full_document_registry_payload(cls, value: str) -> str | None:

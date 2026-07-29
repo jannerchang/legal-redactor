@@ -20,6 +20,7 @@ from .deps import (
     RedactionMap,
     Request,
     TypeCounters,
+    redaction_map_from_json,
     _filter_noise_entity_mappings,
     derived_organization_alias_cores,
     is_noise_entity_text,
