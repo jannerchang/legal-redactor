@@ -2062,6 +2062,59 @@ class WebAppUploadTests(unittest.TestCase):
         data = json.loads(response.body.decode("utf-8"))
         self.assertEqual(data["status"], "pending")
         self.assertEqual(data["workflow_state"], "waiting_hermes")
+    def test_pending_hermes_lookup_does_not_block_health_requests(self) -> None:
+        import asyncio
+        import threading
+
+        lookup_started = threading.Event()
+        release_lookup = threading.Event()
+
+        def slow_lookup(*_args) -> str:
+            lookup_started.set()
+            if not release_lookup.wait(timeout=2):
+                raise AssertionError("Discord lookup was not released")
+            return ""
+
+        async def exercise() -> tuple[dict, dict]:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                source_dir = os.path.join(tmpdir, "2026 5987")
+                record_hermes_thread_request(
+                    tmpdir,
+                    "2026 5987",
+                    "lr_test",
+                    source_dir=source_dir,
+                    command_message_id="m1",
+                    command_channel_id="c1",
+                )
+                with patch("legal_redactor.web.discord_ops._find_discord_thread_for_case", side_effect=slow_lookup):
+                    from httpx import ASGITransport, AsyncClient
+
+                    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                        pending = asyncio.create_task(
+                            client.post(
+                                "/api/discord/attach-bound-thread",
+                                json={
+                                    "case_root": tmpdir,
+                                    "case_folder": "2026 5987",
+                                    "source_dir": source_dir,
+                                    "filename": "redacted.txt",
+                                    "content": "脱敏内容",
+                                    "map_json": redaction_map_to_json(RedactionMap.create([])),
+                                },
+                            )
+                        )
+                        started = await asyncio.to_thread(lookup_started.wait, 1)
+                        self.assertTrue(started)
+                        health_response = await asyncio.wait_for(client.get("/health"), timeout=0.5)
+                        release_lookup.set()
+                        pending_response = await pending
+            return health_response.json(), pending_response.json()
+
+        health_data, pending_data = asyncio.run(exercise())
+
+        self.assertEqual(health_data["status"], "ok")
+        self.assertEqual(pending_data["workflow_state"], "waiting_hermes")
+
 
     def test_attach_bound_discord_thread_recovers_hermes_thread_during_poll(self) -> None:
         import asyncio

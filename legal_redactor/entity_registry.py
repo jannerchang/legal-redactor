@@ -6,6 +6,8 @@ import re
 from typing import Any, Iterable
 
 from .models import Candidate
+from .filters import is_false_org, is_false_person
+
 
 _ALLOWED_ENTITY_TYPES = frozenset({"person", "organization", "location"})
 _MAX_PAYLOAD_CHARS = 1_000_000
@@ -47,6 +49,90 @@ _COURT_PERSONNEL_PREFIXES = (
     "执行法官",
 )
 _ALLOWED_LOCATION_SUFFIXES = ("省", "市", "自治区", "特别行政区", "自治州", "盟", "地区")
+_LOCATION_ONLY_INSTITUTION_SUFFIXES = (
+    "高级人民法院",
+    "中级人民法院",
+    "基层人民法院",
+    "人民法院",
+    "法院",
+    "中院",
+)
+_OTHER_ORGANIZATION_SUFFIXES = (
+    "律师事务所",
+    "会计师事务所",
+    "人民检察院",
+    "公安局",
+    "税务局",
+    "管理局",
+    "委员会",
+    "仲裁委",
+    "经营部",
+    "合作社",
+    "商行",
+    "工作室",
+    "医院",
+    "学校",
+    "幼儿园",
+    "银行",
+    "中心",
+    "厂",
+    "店",
+)
+_GENERIC_ORGANIZATION_VALUES = frozenset({"地产公司"})
+_GENERIC_FACTORY_REFERENCES = re.compile(r".+的厂子$")
+_ORGANIZATION_NOISE_TERMS = (
+    "协议",
+    "合同",
+    "价款",
+    "差价款",
+    "案件",
+    "纠纷",
+    "案号",
+    "判决书",
+    "裁定书",
+)
+_GENERIC_ORGANIZATION_PREFIXES = ("劳动",)
+
+_ORGANIZATION_BUSINESS_SUFFIXES = (
+    "制品厂",
+    "加工厂",
+    "制造厂",
+    "修理厂",
+    "砖厂",
+    "石料厂",
+    "砂石厂",
+    "家具厂",
+    "服装厂",
+    "食品厂",
+    "木器厂",
+    "铸造厂",
+    "机械厂",
+    "电器厂",
+    "电子厂",
+    "化工厂",
+)
+
+
+def _organization_variant_allowed(value: str) -> bool:
+    if value in _GENERIC_ORGANIZATION_VALUES or value.isdigit():
+        return False
+    if _GENERIC_FACTORY_REFERENCES.fullmatch(value):
+        return False
+    if any(term in value for term in _ORGANIZATION_NOISE_TERMS):
+        return False
+    if value.startswith(_GENERIC_ORGANIZATION_PREFIXES) and value.endswith("仲裁委"):
+        return False
+    if value.endswith(_LOCATION_ONLY_INSTITUTION_SUFFIXES):
+        return False
+    if any(value.endswith(suffix) for suffix in _ORGANIZATION_BUSINESS_SUFFIXES):
+        return True
+    if value.endswith(_OTHER_ORGANIZATION_SUFFIXES):
+        return len(value) >= 4
+    from .llm import _is_valid_company_variant
+
+    return _is_valid_company_variant(value)
+
+
 
 
 @dataclass(frozen=True)
@@ -621,8 +707,12 @@ def _registry_variant_allowed(
         return value.endswith(_ALLOWED_LOCATION_SUFFIXES) and (
             allowed_location_values is None or value in allowed_location_values
         )
+    if entity_type == "organization":
+        return _organization_variant_allowed(value)
     if entity_type != "person":
         return True
+    if is_false_person(value):
+        return False
     if value.endswith(("经理", "主任", "书记", "法官", "律师", "先生", "女士")):
         return False
     for match in re.finditer(re.escape(value), text):

@@ -103,6 +103,9 @@ def _split_leading_place_prefix(body: str) -> tuple[str, str]:
     """Split a company body into a leading place prefix and the remaining brand body."""
     if body.startswith(("中国", "中华", "全国")):
         return "", body
+    if re.search(r"\s", body):
+        return "", body
+
     body = body.strip("（）() ")
     for province in PROVINCE_NAMES:
         if body.startswith(province) and len(body) > len(province) + 1:

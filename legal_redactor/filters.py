@@ -62,14 +62,15 @@ def is_false_person(value: str) -> bool:
         )
     ):
         return True
-    # ── 末字是高频动词/副词/形容词尾字 → 伪人名（如 高涛全, 王平抗, 徐闯提）──
+    # 高频动作尾字只在候选本身不是常见姓氏开头时拦截，避免误杀“杨利进”一类真实姓名。
     _TAIL_ACTION_CHARS = frozenset(
         "全均承提抗扣图聊反送担到打替找查验收据向属力监者称证过进内无赔手"
         "交破期满合范工费还详适关就形备规约债票项款应出"
         "拨支负签协公"
     )
-    if len(value) == 3 and value[-1] in _TAIL_ACTION_CHARS:
+    if len(value) == 3 and value[0] not in _COMMON_SURNAME_CHARS and value[-1] in _TAIL_ACTION_CHARS:
         return True
+
     if len(value) <= 3 and (
         value.endswith(("提", "未", "内", "反", "聊", "分", "也", "吗", "呢", "吧", "啊", "呀"))
         or value.startswith(("方", "施工", "法官", "齐齐", "包含"))

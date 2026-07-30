@@ -417,6 +417,29 @@ def test_resolve_candidate_overlaps_prefers_clean_nested_org_alias() -> None:
 
 
 
+def test_engine_masks_named_factory_and_preserves_ocr_spaced_company_surface() -> None:
+    text = "平山县永鸿金属制品厂与赛 城投资公司签订合同。"
+    candidates = [
+        Candidate(
+            type="organization",
+            text=value,
+            start=text.index(value),
+            end=text.index(value) + len(value),
+            source="full_document_llm",
+            confidence=0.95,
+            risk_level="medium",
+            auto_redact=True,
+        )
+        for value in ("平山县永鸿金属制品厂", "赛 城投资公司")
+    ]
+
+    mappings = {mapping.original: mapping for mapping in _discover(text, candidates=candidates)}
+
+    assert mappings["平山县永鸿金属制品厂"].masked.endswith("厂")
+    assert mappings["赛 城投资公司"].masked.endswith("公司")
+    assert "城投资公司" not in mappings
+
+
 def test_engine_accepts_precollected_candidates_and_calibrates_before_overlap() -> None:
     text = "办公区完成调整，某人无权代表星河公司签字。"
     noisy = Candidate(

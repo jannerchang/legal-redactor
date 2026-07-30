@@ -108,7 +108,8 @@ async def send_redacted_to_discord(request: Request) -> JSONResponse:
     except InvalidDiscordThreadError as exc:
         return _case_error_response(str(exc), code=exc.code)
     try:
-        result = _post_discord_thread_file(
+        result = await asyncio.to_thread(
+            _post_discord_thread_file,
             thread_id,
             filename,
             content,
@@ -153,7 +154,11 @@ async def create_discord_thread(request: Request) -> JSONResponse:
         )
     if manifest and manifest.hermes_request_id:
         try:
-            recovered_thread_url = _find_discord_thread_for_case(case_folder, case_cause)
+            recovered_thread_url = await asyncio.to_thread(
+                _find_discord_thread_for_case,
+                case_folder,
+                case_cause,
+            )
             if recovered_thread_url:
                 manifest = create_or_update_manifest(
                     case_root,
@@ -189,7 +194,11 @@ async def create_discord_thread(request: Request) -> JSONResponse:
             request_id,
             case_cause,
         )
-        result = _post_discord_channel_message(_discord_command_channel_id(), command)
+        result = await asyncio.to_thread(
+            _post_discord_channel_message,
+            _discord_command_channel_id(),
+            command,
+        )
         manifest = record_hermes_thread_request(
             case_root,
             case_folder,
@@ -244,7 +253,11 @@ async def attach_to_bound_discord_thread(request: Request) -> JSONResponse:
         return _case_error_response(f"案件 manifest 读取失败: {exc}")
     if not manifest.discord_thread_url and manifest.hermes_request_id:
         try:
-            recovered_thread_url = _find_discord_thread_for_case(case_folder, case_cause)
+            recovered_thread_url = await asyncio.to_thread(
+                _find_discord_thread_for_case,
+                case_folder,
+                case_cause,
+            )
             if recovered_thread_url:
                 manifest = create_or_update_manifest(
                     case_root,
@@ -262,7 +275,8 @@ async def attach_to_bound_discord_thread(request: Request) -> JSONResponse:
         return _case_error_response(f"映射表解析失败: {exc}")
     try:
         thread_id = parse_discord_thread_id(manifest.discord_thread_url)
-        result = _post_discord_thread_file(
+        result = await asyncio.to_thread(
+            _post_discord_thread_file,
             thread_id,
             filename=filename,
             content=content,
