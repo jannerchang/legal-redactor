@@ -23,8 +23,8 @@ QWEN_MODEL_ID = "qwen3.6-27b-fp8"
 QWEN_MODEL_LABEL = "Qwen3.6 27B FP8（DGX Spark；全文默认）"
 DEFAULT_MODEL_ID = QWEN_MODEL_ID
 DEFAULT_MODEL_PATH = DEFAULT_QWEN_MODEL_PATH = QWEN_MODEL_ID
-DEFAULT_WORKER_HOST = "192.168.99.1"
-DEFAULT_WORKER_PORT = 8000
+DEFAULT_WORKER_BASE_URL = "http://192.168.99.1:8000/v1"
+DEFAULT_WORKER_API_KEY = "local-placeholder"
 DEFAULT_WORKER_MAX_TOKENS = 8192
 DEFAULT_WORKER_STARTUP_TIMEOUT_SECONDS = 300
 DEFAULT_WORKER_REQUEST_TIMEOUT_SECONDS = 660
@@ -108,11 +108,15 @@ class ModelManager:
         popen_factory: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
         model_discovery: Callable[[], Mapping[str, ModelSpec]] | None = None,
         manage_worker: bool = True,
+        worker_base_path: str = "",
+        worker_api_key: str | None = None,
     ) -> None:
         self._models = dict(models)
         self._model_discovery = model_discovery
         self._worker_host = worker_host
         self._worker_port = worker_port
+        self._worker_base_path = worker_base_path.rstrip("/")
+        self._worker_api_key = worker_api_key
         self._startup_timeout_seconds = startup_timeout_seconds
         self._request_timeout_seconds = request_timeout_seconds
         self._popen_factory = popen_factory
@@ -358,12 +362,15 @@ class ModelManager:
             self._worker_port,
             timeout=self._request_timeout_seconds,
         )
+        headers = {"Content-Type": "application/json"}
+        if self._worker_api_key:
+            headers["Authorization"] = f"Bearer {self._worker_api_key}"
         try:
             connection.request(
                 "POST",
-                "/v1/chat/completions",
+                f"{self._worker_base_path}/v1/chat/completions" if self._manage_worker else f"{self._worker_base_path}/chat/completions",
                 body=body,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
             )
             response = connection.getresponse()
             return response.status, response.read(), "application/json"
@@ -398,13 +405,9 @@ def create_model_manager_app(manager: ModelManager) -> FastAPI:
 
 
 def default_model_manager() -> ModelManager:
-    worker_host = os.environ.get("LEGAL_REDACTOR_MODEL_WORKER_HOST", DEFAULT_WORKER_HOST)
-    try:
-        worker_port = int(os.environ.get("LEGAL_REDACTOR_MODEL_WORKER_PORT", str(DEFAULT_WORKER_PORT)))
-    except ValueError as exc:
-        raise RuntimeError("LEGAL_REDACTOR_MODEL_WORKER_PORT must be an integer") from exc
-    if not 1 <= worker_port <= 65535:
-        raise RuntimeError("LEGAL_REDACTOR_MODEL_WORKER_PORT must be between 1 and 65535")
+    worker_base_url = os.environ.get("LEGAL_REDACTOR_MODEL_WORKER_BASE_URL", DEFAULT_WORKER_BASE_URL)
+    worker_host, worker_port, worker_base_path = _parse_worker_base_url(worker_base_url)
+    worker_api_key = os.environ.get("LEGAL_REDACTOR_MODEL_WORKER_API_KEY", DEFAULT_WORKER_API_KEY)
     models = {
         QWEN_MODEL_ID: ModelSpec(
             QWEN_MODEL_ID,
@@ -412,7 +415,30 @@ def default_model_manager() -> ModelManager:
             os.environ.get("LEGAL_REDACTOR_QWEN_MODEL", str(DEFAULT_QWEN_MODEL_PATH)),
         )
     }
-    return ModelManager(models, worker_host, worker_port, manage_worker=False)
+    return ModelManager(
+        models,
+        worker_host,
+        worker_port,
+        manage_worker=False,
+        worker_base_path=worker_base_path,
+        worker_api_key=worker_api_key,
+    )
+
+
+def _parse_worker_base_url(value: str) -> tuple[str, int, str]:
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(value.strip())
+    if parsed.scheme != "http" or not parsed.hostname:
+        raise RuntimeError("LEGAL_REDACTOR_MODEL_WORKER_BASE_URL must be an http URL")
+    try:
+        port = parsed.port or 80
+    except ValueError as exc:
+        raise RuntimeError("LEGAL_REDACTOR_MODEL_WORKER_BASE_URL has an invalid port") from exc
+    base_path = parsed.path.rstrip("/")
+    if not base_path:
+        raise RuntimeError("LEGAL_REDACTOR_MODEL_WORKER_BASE_URL must include an API base path")
+    return parsed.hostname, port, base_path
 
 
 def discover_model_specs(

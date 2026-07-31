@@ -14,6 +14,7 @@ from legal_redactor.model_manager import (
     ModelManager,
     ModelManagerError,
     ModelSpec,
+    _parse_worker_base_url,
     create_model_manager_app,
     discover_model_specs,
 )
@@ -43,6 +44,8 @@ class _FakeProcess:
 
 class _WorkerHandler(BaseHTTPRequestHandler):
     requests: list[dict] = []
+    request_paths: list[str] = []
+    authorization_headers: list[str | None] = []
     status = 200
     payload: object = {"id": "chatcmpl-1", "model": "/private/model", "choices": [{"message": {"content": "{}"}}]}
 
@@ -55,6 +58,8 @@ class _WorkerHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         body = self.rfile.read(int(self.headers["Content-Length"]))
         self.requests.append(json.loads(body))
+        self.request_paths.append(self.path)
+        self.authorization_headers.append(self.headers.get("Authorization"))
         self._respond(self.status, self.payload)
 
     def _respond(self, status: int, payload: object) -> None:
@@ -101,9 +106,26 @@ def _manager(tmp_path: Path, port: int, created: list[_FakeProcess]) -> ModelMan
     return ModelManager({spec.id: spec}, "127.0.0.1", port, startup_timeout_seconds=1, popen_factory=popen)
 
 
+def test_worker_base_url_parses_openai_api_root() -> None:
+    assert _parse_worker_base_url("http://192.168.99.1:8000/v1") == (
+        "192.168.99.1",
+        8000,
+        "/v1",
+    )
+
+
+@pytest.mark.parametrize("value", ["", "192.168.99.1:8000/v1", "https://192.168.99.1:8000/v1"])
+def test_worker_base_url_rejects_unsupported_values(value: str) -> None:
+    with pytest.raises(RuntimeError, match="MODEL_WORKER_BASE_URL"):
+        _parse_worker_base_url(value)
+
+
+
 def test_remote_manager_proxies_registered_model_without_local_path(tmp_path: Path) -> None:
     del tmp_path
     _WorkerHandler.requests = []
+    _WorkerHandler.request_paths = []
+    _WorkerHandler.authorization_headers = []
     _WorkerHandler.status = 200
     _WorkerHandler.payload = {
         "id": "chatcmpl-remote",
@@ -116,6 +138,8 @@ def test_remote_manager_proxies_registered_model_without_local_path(tmp_path: Pa
             "127.0.0.1",
             worker.port,
             manage_worker=False,
+            worker_base_path="/v1",
+            worker_api_key="local-placeholder",
         )
         client = TestClient(create_model_manager_app(manager))
         response = client.post(
@@ -128,6 +152,8 @@ def test_remote_manager_proxies_registered_model_without_local_path(tmp_path: Pa
     assert _WorkerHandler.requests == [
         {"model": "qwen3.6-27b-fp8", "messages": [{"role": "user", "content": "{}"}]}
     ]
+    assert _WorkerHandler.request_paths == ["/v1/chat/completions"]
+    assert _WorkerHandler.authorization_headers == ["Bearer local-placeholder"]
     assert manager.models_payload()["data"] == [
         {"id": "qwen3.6-27b-fp8", "object": "model", "name": "Qwen 27B"}
     ]
