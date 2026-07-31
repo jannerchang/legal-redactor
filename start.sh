@@ -7,6 +7,26 @@ HOST="${LEGAL_REDACTOR_HOST:-127.0.0.1}"
 PORT="${LEGAL_REDACTOR_PORT:-7860}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
+sync_macos_proxy_env() {
+  [[ "$(uname -s)" == "Darwin" ]] || return 0
+  local proxy_dump http_host http_port https_host https_port
+  proxy_dump="$(scutil --proxy 2>/dev/null || true)"
+  http_host="$(printf '%s\n' "$proxy_dump" | sed -n 's/^[[:space:]]*HTTPProxy : //p' | head -n 1)"
+  http_port="$(printf '%s\n' "$proxy_dump" | sed -n 's/^[[:space:]]*HTTPPort : //p' | head -n 1)"
+  https_host="$(printf '%s\n' "$proxy_dump" | sed -n 's/^[[:space:]]*HTTPSProxy : //p' | head -n 1)"
+  https_port="$(printf '%s\n' "$proxy_dump" | sed -n 's/^[[:space:]]*HTTPSPort : //p' | head -n 1)"
+  if [[ -n "$http_host" && -n "$http_port" ]]; then
+    export HTTP_PROXY="http://$http_host:$http_port"
+    export http_proxy="$HTTP_PROXY"
+  fi
+  if [[ -n "$https_host" && -n "$https_port" ]]; then
+    export HTTPS_PROXY="http://$https_host:$https_port"
+    export https_proxy="$HTTPS_PROXY"
+  fi
+}
+
+sync_macos_proxy_env
+
 if [[ ! -d ".venv" ]]; then
   "$PYTHON_BIN" -m venv .venv
 fi

@@ -17,13 +17,14 @@
 > 律师的专业判断，也不得用于未经授权的案件材料。未公开材料不得发送到公共 AI 或未经批准的
 > 第三方服务；使用者应自行遵守保密、数据安全、个人信息保护及所在机构的内部制度。
 
-## v0.2.2 单一认证模型与行政区划深度策略
+## v0.2.3 DGX Spark 27B 推理后端
 
-`v0.2.2` 将业务模型收敛为经过真实全文验证的 `qwen3.5-9b`，不再注册或发现 27B/2-bit 模型；同时明确全国行政区划自动处理至地级、河北权威数据库继续深入区县与乡镇/街道。
+`v0.2.3` 将唯一认证模型切换为 DGX Spark 上的 `qwen3.6-27b-fp8`。Mac 仍只暴露本机 `model-manager`（默认 `127.0.0.1:18080`）；管理器把逻辑模型请求代理到 Spark 的 OpenAI-compatible vLLM 端点。
 
-- Web、CLI、模型管理器和识别基准只暴露 `qwen3.5-9b`，避免长全文处理被低收益的慢速模型阻塞。
+- Web、CLI、模型管理器和识别基准只暴露 `qwen3.6-27b-fp8`。
+- Spark API 默认 `base_url` 为 `http://192.168.99.1:8000/v1`，`api_key` 为 `local-placeholder`；可用 `LEGAL_REDACTOR_MODEL_WORKER_BASE_URL` 和 `LEGAL_REDACTOR_MODEL_WORKER_API_KEY` 覆盖。
+- Mac 不再加载或切换本地 MLX 权重；模型不可达时保持 fail-closed，不生成新的脱敏 artifact。
 - 全国数据库自动识别省级和地级行政区；河北数据库继续自动识别至区县、县级市、乡镇和街道。
-- LLM 地点补充只接受省级和地级名称，区县以下不由模型猜测。
 
 ## v0.2.1 全文生成稳定性与架构保护
 
@@ -101,12 +102,12 @@
 - 系统：macOS 26.5.1
 - Python：3.13.2（项目 `.venv`）
 - 本地模型 API：`model-manager`，默认 `127.0.0.1:18080`
-- 默认逻辑模型 ID：`qwen3.5-9b`（展示名：Qwen3.5 9B（MLX 4-bit））
-- 认证模型仅包括 `qwen3.5-9b`；27B/2-bit 模型不再注册或出现在业务模型列表中
+- 默认逻辑模型 ID：`qwen3.6-27b-fp8`（展示名：Qwen3.6 27B FP8（DGX Spark））
+- 认证模型仅包括 `qwen3.6-27b-fp8`；本机不再注册业务推理权重
 - 默认 Web 端口：`127.0.0.1:7860`
 - Office 私网还原 API：建议绑定 `127.0.0.1:8787`，通过 SSH 反向隧道暴露到 Home Mac 的 `127.0.0.1:18787`
 
-应用和 Web 表单只向本地 `model-manager` 发送逻辑模型 ID。管理器通过 OpenAI-compatible `GET /v1/models` 公布当前可用模型，并把每次请求选择的 ID 映射到本机 MLX 权重；切换模型时会卸载当前 worker 后加载所选模型。权重路径不会出现在应用请求或 Web 页面中。模型 API 或所选模型不可用时，新的脱敏生成会明确停止；已有加密映射的恢复能力不受影响。
+应用和 Web 表单只向本机 `model-manager` 发送逻辑模型 ID。管理器通过 OpenAI-compatible `GET /v1/models` 公布当前可用模型，并把请求代理到 DGX Spark vLLM worker；Spark 的模型路径和内部部署细节不会出现在应用请求或 Web 页面中。模型 API 或 Spark worker 不可用时，新的脱敏生成会明确停止；已有加密映射的恢复能力不受影响。
 
 ## 安装与启动
 
@@ -122,7 +123,7 @@ cd legal-redactor
 # 浏览器打开 http://127.0.0.1:7860
 ```
 
-`start.sh` 会创建/复用 `.venv`、检查 Web 依赖、复用或启动本地模型管理器，然后启动 WebUI。管理器只在首次推理请求时启动内部 MLX worker；设置 `LEGAL_REDACTOR_SKIP_MLX=1` 会跳过模型 API，并使新的脱敏请求以明确错误停止。
+`start.sh` 会创建/复用 `.venv`、检查 Web 依赖、复用或启动本地模型管理器，然后启动 WebUI。模型管理器不会在 Mac 上加载权重，只代理到已启动的 DGX Spark worker；设置 `LEGAL_REDACTOR_SKIP_MLX=1` 会跳过模型 API，并使新的脱敏请求以明确错误停止。
 
 首页会显示一个只读系统状态区，也可直接访问机器接口：
 
@@ -141,7 +142,7 @@ Web 支持粘贴文本、拖拽 txt/md、上传 txt/md/doc/docx/pdf、多文件�
 帖子后，脱敏文本和加密映射表会保存到本地案件库，供后续 Hermes/Discord
 还原工作流使用。
 
-首页默认选择“整篇文书（LLM 双轮补漏）”和 `qwen3.5-9b`。本地 LLM 首轮读取完整文书并返回案件级实体登记表，第二轮再次独立阅读全文，只补充首轮遗漏的人名、机构、行政区划及明确的同一主体关系；程序校验所有名称都逐字存在于原文后合并两轮登记、定位全部精确 span，并沿用现有确定性映射与替换流程。首轮成功但补漏失败时保留首轮有效结果；首轮失败、超限或无效登记表时停止生成，不保存也不发送新的脱敏 artifact。SQLite 行政区划数据库以及身份证号、电话、银行账号、案号等确定性安全能力始终保留；宽泛的任意汉字加行政后缀发现规则已删除。全文模式单篇硬上限为 120000 字符，不截断。结果页只展示模式、逻辑模型 ID、状态、文档数、调用数、识别耗时、降级与冲突计数，不展示 prompt、response、实体登记表、证据或模型权重路径。TXT 下载使用 UTF-8 BOM，兼容按系统默认编码打开的编辑器。
+首页默认选择“整篇文书（LLM 双轮补漏）”和 `qwen3.6-27b-fp8`。DGX Spark 上的模型首轮读取完整文书并返回案件级实体登记表，第二轮再次独立阅读全文，只补充首轮遗漏的人名、机构、行政区划及明确的同一主体关系；程序校验所有名称都逐字存在于原文后合并两轮登记、定位全部精确 span，并沿用现有确定性映射与替换流程。首轮成功但补漏失败时保留首轮有效结果；首轮失败、超限或无效登记表时停止生成，不保存也不发送新的脱敏 artifact。SQLite 行政区划数据库以及身份证号、电话、银行账号、案号等确定性安全能力始终保留；宽泛的任意汉字加行政后缀发现规则已删除。全文模式单篇硬上限为 120000 字符，不截断。结果页只展示模式、逻辑模型 ID、状态、文档数、调用数、识别耗时、降级与冲突计数，不展示 prompt、response、实体登记表、证据或模型权重路径。TXT 下载使用 UTF-8 BOM，兼容按系统默认编码打开的编辑器。
 
 脱敏结果页的映射表带有复核筛选：全部、低置信、手工新增、已修改、删除候选、
 还原风险和样本复用。保存为样本时页面不会跳转，会在当前结果页显示本次保存摘要，
@@ -160,8 +161,8 @@ Web 支持粘贴文本、拖拽 txt/md、上传 txt/md/doc/docx/pdf、多文件�
 # 按统一标准脱敏
 .venv/bin/python -m legal_redactor 文件.txt
 
-# 当前认证逻辑模型 ID 固定为 qwen3.5-9b
-.venv/bin/python -m legal_redactor --model qwen3.5-9b 文件.txt
+# 当前认证逻辑模型 ID 固定为 qwen3.6-27b-fp8
+.venv/bin/python -m legal_redactor --model qwen3.6-27b-fp8 文件.txt
 
 # 指定输出目录
 .venv/bin/python -m legal_redactor -o output/2026-05 文件.txt
@@ -238,16 +239,16 @@ Hermes 工具调用只传协作 thread id 和法律文书草稿；本地工作�
 
 唯一的对外模型端点是 `model-manager`，默认 `http://127.0.0.1:18080`。它公开 OpenAI-compatible `GET /v1/models` 和 `POST /v1/chat/completions`。Web 每次载入页面时读取模型列表，处理文书时提交本次选择的逻辑模型 ID；CLI 可使用 `--model` 指定同一个 ID。浏览器和命令行仍不接受任意权重路径。
 
-管理器只向 Web/CLI 暴露经过全文实体登记协议验证的模型。当前唯一认证模型为内置逻辑 ID `qwen3.5-9b`；27B/2-bit 与 `mlx-community/Qwen3.5-4B-MLX-4bit` 均不会注册或出现在下拉列表中。本地权重存在不等于业务兼容；新增模型必须先通过真实公开全文的两轮 JSON 登记、原文一致性、性能与 fail-closed 验证，再加入认证列表。
+管理器只向 Web/CLI 暴露经过全文实体登记协议验证的模型。当前唯一认证模型为逻辑 ID `qwen3.6-27b-fp8`；浏览器和 CLI 不接受任意远程模型名或权重路径。新增模型必须先通过真实公开全文的两轮 JSON 登记、原文一致性、性能与 fail-closed 验证，再加入认证列表。
 
-管理器本身通过 `scripts/start_model_manager.sh` 启动或复用。内部 MLX worker 默认仅监听 `127.0.0.1:18081`，由管理器按请求惰性拥有、切换和关闭；不要直接启动 worker。可通过以下环境变量分别覆盖本机监听地址，并可用 `LEGAL_REDACTOR_QWEN_MODEL` 覆盖 Qwen 模型的本地路径或 Hugging Face 仓库 ID：
+管理器本身通过 `scripts/start_model_manager.sh` 启动或复用。DGX Spark 的 OpenAI-compatible API 默认 `base_url=http://192.168.99.1:8000/v1`、`api_key=local-placeholder`，必须由 Spark 侧预先启动；Mac 管理器不会拥有、切换或关闭该远程进程。可通过以下环境变量覆盖本机管理器和 Spark API 配置：
 
 ```bash
 LEGAL_REDACTOR_MODEL_MANAGER_HOST=127.0.0.1
 LEGAL_REDACTOR_MODEL_MANAGER_PORT=18080
-LEGAL_REDACTOR_MLX_WORKER_HOST=127.0.0.1
-LEGAL_REDACTOR_MLX_WORKER_PORT=18081
-LEGAL_REDACTOR_QWEN_MODEL=~/Models/HuggingFace/hub/models--mlx-community--Qwen3.5-9B-MLX-4bit/snapshots/<revision>
+LEGAL_REDACTOR_MODEL_WORKER_BASE_URL=http://192.168.99.1:8000/v1
+LEGAL_REDACTOR_MODEL_WORKER_API_KEY=local-placeholder
+LEGAL_REDACTOR_QWEN_MODEL=qwen3.6-27b-fp8
 ```
 
 例如，先读取可选模型，再在请求中传入其中一个逻辑 ID：
@@ -256,7 +257,7 @@ LEGAL_REDACTOR_QWEN_MODEL=~/Models/HuggingFace/hub/models--mlx-community--Qwen3.
 curl -fsS http://127.0.0.1:18080/v1/models
 curl -fsS http://127.0.0.1:18080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.5-9b","messages":[{"role":"user","content":"Return exactly {}"}],"stream":false,"temperature":0,"max_tokens":16}'
+  -d '{"model":"qwen3.6-27b-fp8","messages":[{"role":"user","content":"Return exactly {}"}],"stream":false,"temperature":0,"max_tokens":16}'
 ```
 
 管理器或模型不可用时，应用停止新的脱敏生成；不会尝试纯规则、逐句窗口、Ollama、Open WebUI 或其他后端。模型只负责整篇文书实体登记；最终替换仍由本地确定性映射流程完成。

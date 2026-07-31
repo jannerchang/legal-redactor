@@ -151,8 +151,7 @@ class WebAppUploadTests(unittest.TestCase):
             patch(
                 "legal_redactor.web.status_ops._available_model_options",
                 return_value=[
-                    {"id": "bonsai-27b", "label": "Ternary Bonsai 27B（MLX 2-bit；长全文不推荐）"},
-                    {"id": "qwen3.5-9b", "label": "Qwen3.5 9B（MLX 4-bit；全文默认）"},
+                    {"id": "qwen3.6-27b-fp8", "label": "Qwen3.6 27B FP8（DGX Spark；全文默认）"},
                 ],
             ),
         ):
@@ -181,14 +180,13 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertNotIn("body:new FormData(form)", page)
         self.assertIn('id="redact-form"', page)
         self.assertIn('id="redact-progress"', page)
-        self.assertIn("Ternary Bonsai 27B（MLX 2-bit；长全文不推荐）", page)
-        self.assertIn("Qwen3.5 9B（MLX 4-bit；全文默认）", page)
+        self.assertIn("Qwen3.6 27B FP8（DGX Spark；全文默认）", page)
         self.assertIn('id="model-choice"', page)
         self.assertIn('name="model"', page)
         self.assertIn('class="advanced-options"', page)
         self.assertIn('data-upload-target="source-files"', page)
         self.assertIn('data-upload-target="source-directory-files"', page)
-        self.assertIn("每次处理都可重新选择", page)
+        self.assertIn("当前提供 1 个模型", page)
         self.assertIn("识别模式固定使用整篇文书双轮补漏", page)
         self.assertIn('name="recognition_mode" value="full_document"', page)
         self.assertNotIn('id="recognition-mode-choice"', page)
@@ -198,7 +196,7 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertIn("/api/model-status", page)
         self.assertIn("已用时", page)
         self.assertNotIn("super-secret-token", page)
-        self.assertIn('value="qwen3.5-9b" selected', page)
+        self.assertIn('value="qwen3.6-27b-fp8" selected', page)
 
 
     def test_models_endpoint_forwards_public_manager_registry(self) -> None:
@@ -1482,6 +1480,35 @@ class WebAppUploadTests(unittest.TestCase):
             self.assertEqual(manifest.case_folder, "2026 8888")
             self.assertFalse((Path(default_root) / "2026 8888").exists())
 
+    def test_suggest_mapping_entry_api_parses_current_map_after_modularization(self) -> None:
+        from fastapi.testclient import TestClient
+
+        current_map = RedactionMap.create(
+            [
+                MappingEntry(
+                    type="person",
+                    original="张三",
+                    masked="张某甲",
+                    role=None,
+                    source="test",
+                    confidence=1.0,
+                    restore_by_default=True,
+                )
+            ]
+        )
+        response = TestClient(app).post(
+            "/api/mapping/suggest-entry",
+            json={
+                "selected_text": "张四",
+                "entity_type": "person",
+                "map_json": json.dumps(current_map.to_dict(), ensure_ascii=False),
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "success")
+        self.assertEqual(response.json()["entry"]["masked"], "张某乙")
+
     def test_suggest_manual_person_mapping_continues_same_surname_counter(self) -> None:
         existing = [
             MappingEntry(
@@ -2033,6 +2060,107 @@ class WebAppUploadTests(unittest.TestCase):
         data = json.loads(response.body.decode("utf-8"))
         self.assertEqual(data["status"], "pending")
         self.assertEqual(data["workflow_state"], "waiting_hermes")
+    def test_pending_hermes_lookup_does_not_block_health_requests(self) -> None:
+        import asyncio
+        import threading
+
+        lookup_started = threading.Event()
+        release_lookup = threading.Event()
+
+        def slow_lookup(*_args) -> str:
+            lookup_started.set()
+            if not release_lookup.wait(timeout=2):
+                raise AssertionError("Discord lookup was not released")
+            return ""
+
+        async def exercise() -> tuple[dict, dict]:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                source_dir = os.path.join(tmpdir, "2026 5987")
+                record_hermes_thread_request(
+                    tmpdir,
+                    "2026 5987",
+                    "lr_test",
+                    source_dir=source_dir,
+                    command_message_id="m1",
+                    command_channel_id="c1",
+                )
+                with patch("legal_redactor.web.discord_ops._find_discord_thread_for_case", side_effect=slow_lookup):
+                    from httpx import ASGITransport, AsyncClient
+
+                    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                        pending = asyncio.create_task(
+                            client.post(
+                                "/api/discord/attach-bound-thread",
+                                json={
+                                    "case_root": tmpdir,
+                                    "case_folder": "2026 5987",
+                                    "source_dir": source_dir,
+                                    "filename": "redacted.txt",
+                                    "content": "脱敏内容",
+                                    "map_json": redaction_map_to_json(RedactionMap.create([])),
+                                },
+                            )
+                        )
+                        started = await asyncio.to_thread(lookup_started.wait, 1)
+                        self.assertTrue(started)
+                        health_response = await asyncio.wait_for(client.get("/health"), timeout=0.5)
+                        release_lookup.set()
+                        pending_response = await pending
+            return health_response.json(), pending_response.json()
+
+        health_data, pending_data = asyncio.run(exercise())
+
+        self.assertEqual(health_data["status"], "ok")
+        self.assertEqual(pending_data["workflow_state"], "waiting_hermes")
+
+
+    def test_attach_bound_discord_thread_recovers_hermes_thread_during_poll(self) -> None:
+        import asyncio
+
+        calls = []
+        thread_url = "https://discord.com/channels/1/2/333"
+
+        def fake_post(thread_id: str, filename: str, content: str, message: str = "") -> dict[str, str]:
+            calls.append((thread_id, filename, content, message))
+            return {"message_id": "m2", "channel_id": thread_id}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_dir = os.path.join(tmpdir, "2026 5987")
+            record_hermes_thread_request(
+                tmpdir,
+                "2026 5987",
+                "lr_test",
+                source_dir=source_dir,
+                command_message_id="m1",
+                command_channel_id="c1",
+            )
+            with (
+                patch("legal_redactor.web.discord_ops._find_discord_thread_for_case", return_value=thread_url),
+                patch("legal_redactor.web.discord_ops._post_discord_thread_file", side_effect=fake_post),
+            ):
+                response = asyncio.run(
+                    attach_to_bound_discord_thread(
+                        MockJsonRequest(
+                            {
+                                "case_root": tmpdir,
+                                "case_folder": "2026 5987",
+                                "source_dir": source_dir,
+                                "case_cause": "劳动争议纠纷",
+                                "filename": "redacted.txt",
+                                "content": "脱敏内容",
+                                "map_json": redaction_map_to_json(RedactionMap.create([])),
+                            }
+                        )
+                    )
+                )
+            manifest = load_manifest(source_dir)
+
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(data["thread_url"], thread_url)
+        self.assertEqual(manifest.discord_thread_url, thread_url)
+        self.assertEqual(calls, [("333", "redacted.txt", "脱敏内容", "脱敏文件已生成，请见附件：redacted.txt")])
 
     def test_attach_bound_discord_thread_sends_file_and_persists(self) -> None:
         import asyncio

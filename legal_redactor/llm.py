@@ -248,6 +248,27 @@ def _is_valid_company_variant(text: str) -> bool:
         if "（" in stripped or "(" in stripped:
             return _is_valid_org_capture(stripped)
         return len(stripped) <= 10
+    if stripped.endswith(
+        (
+            "制品厂",
+            "加工厂",
+            "制造厂",
+            "修理厂",
+            "砖厂",
+            "石料厂",
+            "砂石厂",
+            "家具厂",
+            "服装厂",
+            "食品厂",
+            "木器厂",
+            "铸造厂",
+            "机械厂",
+            "电器厂",
+            "电子厂",
+            "化工厂",
+        )
+    ):
+        return len(stripped) >= 4
     if any(stripped.endswith(suffix) for suffix in _BANK_OR_FIRM_SUFFIXES):
         return len(stripped) <= 12
     return 2 <= len(stripped) <= 8
@@ -445,17 +466,28 @@ class LegalEntityAuditor:
                 response.metadata.completion_token_count if response.metadata.completion_token_count is not None else "未知",
                 response.metadata.finish_reason or "未知",
             )
-            if response.metadata.finish_reason == "length":
+            completed_payload = self._first_complete_json_object(response.response_text)
+            payload = completed_payload or self._repair_full_document_registry_payload(response.response_text)
+            parsed = parse_full_document_registry(payload or response.response_text)
+            if response.metadata.finish_reason == "length" and completed_payload is None:
+                last_reason = "output_token_limit"
+                if attempt + 1 < attempts:
+                    _logger.warning(
+                        "全文 LLM 输出达到 token 上限且没有有效完整 JSON；将切换 JSON 修复提示词执行唯一一次重试。"
+                    )
+                    continue
                 _logger.warning(
-                    "全文 LLM 输出达到 token 上限；判定为输出失控并停止，不执行同参数重试。"
+                    "全文 LLM 输出再次达到 token 上限且没有有效完整 JSON；已停止调用并阻止脱敏。"
                 )
                 return FullDocumentRegistryExtraction(
                     status="fallback",
-                    reason="output_token_limit",
+                    reason=last_reason,
                     metadata=total_metadata,
                 )
-            repaired_payload = self._repair_full_document_registry_payload(response.response_text)
-            parsed = parse_full_document_registry(repaired_payload or response.response_text)
+            if response.metadata.finish_reason == "length":
+                _logger.warning(
+                    "全文 LLM 达到 token 上限，但已提取并校验触顶前的完整 JSON；忽略其后失控输出。"
+                )
             if not parsed.valid:
                 last_reason = parsed.error or "invalid_registry_payload"
                 if attempt + 1 < attempts:
@@ -586,6 +618,44 @@ class LegalEntityAuditor:
                 finish_reason=finish_reason if isinstance(finish_reason, str) else None,
             ),
         )
+
+    @staticmethod
+    def _first_complete_json_object(value: str) -> str | None:
+        """Return the first complete top-level JSON object, ignoring trailing generation."""
+        text = value.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text, count=1, flags=re.IGNORECASE)
+        start = text.find("{")
+        if start < 0:
+            return None
+        depth = 0
+        in_string = False
+        escape = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : index + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                    except JSONDecodeError:
+                        return None
+                    return candidate if isinstance(parsed, dict) else None
+        return None
+
 
     @classmethod
     def _repair_full_document_registry_payload(cls, value: str) -> str | None:
@@ -860,9 +930,12 @@ class LegalEntityAuditor:
             "same_entities 只列原文用又名、曾用名、简称、以下简称或同一人明确确认的同一主体两个不同名称；无法确认就不列。"
             "same_entities 两项文字必须不同，禁止名称与自身配对；不同诉讼角色、同段出现、姓名相似或模型推断都不构成同一主体；张三与李四这类不同完整人名禁止合并。"
             "名称必须逐字来自原文，不得改写、补空格或规范化数字。"
-            "只登记 person、organization、location；禁止登记普通指代、职务称谓、审判人员、法官助理、书记员、"
-            "项目、合同、案号、电话、身份证号、银行账号、详细地址或其他编号。"
-            "地点只登记省级或地级市名称，包括省、自治区、特别行政区、市、自治州、盟、地区；禁止登记区、县、旗、乡镇、街道、村、社区或详细地址。没有某类实体或映射时使用空数组。"
+            "只登记 person、organization、location；person 必须是具体自然人姓名，organization 必须是有专名的具体法律主体或经营主体。"
+            "禁止把纯数字、普通指代、职务称谓、审判人员、法官助理、书记员、项目、合同、协议、价款、案件、"
+            "电话、身份证号、银行账号、详细地址或其他编号登记为实体；‘地产公司’等通用类别名称也不是具体机构。"
+            "法院、中院名称只登记其中省级或地级市地点，不登记整个法院名称；地点只登记省级或地级市名称，包括省、自治区、特别行政区、市、自治州、盟、地区；"
+            "禁止登记区、县、旗、乡镇、街道、村、社区或详细地址。没有某类实体或映射时使用空数组。"
+
             "不要证据、entity_id、type、confidence、解释、Markdown、脱敏稿、换行或其他字段。"
             "输出最后一个 } 后立即停止。\n"
             "输出格式："
@@ -899,9 +972,11 @@ class LegalEntityAuditor:
             "顶层必须且只能有 persons、organizations、locations、same_entities 四个数组，每个字段只允许出现一次。"
             "严禁输出第一轮已有名称。没有遗漏时，必须逐字输出"
             '{"persons":[],"organizations":[],"locations":[],"same_entities":[]}。'
-            "名称必须逐字来自原文。"
-            "禁止登记普通指代、职务称谓、审判人员、法官助理、书记员、项目、合同、案号、电话、身份证号、银行账号、"
-            "详细地址或其他编号。地点只登记省级或地级市名称，禁止登记区、县、旗、乡镇、街道、村或社区。"
+            "名称必须逐字来自原文。person 必须是具体自然人姓名，organization 必须是有专名的具体法律主体或经营主体。"
+            "禁止把纯数字、普通指代、职务称谓、审判人员、法官助理、书记员、项目、合同、协议、价款、案件、电话、身份证号、银行账号、"
+            "详细地址或其他编号登记为实体；‘地产公司’等通用类别名称也不是具体机构。法院、中院名称只登记其中省级或地级市地点，不登记整个法院名称。"
+            "地点只登记省级或地级市名称，禁止登记区、县、旗、乡镇、街道、村或社区。"
+
             "same_entities 每项必须恰好包含两个不同名称，禁止名称与自身配对，且原文必须用又名、曾用名、简称、以下简称或同一人明确确认其为同一主体。"
             "不同诉讼角色、同段出现、姓名相似或模型推断都不构成同一主体；不同完整人名禁止合并。"
             "不要重复字段、重复对象、证据、解释、Markdown、换行或其他字段。输出第一个完整对象后立即停止。\n"

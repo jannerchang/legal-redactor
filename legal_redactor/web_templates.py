@@ -966,7 +966,7 @@ def render_home_page(
               <select id="model-choice" name="model">
                 {model_options_html}
               </select>
-              <p class="hint">整篇文书双轮识别是唯一的新识别路径；单篇最多 120000 字符，超限或首轮失败时停止生成，不保存也不发送新的脱敏文件。切换模型会重载本地 MLX worker，仅影响本次文书。</p>
+              <p class="hint">整篇文书双轮识别是唯一的新识别路径；单篇最多 120000 字符，超限或首轮失败时停止生成，不保存也不发送新的脱敏文件。当前模型由 DGX Spark 提供，仅影响本次文书。</p>
               <label>已有映射表（保持替换一致性）</label>
               <textarea name="base_map_json" rows="3" placeholder="粘贴已有映射表 JSON（可选）"></textarea>
               <label class="file-pill">

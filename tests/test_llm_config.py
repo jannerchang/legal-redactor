@@ -79,8 +79,8 @@ def test_balanced_config_targets_same_manager_model() -> None:
 
 def test_from_llm_mode_accepts_registered_model_choice() -> None:
     assert PipelineConfig.from_llm_mode("max-effect").llm.model == QWEN_MODEL_ID
-    assert PipelineConfig.from_llm_mode("max-effect", model="qwen3.5-9b").llm.model == "qwen3.5-9b"
-    assert PipelineConfig.from_llm_mode("balanced", model="qwen3.5-9b").llm.model == "qwen3.5-9b"
+    assert PipelineConfig.from_llm_mode("max-effect", model="qwen3.6-27b-fp8").llm.model == "qwen3.6-27b-fp8"
+    assert PipelineConfig.from_llm_mode("balanced", model="qwen3.6-27b-fp8").llm.model == "qwen3.6-27b-fp8"
 
 def test_disabled_and_sentence_recognition_modes_are_rejected() -> None:
     with pytest.raises(ValueError, match="cannot be disabled"):
@@ -194,7 +194,110 @@ def test_full_document_calls_use_newline_stop_sequence(monkeypatch) -> None:
     assert all(request["timeout"] == 600 for request in _Connection.requests)
 
 
-def test_full_document_token_limit_fails_without_retry(monkeypatch) -> None:
+def test_full_document_token_limit_accepts_complete_json_before_trailing_runaway(monkeypatch) -> None:
+    registry_json = '{"persons":["张三"],"organizations":[],"locations":[],"same_entities":[]}'
+    limited_body = json.dumps(
+        {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {"content": registry_json + registry_json + '{"persons":["张'},
+                }
+            ],
+            "usage": {"completion_tokens": 1024},
+        },
+        ensure_ascii=False,
+    )
+    empty_body = json.dumps(
+        {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": '{"persons":[],"organizations":[],"locations":[],"same_entities":[]}'
+                    },
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    _Connection.requests = []
+    _Connection.responses = [_Response(200, limited_body), _Response(200, empty_body)]
+    monkeypatch.setattr("legal_redactor.llm.http.client.HTTPConnection", _Connection)
+
+    result = LegalEntityAuditor(LLMAPIConfig()).extract_full_document_registry("原告张三。")
+
+    assert result.status == "success"
+    assert result.metadata.call_count == 2
+    assert result.metadata.retry_count == 0
+    assert [entity.variants for entity in result.validation.registry.entities] == [("张三",)]
+    assert len(_Connection.requests) == 2
+
+
+def test_full_document_token_limit_retries_once_with_repair_prompt(monkeypatch) -> None:
+    registry = {
+        "persons": ["张三"],
+        "organizations": [],
+        "locations": [],
+        "same_entities": [],
+    }
+    limited_body = json.dumps(
+        {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {"content": '{"persons":["张三"'},
+                }
+            ],
+            "usage": {"completion_tokens": 1024},
+        },
+        ensure_ascii=False,
+    )
+    repaired_body = json.dumps(
+        {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": json.dumps(registry, ensure_ascii=False)},
+                }
+            ],
+            "usage": {"completion_tokens": 40},
+        },
+        ensure_ascii=False,
+    )
+    empty_body = json.dumps(
+        {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": '{"persons":[],"organizations":[],"locations":[],"same_entities":[]}'
+                    },
+                }
+            ],
+            "usage": {"completion_tokens": 20},
+        },
+        ensure_ascii=False,
+    )
+    _Connection.requests = []
+    _Connection.responses = [
+        _Response(200, limited_body),
+        _Response(200, repaired_body),
+        _Response(200, empty_body),
+    ]
+    monkeypatch.setattr("legal_redactor.llm.http.client.HTTPConnection", _Connection)
+
+    result = LegalEntityAuditor(LLMAPIConfig()).extract_full_document_registry("原告张三。")
+
+    assert result.status == "success"
+    assert result.reason is None
+    assert result.metadata.call_count == 3
+    assert result.metadata.retry_count == 1
+    assert len(_Connection.requests) == 3
+    assert "上一轮输出不是合法的案件级实体 JSON" in _Connection.requests[1]["body"]["messages"][0]["content"]
+
+
+def test_full_document_repeated_token_limit_fails_closed(monkeypatch) -> None:
     response_body = json.dumps(
         {
             "choices": [
@@ -208,7 +311,7 @@ def test_full_document_token_limit_fails_without_retry(monkeypatch) -> None:
         ensure_ascii=False,
     )
     _Connection.requests = []
-    _Connection.responses = [_Response(200, response_body)]
+    _Connection.responses = [_Response(200, response_body), _Response(200, response_body)]
     monkeypatch.setattr("legal_redactor.llm.http.client.HTTPConnection", _Connection)
 
     result = LegalEntityAuditor(LLMAPIConfig()).extract_full_document_registry("原告张三。")
@@ -216,8 +319,9 @@ def test_full_document_token_limit_fails_without_retry(monkeypatch) -> None:
     assert result.status == "fallback"
     assert result.reason == "output_token_limit"
     assert result.metadata.finish_reason == "length"
-    assert result.metadata.call_count == 1
-    assert len(_Connection.requests) == 1
+    assert result.metadata.call_count == 2
+    assert result.metadata.retry_count == 1
+    assert len(_Connection.requests) == 2
 
 
 def test_full_document_supplement_failure_preserves_primary_registry(monkeypatch) -> None:
@@ -251,7 +355,11 @@ def test_full_document_supplement_failure_preserves_primary_registry(monkeypatch
         ensure_ascii=False,
     )
     _Connection.requests = []
-    _Connection.responses = [_Response(200, primary_body), _Response(200, supplement_body)]
+    _Connection.responses = [
+        _Response(200, primary_body),
+        _Response(200, supplement_body),
+        _Response(200, supplement_body),
+    ]
     monkeypatch.setattr("legal_redactor.llm.http.client.HTTPConnection", _Connection)
 
     result = LegalEntityAuditor(LLMAPIConfig()).extract_full_document_registry("原告张三，被告李四。")
@@ -259,7 +367,10 @@ def test_full_document_supplement_failure_preserves_primary_registry(monkeypatch
     assert result.status == "success"
     assert result.reason == "supplement_output_token_limit"
     assert [entity.variants for entity in result.validation.registry.entities] == [("张三",)]
-    assert result.metadata.call_count == 2
+    assert result.metadata.call_count == 3
+    assert result.metadata.retry_count == 1
+    assert len(_Connection.requests) == 3
+    assert "上一轮补漏输出不是合法 JSON" in _Connection.requests[2]["body"]["messages"][0]["content"]
 
 
 def test_full_document_supplement_invalid_entities_gets_one_repair_attempt(monkeypatch) -> None:
@@ -306,6 +417,8 @@ def test_full_document_supplement_invalid_entities_gets_one_repair_attempt(monke
 
     assert result.status == "success"
     assert [entity.variants for entity in result.validation.registry.entities] == [("张三",), ("李四",)]
+
+
     assert result.metadata.call_count == 3
     assert result.metadata.retry_count == 1
     assert len(_Connection.requests) == 3
@@ -461,6 +574,30 @@ def test_registry_parser_builds_identity_groups_and_bounds_names() -> None:
     assert location.variants == ("北京市",)
 
 
+def test_registry_parser_drops_malformed_same_entity_pairs_without_dropping_entities() -> None:
+    from legal_redactor.entity_registry import parse_full_document_registry
+
+    result = parse_full_document_registry(
+        {
+            "persons": ["张三"],
+            "organizations": ["星河建设有限公司", "星河公司"],
+            "locations": [],
+            "same_entities": [
+                ["星河建设有限公司", "星河公司"],
+                ["张三"],
+                {"left": "张三", "right": "李四"},
+                ["张三", 1],
+            ],
+        }
+    )
+
+    assert result.valid
+    assert [(entity.entity_type, entity.variants) for entity in result.registry.entities] == [
+        ("person", ("张三",)),
+        ("organization", ("星河建设有限公司", "星河公司")),
+    ]
+
+
 def test_registry_parser_keeps_first_type_for_duplicate_model_name() -> None:
     from legal_redactor.entity_registry import parse_full_document_registry
 
@@ -549,6 +686,69 @@ def test_registry_validation_requires_exact_source_text_and_materializes_local_s
         ),
         ("星河公司", text.index("星河公司"), text.index("星河公司") + len("星河公司")),
     ]
+
+def test_registry_materialization_filters_sample_derived_false_entities() -> None:
+    text = "目标松地。107。土地差价款。民间借贷案件。地产公司。裕华区法院。阆中法院。劳动仲裁委。"
+    entities = (
+        RegistryEntity("person-1", "person", "目标松地", ("目标松地",)),
+        *(RegistryEntity(f"org-{index}", "organization", value, (value,)) for index, value in enumerate(
+            ("107", "土地差价款", "民间借贷案件", "地产公司", "裕华区法院", "阆中法院", "劳动仲裁委"),
+            1,
+        )),
+    )
+    validation = validate_registry_against_text(
+        text,
+        RegistryValidationResult(registry=FullDocumentEntityRegistry(entities=entities)),
+    )
+
+    assert materialize_registry_candidates(text, validation).candidates == ()
+
+
+def test_registry_materialization_keeps_named_factory_and_valid_person() -> None:
+    text = "平山县永鸿金属制品厂负责人杨利进到庭。"
+    validation = validate_registry_against_text(
+        text,
+        RegistryValidationResult(
+            registry=FullDocumentEntityRegistry(
+                entities=(
+                    RegistryEntity(
+                        "org-1",
+                        "organization",
+                        "平山县永鸿金属制品厂",
+                        ("平山县永鸿金属制品厂",),
+                    ),
+                    RegistryEntity("person-1", "person", "杨利进", ("杨利进",)),
+                )
+            )
+        ),
+    )
+
+    assert [candidate.text for candidate in materialize_registry_candidates(text, validation).candidates] == [
+        "平山县永鸿金属制品厂",
+        "杨利进",
+    ]
+
+
+def test_named_factory_survives_mapping_postprocess() -> None:
+    from legal_redactor.models import MappingEntry
+    from legal_redactor.postprocess import PostprocessConfig, apply_postprocess
+
+    mapping = MappingEntry(
+        type="organization",
+        original="平山县永鸿金属制品厂",
+        masked="甲厂",
+        role=None,
+        source="linear:full_document_llm",
+        confidence=0.9,
+        restore_by_default=True,
+    )
+
+    assert apply_postprocess(
+        "平山县永鸿金属制品厂",
+        [mapping],
+        PostprocessConfig(),
+    ) == [mapping]
+
 
 def test_registry_validation_preserves_explicit_person_aliases() -> None:
     from legal_redactor.entity_registry import parse_full_document_registry

@@ -224,6 +224,16 @@ class LinearRuleEngine:
             self.known_organizations.add(value)
             self._add("organization", value, masked, candidate)
             return
+        if any(value.endswith(suffix) for suffix in ("经营部", "合作社", "商行", "工作室", "厂", "店")):
+            suffix = next(
+                suffix
+                for suffix in ("经营部", "合作社", "商行", "工作室", "厂", "店")
+                if value.endswith(suffix)
+            )
+            self.known_organizations.add(value)
+            self._add("organization", value, f"{self.counters.next('group_prefix')}{suffix}", candidate)
+            return
+
 
         legal_suffix = next((suffix for suffix in LEGAL_SUFFIXES if value.endswith(suffix)), "")
         if not legal_suffix:

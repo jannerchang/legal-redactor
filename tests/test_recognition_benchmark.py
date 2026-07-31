@@ -79,7 +79,7 @@ def test_benchmark_matrix_covers_supported_full_document_models() -> None:
 
     assert len(rows) == 1
     assert {(row.recognition_mode, row.model_id) for row in rows} == {
-        ("full_document", "qwen3.5-9b"),
+        ("full_document", "qwen3.6-27b-fp8"),
     }
     assert all(not row.audited for row in rows)
 
