@@ -604,6 +604,34 @@ def _safe_discord_attachment_message(filename: str, message: str = "") -> str:
 
 
 
+def post_case_workflow_notification(
+    *,
+    case_folder: str,
+    workflow_state: str,
+    validation_status: str,
+    report_summary: str = "",
+    job_id: str = "",
+) -> dict[str, str]:
+    """Post a metadata-only final workflow notification from the trusted Mac."""
+    safe_state = re.sub(r"[^A-Za-z0-9_.:-]+", "_", workflow_state.strip())[:40] or "unknown"
+    safe_validation = re.sub(r"[^A-Za-z0-9_.:-]+", "_", validation_status.strip())[:40] or "unknown"
+    safe_job = re.sub(r"[^A-Za-z0-9_.:-]+", "_", job_id.strip())[:80]
+    safe_case = _clean_case_cause(case_folder) or "未命名案件"
+    summary = re.sub(r"\s+", " ", str(report_summary)).strip()
+    if _contains_local_path_text(summary):
+        summary = ""
+    lines = [
+        f"本地司法工作流状态：{safe_state}",
+        f"案件：{safe_case}",
+        f"校验：{safe_validation}",
+    ]
+    if safe_job:
+        lines.append(f"Job ID：{safe_job}")
+    if summary:
+        lines.append(f"摘要：{summary[:600]}")
+    return _post_discord_channel_message(_discord_command_channel_id(), "\n".join(lines))
+
+
 def _multipart_form_data(fields: list[tuple[str, str, str | None, bytes]]) -> tuple[bytes, str]:
     boundary = f"----legal-redactor-{next(tempfile._get_candidate_names())}"
     chunks: list[bytes] = []
