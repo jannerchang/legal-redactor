@@ -502,8 +502,11 @@ def test_full_document_prompt_requires_minimal_identity_groups() -> None:
     assert '"persons":["张三","李四"]' in prompt
     assert "无法确认就不列" in prompt
     assert "same_entities 两项文字必须不同，禁止名称与自身配对" in prompt
-    assert "地点只登记省级或地级市名称" in prompt
-    assert "禁止登记区、县、旗、乡镇、街道、村、社区" in prompt
+    assert "地点必须登记原文出现的省级、地级市和市辖区名称" in prompt
+    assert "禁止登记县、旗、乡镇、街道、村、社区" in prompt
+    assert "全文出现的所有有专名的具体法律主体或经营主体，不限于当事人" in prompt
+    assert "逐段清点公司、集团、银行、分支行、律所、医院、学校、经营部、安装部、安装队、经销处" in prompt
+    assert "非当事人、代发工资主体、供应商、承包商、付款主体" in prompt
     assert "不要证据、entity_id、type、confidence、解释、Markdown、脱敏稿、换行或其他字段" in prompt
     assert "输出最后一个 } 后立即停止" in prompt
     assert '"same_entities":[["星河建设有限公司","星河公司"]]' in prompt
@@ -529,7 +532,11 @@ def test_full_document_supplement_prompt_excludes_known_names_and_keeps_full_tex
     assert "每个字段只允许出现一次" in prompt
 
     assert "禁止名称与自身配对" in prompt
-    assert "地点只登记省级或地级市名称" in prompt
+    assert "地点必须登记原文出现的省级、地级市和以‘区’结尾的市辖区名称" in prompt
+    assert "不限于当事人" in prompt
+    assert "先逐段复核第一轮清单" in prompt
+    assert "经营部、安装部、安装队、经销处" in prompt
+    assert "代发工资主体、供应商、承包商、付款主体" in prompt
 
 def test_truncated_registry_repair_only_closes_existing_json_structure() -> None:
     truncated = '{"persons":["张三"],"organizations":["星河建设有限公司"],"locations":[],"same_entities":['
@@ -727,6 +734,60 @@ def test_registry_materialization_keeps_named_factory_and_valid_person() -> None
         "平山县永鸿金属制品厂",
         "杨利进",
     ]
+
+def test_registry_materialization_keeps_named_business_outlet_suffixes() -> None:
+    text = (
+        "高新区泽行机械设备安装队、藁城区尚远机械设备安装部、"
+        "长安启明机械设备经营部和泽新经销处分别发放工资。"
+    )
+    values = (
+        "高新区泽行机械设备安装队",
+        "藁城区尚远机械设备安装部",
+        "长安启明机械设备经营部",
+        "泽新经销处",
+    )
+    validation = validate_registry_against_text(
+        text,
+        RegistryValidationResult(
+            registry=FullDocumentEntityRegistry(
+                entities=tuple(
+                    RegistryEntity(f"org-{index}", "organization", value, (value,))
+                    for index, value in enumerate(values, 1)
+                )
+            )
+        ),
+    )
+
+    assert [
+        candidate.text for candidate in materialize_registry_candidates(text, validation).candidates
+    ] == list(values)
+
+
+def test_named_business_outlet_mappings_survive_postprocess() -> None:
+    from legal_redactor.models import MappingEntry
+    from legal_redactor.postprocess import PostprocessConfig, apply_postprocess
+
+    values = (
+        "高新区泽行机械设备安装队",
+        "藁城区尚远机械设备安装部",
+        "长安启明机械设备经营部",
+        "泽新经销处",
+    )
+    mappings = [
+        MappingEntry(
+            type="organization",
+            original=value,
+            masked=f"{index}机构",
+            role=None,
+            source="linear:full_document_llm",
+            confidence=0.9,
+            restore_by_default=True,
+        )
+        for index, value in enumerate(values, 1)
+    ]
+
+    assert apply_postprocess("、".join(values), mappings, PostprocessConfig()) == mappings
+
 
 
 def test_named_factory_survives_mapping_postprocess() -> None:

@@ -65,8 +65,7 @@ class ChinaAdminRulesTests(unittest.TestCase):
                 result = RedactionPipeline(config=config).redact("原告张三住广东省深圳市南山区。")
 
         originals = {entry.original for entry in result.redaction_map.mappings}
-        self.assertTrue({"张三", "广东省", "深圳市"}.issubset(originals))
-        self.assertNotIn("南山区", originals)
+        self.assertTrue({"张三", "广东省", "深圳市", "南山区"}.issubset(originals))
 
     def test_llm_location_still_passes_registry_suffix_gate(self) -> None:
         from unittest.mock import patch
@@ -91,7 +90,7 @@ class ChinaAdminRulesTests(unittest.TestCase):
 
         self.assertNotIn("重新确认", {entry.original for entry in result.redaction_map.mappings})
 
-    def test_llm_location_supplement_requires_authoritative_province_or_city(self) -> None:
+    def test_llm_location_supplement_requires_authoritative_province_city_or_district(self) -> None:
         from unittest.mock import patch
 
         extraction = FullDocumentRegistryExtraction(
@@ -126,8 +125,7 @@ class ChinaAdminRulesTests(unittest.TestCase):
                 )
 
         originals = {entry.original for entry in result.redaction_map.mappings}
-        self.assertTrue({"广东省", "深圳市"}.issubset(originals))
-        self.assertNotIn("南山区", originals)
+        self.assertTrue({"广东省", "深圳市", "南山区"}.issubset(originals))
         self.assertNotIn("辛集市", originals)
 
 
@@ -167,21 +165,37 @@ def _write_sample_china_db(path: Path) -> None:
 
 
 class ChinaAdminDetectorTests(unittest.TestCase):
-    def test_detector_reads_only_province_and_city_for_nationwide_database(self) -> None:
+    def test_detector_reads_province_city_and_district_for_nationwide_database(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "china.sqlite"
             _write_sample_china_db(db_path)
             detector = AdminDivisionDetector(
                 db_path,
                 source="china_admin_db",
-                region_label="全国省市行政区划",
-                max_level="city",
+                region_label="全国省市区行政区划",
+                max_level="county",
             )
             candidates = detector.detect("住所地广东省深圳市南山区。")
             texts = {candidate.text for candidate in candidates}
             self.assertIn("广东省", texts)
             self.assertIn("深圳市", texts)
-            self.assertNotIn("南山区", texts)
+            self.assertIn("南山区", texts)
+
+    def test_detector_accepts_standalone_official_district_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "china.sqlite"
+            _write_sample_china_db(db_path)
+            detector = AdminDivisionDetector(
+                db_path,
+                source="china_admin_db",
+                region_label="全国省市区行政区划",
+                max_level="county",
+                require_canonical_substring=True,
+            )
+
+            texts = {candidate.text for candidate in detector.detect("住所地南山区。")}
+
+            self.assertIn("南山区", texts)
 
     def test_hebei_pipeline_redacts_through_county_and_street(self) -> None:
         from unittest.mock import patch

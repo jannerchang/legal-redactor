@@ -6,7 +6,7 @@ import re
 from typing import Any, Iterable
 
 from .models import Candidate
-from .filters import is_false_org, is_false_person
+from .filters import is_false_person
 
 
 _ALLOWED_ENTITY_TYPES = frozenset({"person", "organization", "location"})
@@ -48,7 +48,7 @@ _COURT_PERSONNEL_PREFIXES = (
     "执行员",
     "执行法官",
 )
-_ALLOWED_LOCATION_SUFFIXES = ("省", "市", "自治区", "特别行政区", "自治州", "盟", "地区")
+_ALLOWED_LOCATION_SUFFIXES = ("省", "市", "区", "自治区", "特别行政区", "自治州", "盟", "地区")
 _LOCATION_ONLY_INSTITUTION_SUFFIXES = (
     "高级人民法院",
     "中级人民法院",
@@ -67,6 +67,9 @@ _OTHER_ORGANIZATION_SUFFIXES = (
     "委员会",
     "仲裁委",
     "经营部",
+    "安装部",
+    "安装队",
+    "经销处",
     "合作社",
     "商行",
     "工作室",

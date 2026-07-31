@@ -156,6 +156,36 @@ def test_has_explicit_bare_brand_alias_detects_parenthetical_short_name() -> Non
     assert has_explicit_bare_brand_alias(text, "豪木山运输") is False
 
 
+@pytest.mark.parametrize(
+    ("value", "suffix"),
+    [
+        ("高新区泽行机械设备安装队", "安装队"),
+        ("藁城区尚远机械设备安装部", "安装部"),
+        ("泽新经销处", "经销处"),
+    ],
+)
+def test_accept_organization_masks_named_business_outlets(value: str, suffix: str) -> None:
+    engine = _engine()
+    engine.source_text = value
+
+    engine.accept_organization(
+        Candidate(
+            type="organization",
+            text=value,
+            start=0,
+            end=len(value),
+            source="full_document_llm",
+            confidence=0.9,
+            risk_level="medium",
+            auto_redact=True,
+        )
+    )
+
+    assert [(mapping.original, mapping.masked) for mapping in engine.mappings] == [
+        (value, f"甲{suffix}")
+    ]
+
+
 def test_accept_location_maps_full_name_and_core() -> None:
     engine = _engine()
     candidate = Candidate(

@@ -166,23 +166,24 @@ def _span_overlaps_admin(
 
 
 
-_NATIONWIDE_AUTOMATIC_ADMIN_LEVELS = frozenset({"province", "city"})
+_NATIONWIDE_AUTOMATIC_ADMIN_LEVELS = frozenset({"province", "city", "county", "county_city"})
 _HEBEI_AUTOMATIC_ADMIN_LEVELS = frozenset(
     {"province", "city", "county", "county_city", "township"}
 )
 
 
 def _automatic_admin_candidate(candidate: Candidate) -> bool:
-    """Apply the configured depth: nationwide province/city, Hebei through township."""
+    """Apply nationwide province/city/district depth and Hebei township depth."""
     if candidate.type != "location":
         return False
     level = str(candidate.metadata.get("level", ""))
-    allowed_levels = (
-        _HEBEI_AUTOMATIC_ADMIN_LEVELS
-        if candidate.source == "hebei_admin_db"
-        else _NATIONWIDE_AUTOMATIC_ADMIN_LEVELS
-    )
-    return level in allowed_levels
+    if candidate.source == "hebei_admin_db":
+        return level in _HEBEI_AUTOMATIC_ADMIN_LEVELS
+    if level not in _NATIONWIDE_AUTOMATIC_ADMIN_LEVELS:
+        return False
+    if level == "county":
+        return candidate.text.endswith("区")
+    return True
 
 
 def _append_admin_detection(
@@ -591,8 +592,7 @@ def _linear_run_full_document_recognition(pipeline, ctx, text):
     allowed_llm_locations = frozenset(
         candidate.text
         for candidate in ctx.admin_candidates
-        if candidate.type == "location"
-        and str(candidate.metadata.get("level", "")) in {"province", "city"}
+        if candidate.type == "location" and _automatic_admin_candidate(candidate)
     )
     materialization = materialize_registry_candidates(
         ctx.scan_text,
@@ -785,8 +785,8 @@ class RedactionPipeline:
             AdminDivisionDetector(
                 self.config.china_admin_db_path,
                 source="china_admin_db",
-                region_label="全国省市行政区划",
-                max_level="city",
+                region_label="全国省市区行政区划",
+                max_level="county",
                 require_canonical_substring=True,
             )
             if self.config.enable_china_admin_db else None

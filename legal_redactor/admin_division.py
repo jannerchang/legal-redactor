@@ -145,7 +145,8 @@ class AdminDivisionDetector:
             if _is_short_local_name(term) and not _has_address_context(text, index, end):
                 continue
             if self.require_canonical_substring and term.level in {"city", "county", "county_city"}:
-                if term.canonical_name not in text:
+                is_official_name = term.text.endswith(("市", "区", "县", "旗", "自治州", "地区", "盟"))
+                if term.canonical_name not in text and not is_official_name:
                     continue
             occupied.append((index, end, term.level))
             candidates.append(
