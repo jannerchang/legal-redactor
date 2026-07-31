@@ -79,8 +79,8 @@ def test_balanced_config_targets_same_manager_model() -> None:
 
 def test_from_llm_mode_accepts_registered_model_choice() -> None:
     assert PipelineConfig.from_llm_mode("max-effect").llm.model == QWEN_MODEL_ID
-    assert PipelineConfig.from_llm_mode("max-effect", model="qwen3.5-9b").llm.model == "qwen3.5-9b"
-    assert PipelineConfig.from_llm_mode("balanced", model="qwen3.5-9b").llm.model == "qwen3.5-9b"
+    assert PipelineConfig.from_llm_mode("max-effect", model="qwen3.6-27b-fp8").llm.model == "qwen3.6-27b-fp8"
+    assert PipelineConfig.from_llm_mode("balanced", model="qwen3.6-27b-fp8").llm.model == "qwen3.6-27b-fp8"
 
 def test_disabled_and_sentence_recognition_modes_are_rejected() -> None:
     with pytest.raises(ValueError, match="cannot be disabled"):

@@ -151,8 +151,7 @@ class WebAppUploadTests(unittest.TestCase):
             patch(
                 "legal_redactor.web.status_ops._available_model_options",
                 return_value=[
-                    {"id": "bonsai-27b", "label": "Ternary Bonsai 27B（MLX 2-bit；长全文不推荐）"},
-                    {"id": "qwen3.5-9b", "label": "Qwen3.5 9B（MLX 4-bit；全文默认）"},
+                    {"id": "qwen3.6-27b-fp8", "label": "Qwen3.6 27B FP8（DGX Spark；全文默认）"},
                 ],
             ),
         ):
@@ -181,14 +180,13 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertNotIn("body:new FormData(form)", page)
         self.assertIn('id="redact-form"', page)
         self.assertIn('id="redact-progress"', page)
-        self.assertIn("Ternary Bonsai 27B（MLX 2-bit；长全文不推荐）", page)
-        self.assertIn("Qwen3.5 9B（MLX 4-bit；全文默认）", page)
+        self.assertIn("Qwen3.6 27B FP8（DGX Spark；全文默认）", page)
         self.assertIn('id="model-choice"', page)
         self.assertIn('name="model"', page)
         self.assertIn('class="advanced-options"', page)
         self.assertIn('data-upload-target="source-files"', page)
         self.assertIn('data-upload-target="source-directory-files"', page)
-        self.assertIn("每次处理都可重新选择", page)
+        self.assertIn("当前提供 1 个模型", page)
         self.assertIn("识别模式固定使用整篇文书双轮补漏", page)
         self.assertIn('name="recognition_mode" value="full_document"', page)
         self.assertNotIn('id="recognition-mode-choice"', page)
@@ -198,7 +196,7 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertIn("/api/model-status", page)
         self.assertIn("已用时", page)
         self.assertNotIn("super-secret-token", page)
-        self.assertIn('value="qwen3.5-9b" selected', page)
+        self.assertIn('value="qwen3.6-27b-fp8" selected', page)
 
 
     def test_models_endpoint_forwards_public_manager_registry(self) -> None:

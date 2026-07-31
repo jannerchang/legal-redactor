@@ -19,15 +19,12 @@ from fastapi.responses import Response
 from ._logging import get_logger
 
 
-QWEN_MODEL_ID = "qwen3.5-9b"
-QWEN_MODEL_LABEL = "Qwen3.5 9B（MLX 4-bit；全文默认）"
+QWEN_MODEL_ID = "qwen3.6-27b-fp8"
+QWEN_MODEL_LABEL = "Qwen3.6 27B FP8（DGX Spark；全文默认）"
 DEFAULT_MODEL_ID = QWEN_MODEL_ID
-DEFAULT_MODEL_PATH = DEFAULT_QWEN_MODEL_PATH = (
-    Path.home()
-    / "Models/HuggingFace/hub/models--mlx-community--Qwen3.5-9B-MLX-4bit"
-)
-DEFAULT_WORKER_HOST = "127.0.0.1"
-DEFAULT_WORKER_PORT = 18081
+DEFAULT_MODEL_PATH = DEFAULT_QWEN_MODEL_PATH = QWEN_MODEL_ID
+DEFAULT_WORKER_HOST = "192.168.99.1"
+DEFAULT_WORKER_PORT = 8000
 DEFAULT_WORKER_MAX_TOKENS = 8192
 DEFAULT_WORKER_STARTUP_TIMEOUT_SECONDS = 300
 DEFAULT_WORKER_REQUEST_TIMEOUT_SECONDS = 660
@@ -59,11 +56,7 @@ SUPPORTED_MODEL_TYPES = frozenset(
         "qwen3_moe",
     }
 )
-BUILTIN_MODEL_SOURCE_NAMES = frozenset(
-    {
-        "models--mlx-community--Qwen3.5-9B-MLX-4bit",
-    }
-)
+BUILTIN_MODEL_SOURCE_NAMES = frozenset({QWEN_MODEL_ID})
 INCOMPATIBLE_FULL_DOCUMENT_MODEL_IDS = frozenset(
     {
         "mlx-community/Qwen3.5-4B-MLX-4bit",
@@ -103,7 +96,7 @@ class InvalidWorkerResponseError(ModelManagerError):
 
 
 class ModelManager:
-    """Expose registered logical model IDs while owning one lazy MLX worker."""
+    """Expose registered logical model IDs through one managed or remote worker."""
 
     def __init__(
         self,
@@ -114,6 +107,7 @@ class ModelManager:
         request_timeout_seconds: float = DEFAULT_WORKER_REQUEST_TIMEOUT_SECONDS,
         popen_factory: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
         model_discovery: Callable[[], Mapping[str, ModelSpec]] | None = None,
+        manage_worker: bool = True,
     ) -> None:
         self._models = dict(models)
         self._model_discovery = model_discovery
@@ -122,10 +116,11 @@ class ModelManager:
         self._startup_timeout_seconds = startup_timeout_seconds
         self._request_timeout_seconds = request_timeout_seconds
         self._popen_factory = popen_factory
+        self._manage_worker = manage_worker
         self._lock = threading.RLock()
         self._worker_process: subprocess.Popen[bytes] | None = None
         self._active_model: str | None = None
-        self._worker_state = "stopped"
+        self._worker_state = "stopped" if manage_worker else "ready"
 
     def _refresh_models(self) -> None:
         if self._model_discovery is None:
@@ -147,7 +142,7 @@ class ModelManager:
                 "data": [
                     {"id": spec.id, "object": "model", "name": spec.label}
                     for spec in self._models.values()
-                    if _model_source_is_available(spec.path)
+                    if not self._manage_worker or _model_source_is_available(spec.path)
                 ],
             }
 
@@ -160,7 +155,8 @@ class ModelManager:
                 "worker_state": "busy",
             }
         try:
-            self._refresh_worker_state()
+            if self._manage_worker:
+                self._refresh_worker_state()
             return {
                 "status": "error" if self._worker_state == "error" else "ok",
                 "active_model": self._active_model,
@@ -175,10 +171,11 @@ class ModelManager:
             spec = self._models.get(model_id)
             if spec is None:
                 raise ModelNotFoundError("Requested model is not registered")
-            if not _model_source_is_available(spec.path):
-                raise ModelManagerError("Registered model is unavailable")
-            spec = ModelSpec(spec.id, spec.label, _resolve_model_source(spec.path))
-            self._ensure_worker(spec)
+            if self._manage_worker:
+                if not _model_source_is_available(spec.path):
+                    raise ModelManagerError("Registered model is unavailable")
+                spec = ModelSpec(spec.id, spec.label, _resolve_model_source(spec.path))
+                self._ensure_worker(spec)
             return spec
 
     def proxy_chat_completion(self, payload: dict[str, Any]) -> tuple[int, bytes, str]:
@@ -197,7 +194,7 @@ class ModelManager:
                 worker_payload["model"] = str(spec.path)
                 status, body, content_type = self._post_worker(worker_payload)
                 if not 200 <= status < 300:
-                    raise WorkerResponseError("MLX worker rejected the request")
+                    raise WorkerResponseError("Model worker rejected the request")
                 response_payload = _parse_worker_response(body)
                 if "model" in response_payload:
                     response_payload["model"] = spec.id
@@ -224,8 +221,11 @@ class ModelManager:
                 )
                 return _error_response(exc)
             except (OSError, http.client.HTTPException):
-                self._refresh_worker_state()
-                error = ModelManagerError("MLX worker is unavailable")
+                if self._manage_worker:
+                    self._refresh_worker_state()
+                else:
+                    self._worker_state = "error"
+                error = ModelManagerError("Model worker is unavailable")
                 _logger.warning(
                     "模型请求终止：逻辑模型=%s，HTTP=%d，错误码=%s，用时=%.2fs。",
                     model_id,
@@ -237,7 +237,8 @@ class ModelManager:
 
     def shutdown(self) -> None:
         with self._lock:
-            self._stop_worker()
+            if self._manage_worker:
+                self._stop_worker()
 
     def _ensure_worker(self, spec: ModelSpec) -> None:
         self._refresh_worker_state()
@@ -397,13 +398,13 @@ def create_model_manager_app(manager: ModelManager) -> FastAPI:
 
 
 def default_model_manager() -> ModelManager:
-    worker_host = os.environ.get("LEGAL_REDACTOR_MLX_WORKER_HOST", DEFAULT_WORKER_HOST)
+    worker_host = os.environ.get("LEGAL_REDACTOR_MODEL_WORKER_HOST", DEFAULT_WORKER_HOST)
     try:
-        worker_port = int(os.environ.get("LEGAL_REDACTOR_MLX_WORKER_PORT", str(DEFAULT_WORKER_PORT)))
+        worker_port = int(os.environ.get("LEGAL_REDACTOR_MODEL_WORKER_PORT", str(DEFAULT_WORKER_PORT)))
     except ValueError as exc:
-        raise RuntimeError("LEGAL_REDACTOR_MLX_WORKER_PORT must be an integer") from exc
+        raise RuntimeError("LEGAL_REDACTOR_MODEL_WORKER_PORT must be an integer") from exc
     if not 1 <= worker_port <= 65535:
-        raise RuntimeError("LEGAL_REDACTOR_MLX_WORKER_PORT must be between 1 and 65535")
+        raise RuntimeError("LEGAL_REDACTOR_MODEL_WORKER_PORT must be between 1 and 65535")
     models = {
         QWEN_MODEL_ID: ModelSpec(
             QWEN_MODEL_ID,
@@ -411,7 +412,7 @@ def default_model_manager() -> ModelManager:
             os.environ.get("LEGAL_REDACTOR_QWEN_MODEL", str(DEFAULT_QWEN_MODEL_PATH)),
         )
     }
-    return ModelManager(models, worker_host, worker_port)
+    return ModelManager(models, worker_host, worker_port, manage_worker=False)
 
 
 def discover_model_specs(

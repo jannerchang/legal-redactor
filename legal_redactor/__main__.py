@@ -62,7 +62,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL_ID,
-        help="model-manager 返回的逻辑模型 ID（当前认证模型为 qwen3.5-9b）",
+        help="model-manager 返回的逻辑模型 ID（当前认证模型为 qwen3.6-27b-fp8）",
     )
     parser.add_argument(
         "--output-dir", "-o",
