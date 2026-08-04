@@ -466,7 +466,9 @@ class CatalogModelManager:
             found: set[str] = set()
             for worker in self._catalog.workers:
                 try:
-                    _, body, _ = self._request_worker(worker, "GET", "/models", None)
+                    status, body, _ = self._request_worker(worker, "GET", "/models", None)
+                    if not 200 <= status < 300:
+                        continue
                     payload = json.loads(body)
                     upstream_ids = {
                         item.get("id") for item in payload.get("data", [])
