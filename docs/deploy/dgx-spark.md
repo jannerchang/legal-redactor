@@ -13,14 +13,22 @@ ssh -L 7860:127.0.0.1:7860 spark-host
 
 1. Create a dedicated `legal-redactor` Linux account and install the repository
    at `/opt/legal-redactor`; create its virtual environment and install
-   `requirements.txt`.
+   `requirements.txt`. The application requirements intentionally do **not**
+   include vLLM. Install vLLM separately in a DGX/CUDA-compatible Python runtime;
+   the exact interpreter configured for each worker must successfully run
+   `import vllm`.
 2. Copy `config/models.example.json` outside the checkout (for example
    `/etc/legal-redactor/models.json`), set `LEGAL_REDACTOR_MODEL_CATALOG` in
    `/etc/legal-redactor/model-manager.env`, and put worker API keys only in the
    environment file named by each `api_key_env` field. Do not commit either file.
 3. For each worker create `/etc/legal-redactor/vllm-NAME.env` with `VLLM_MODEL`,
-   `VLLM_PORT`, and optionally `VLLM_SERVED_MODEL_NAME`. Keep `VLLM_HOST=127.0.0.1`.
-   Start with `systemctl enable --now legal-redactor-vllm@NAME`.
+   `VLLM_PORT`, mandatory `VLLM_SERVED_MODEL_NAME`, and `PYTHON_BIN` pointing to
+   the DGX/CUDA vLLM interpreter. `VLLM_SERVED_MODEL_NAME` must exactly equal that
+   model's catalog `upstream_id`; discovery will not expose a mismatched name.
+   Keep `VLLM_HOST=127.0.0.1` (only `127.0.0.1` and `localhost` are accepted).
+   If `/opt/legal-redactor/.venv/bin/python` contains vLLM, `PYTHON_BIN` may be
+   omitted and that interpreter is used. Free-form worker arguments are not
+   accepted. Start with `systemctl enable --now legal-redactor-vllm@NAME`.
 4. Install the three units from `deploy/systemd/`, then enable the manager and
    Web services. All units intentionally bind to `127.0.0.1`.
 

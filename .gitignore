@@ -38,6 +38,7 @@ tests/*
 !tests/test_model_manager.py
 !tests/test_llm_config.py
 !tests/test_start_model_manager.py
+!tests/test_start_vllm_worker.py
 !tests/test_recognition_benchmark.py
 !tests/test_public_spc_fixtures.py
 !tests/test_models.py

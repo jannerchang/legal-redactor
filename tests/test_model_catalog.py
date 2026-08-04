@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -75,3 +76,36 @@ def test_catalog_router_intersects_allowlist_tolerates_worker_failure_and_routes
     assert status == 503
     assert json.loads(body)["error"]["code"] == "model_unavailable"
     assert "other-worker" not in body.decode()
+
+
+def test_catalog_discovery_queries_workers_concurrently(monkeypatch) -> None:
+    catalog_data = _catalog()
+    catalog_data["workers"].insert(
+        1,
+        {
+            "id": "second-slow-worker",
+            "base_url": "http://127.0.0.1:8002/v1",
+            "discovery_timeout_seconds": 1,
+            "request_timeout_seconds": 2,
+            "models": [{"id": "slow", "upstream_id": "slow-upstream", "label": "Slow", "enabled": True}],
+        },
+    )
+    manager = CatalogModelManager(parse_model_catalog(catalog_data))
+
+    def request(worker, method, endpoint, payload):
+        assert method == "GET"
+        if worker.id != "other-worker":
+            time.sleep(0.2)
+            raise OSError("slow failure")
+        return 200, json.dumps({"data": [{"id": "other-upstream"}]}).encode(), "application/json"
+
+    monkeypatch.setattr(manager, "_request_worker", request)
+    started = time.monotonic()
+
+    payload = manager.models_payload()
+
+    elapsed = time.monotonic() - started
+    assert payload["data"] == [{"id": "other", "object": "model", "name": "Other"}]
+    # Two serial worker timeouts would exceed 0.4s. This generous threshold
+    # proves discovery costs roughly one timeout without relying on tight timing.
+    assert elapsed < 0.35

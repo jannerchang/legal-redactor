@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -464,28 +465,34 @@ class CatalogModelManager:
             if now - self._discovered_at < self._catalog.discovery_ttl_seconds:
                 return self._live_model_ids
             found: set[str] = set()
-            for worker in self._catalog.workers:
-                try:
-                    status, body, _ = self._request_worker(worker, "GET", "/models", None)
-                    if not 200 <= status < 300:
-                        continue
-                    payload = json.loads(body)
-                    upstream_ids = {
-                        item.get("id") for item in payload.get("data", [])
-                        if isinstance(item, dict) and isinstance(item.get("id"), str)
-                    } if isinstance(payload, dict) else set()
-                    found.update(
-                        model.id for model in worker.models
-                        if model.enabled and model.upstream_id in upstream_ids
-                    )
-                except (OSError, ValueError, http.client.HTTPException):
-                    # One unavailable worker must not hide models from another.
-                    continue
+            with ThreadPoolExecutor(max_workers=len(self._catalog.workers)) as executor:
+                for worker_models in executor.map(self._discover_worker_models, self._catalog.workers):
+                    found.update(worker_models)
             self._live_model_ids = frozenset(found)
             self._discovered_at = time.monotonic()
             return self._live_model_ids
         finally:
             self._discovery_lock.release()
+
+    def _discover_worker_models(self, worker: CatalogWorker) -> frozenset[str]:
+        try:
+            status, body, _ = self._request_worker(worker, "GET", "/models", None)
+            if not 200 <= status < 300:
+                return frozenset()
+            payload = json.loads(body)
+            upstream_ids = {
+                item.get("id")
+                for item in payload.get("data", [])
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            } if isinstance(payload, dict) else set()
+            return frozenset(
+                model.id
+                for model in worker.models
+                if model.enabled and model.upstream_id in upstream_ids
+            )
+        except (OSError, ValueError, http.client.HTTPException):
+            # One unavailable worker must not hide models from another.
+            return frozenset()
 
     def _request_worker(
         self,
