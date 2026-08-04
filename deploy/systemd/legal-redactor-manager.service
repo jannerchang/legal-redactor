@@ -1,0 +1,16 @@
+[Unit]
+Description=Legal Redactor Model Manager
+After=network.target
+
+[Service]
+Type=simple
+User=legal-redactor
+WorkingDirectory=/opt/legal-redactor
+EnvironmentFile=/etc/legal-redactor/model-manager.env
+ExecStart=/opt/legal-redactor/.venv/bin/python -m uvicorn legal_redactor.model_manager:app --host 127.0.0.1 --port 18080
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

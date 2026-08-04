@@ -1,0 +1,17 @@
+[Unit]
+Description=Legal Redactor Web UI
+After=network.target legal-redactor-manager.service
+Requires=legal-redactor-manager.service
+
+[Service]
+Type=simple
+User=legal-redactor
+WorkingDirectory=/opt/legal-redactor
+EnvironmentFile=/etc/legal-redactor/web.env
+ExecStart=/opt/legal-redactor/.venv/bin/python -m uvicorn legal_redactor.web_app:app --host 127.0.0.1 --port 7860
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

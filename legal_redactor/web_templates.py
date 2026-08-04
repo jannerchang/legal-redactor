@@ -923,9 +923,12 @@ def render_home_page(
         for item in model_options
         if isinstance(item, dict) and str(item.get("id") or "").strip()
     ]
+    selected_model_id = default_model_id if any(
+        str(item.get("id")) == default_model_id for item in available_models
+    ) else (str(available_models[0]["id"]) if available_models else "")
     model_options_html = "".join(
         f'<option value="{html.escape(str(item["id"]), quote=True)}"'
-        f'{" selected" if item["id"] == default_model_id else ""}>'
+        f'{" selected" if str(item["id"]) == selected_model_id else ""}>'
         f'{html.escape(str(item.get("label") or item["id"]))}</option>'
         for item in available_models
     )
@@ -963,7 +966,7 @@ def render_home_page(
             <details class="advanced-options">
               <summary>高级选项</summary>
               <label for="model-choice">识别模型</label>
-              <select id="model-choice" name="model">
+              <select id="model-choice" name="model"{' disabled' if not available_models else ''}>
                 {model_options_html}
               </select>
               <p class="hint">整篇文书双轮识别是唯一的新识别路径；单篇最多 120000 字符，超限或首轮失败时停止生成，不保存也不发送新的脱敏文件。当前模型由 DGX Spark 提供，仅影响本次文书。</p>

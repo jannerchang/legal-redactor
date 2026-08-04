@@ -17,6 +17,7 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.responses import Response
 from ._logging import get_logger
+from .model_catalog import CatalogModel, CatalogWorker, ModelCatalog, load_model_catalog_from_environment
 
 
 QWEN_MODEL_ID = "qwen3.6-27b-fp8"
@@ -378,7 +379,146 @@ class ModelManager:
             connection.close()
 
 
-def create_model_manager_app(manager: ModelManager) -> FastAPI:
+
+
+class CatalogModelManager:
+    """Route only catalog allowlisted logical models to their configured workers.
+
+    Discovery is short-lived and guarded independently from requests, so a slow
+    inference never blocks the public model registry or health control plane.
+    """
+
+    def __init__(self, catalog: ModelCatalog, environ: Mapping[str, str] | None = None) -> None:
+        self._catalog = catalog
+        self._environ = os.environ if environ is None else environ
+        self._routes = {
+            model.id: (worker, model)
+            for worker in catalog.workers
+            for model in worker.models
+            if model.enabled
+        }
+        self._discovery_lock = threading.Lock()
+        self._live_model_ids: frozenset[str] = frozenset()
+        self._discovered_at = 0.0
+        self._active_model: str | None = None
+        self._state_lock = threading.Lock()
+
+    def models_payload(self) -> dict[str, Any]:
+        live_ids = self._live_models()
+        return {
+            "object": "list",
+            "default_model_id": self._catalog.default_model_id,
+            "data": [
+                {"id": model_id, "object": "model", "name": self._routes[model_id][1].label}
+                for model_id in self._routes
+                if model_id in live_ids
+            ],
+        }
+
+    def health_payload(self) -> dict[str, str | None]:
+        live_ids = self._live_models()
+        with self._state_lock:
+            active_model = self._active_model
+        return {
+            "status": "ok",
+            "active_model": active_model,
+            "worker_state": "ready" if live_ids else "no_models",
+        }
+
+    def proxy_chat_completion(self, payload: dict[str, Any]) -> tuple[int, bytes, str]:
+        model_id = payload.get("model")
+        if not isinstance(model_id, str) or model_id not in self._routes:
+            return _error_response(ModelNotFoundError("Requested model is not registered"))
+        if model_id not in self._live_models():
+            return _error_response(ModelManagerError("Requested model is unavailable"))
+        worker, model = self._routes[model_id]
+        request_payload = dict(payload)
+        request_payload["model"] = model.upstream_id
+        try:
+            status, body, content_type = self._request_worker(worker, "POST", "/chat/completions", request_payload)
+            if not 200 <= status < 300:
+                raise WorkerResponseError("Model worker rejected the request")
+            response_payload = _parse_worker_response(body)
+            response_payload["model"] = model_id
+            with self._state_lock:
+                self._active_model = model_id
+            return 200, json.dumps(response_payload, ensure_ascii=False).encode("utf-8"), content_type
+        except ModelManagerError as exc:
+            return _error_response(exc)
+        except (OSError, http.client.HTTPException, ValueError):
+            return _error_response(ModelManagerError("Model worker is unavailable"))
+
+    def shutdown(self) -> None:
+        return None
+
+    def _live_models(self) -> frozenset[str]:
+        now = time.monotonic()
+        if now - self._discovered_at < self._catalog.discovery_ttl_seconds:
+            return self._live_model_ids
+        # Do not wait behind an in-flight discovery: existing cached information
+        # is preferable to contending with a long-running inference or worker.
+        if not self._discovery_lock.acquire(blocking=False):
+            return self._live_model_ids
+        try:
+            now = time.monotonic()
+            if now - self._discovered_at < self._catalog.discovery_ttl_seconds:
+                return self._live_model_ids
+            found: set[str] = set()
+            for worker in self._catalog.workers:
+                try:
+                    _, body, _ = self._request_worker(worker, "GET", "/models", None)
+                    payload = json.loads(body)
+                    upstream_ids = {
+                        item.get("id") for item in payload.get("data", [])
+                        if isinstance(item, dict) and isinstance(item.get("id"), str)
+                    } if isinstance(payload, dict) else set()
+                    found.update(
+                        model.id for model in worker.models
+                        if model.enabled and model.upstream_id in upstream_ids
+                    )
+                except (OSError, ValueError, http.client.HTTPException):
+                    # One unavailable worker must not hide models from another.
+                    continue
+            self._live_model_ids = frozenset(found)
+            self._discovered_at = time.monotonic()
+            return self._live_model_ids
+        finally:
+            self._discovery_lock.release()
+
+    def _request_worker(
+        self,
+        worker: CatalogWorker,
+        method: str,
+        endpoint: str,
+        payload: dict[str, Any] | None,
+    ) -> tuple[int, bytes, str]:
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(worker.base_url)
+        connection_class = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+        connection = connection_class(parsed.hostname, parsed.port, timeout=(
+            worker.discovery_timeout_seconds if method == "GET" else worker.request_timeout_seconds
+        ))
+        headers: dict[str, str] = {}
+        body: bytes | None = None
+        if payload is not None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if worker.api_key_env:
+            api_key = self._environ.get(worker.api_key_env, "")
+            if worker.id == "legacy-qwen-worker" and not api_key:
+                api_key = DEFAULT_WORKER_API_KEY
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+        try:
+            connection.request(method, f"{parsed.path.rstrip('/')}{endpoint}", body=body, headers=headers)
+            response = connection.getresponse()
+            return response.status, response.read(), "application/json"
+        finally:
+            connection.close()
+
+
+def create_model_manager_app(manager: Any) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         try:
@@ -404,25 +544,9 @@ def create_model_manager_app(manager: ModelManager) -> FastAPI:
     return app
 
 
-def default_model_manager() -> ModelManager:
-    worker_base_url = os.environ.get("LEGAL_REDACTOR_MODEL_WORKER_BASE_URL", DEFAULT_WORKER_BASE_URL)
-    worker_host, worker_port, worker_base_path = _parse_worker_base_url(worker_base_url)
-    worker_api_key = os.environ.get("LEGAL_REDACTOR_MODEL_WORKER_API_KEY", DEFAULT_WORKER_API_KEY)
-    models = {
-        QWEN_MODEL_ID: ModelSpec(
-            QWEN_MODEL_ID,
-            QWEN_MODEL_LABEL,
-            os.environ.get("LEGAL_REDACTOR_QWEN_MODEL", str(DEFAULT_QWEN_MODEL_PATH)),
-        )
-    }
-    return ModelManager(
-        models,
-        worker_host,
-        worker_port,
-        manage_worker=False,
-        worker_base_path=worker_base_path,
-        worker_api_key=worker_api_key,
-    )
+def default_model_manager() -> Any:
+    """Build the production catalog router; legacy MLX management remains test-only."""
+    return CatalogModelManager(load_model_catalog_from_environment())
 
 
 def _parse_worker_base_url(value: str) -> tuple[str, int, str]:

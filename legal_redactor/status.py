@@ -167,7 +167,7 @@ def probe_model_manager(
     if not isinstance(health_payload, dict) or health_payload.get("status") not in {"ok", "error"}:
         return StatusItem("model_manager", "本地模型 API", "error", "本地模型 API /health 返回结构不符合协议。", "检查模型管理器", details)
     worker_state = health_payload.get("worker_state")
-    if worker_state in {"ready", "stopped", "starting", "busy", "error"}:
+    if worker_state in {"ready", "stopped", "starting", "busy", "error", "no_models"}:
         details["worker_state"] = worker_state
     if health_payload.get("status") == "error" or worker_state == "error":
         details["reason"] = "worker_error"
@@ -202,7 +202,7 @@ def probe_model_manager(
     details["model_ids"] = model_ids[:8]
     if not model_ids:
         details["reason"] = "no_models_registered"
-        return StatusItem("model_manager", "本地模型 API", "error", "本地模型 API 当前没有可用模型。", "下载或配置至少一个 MLX 模型", details)
+        return StatusItem("model_manager", "本地模型 API", "error", "本地模型 API 当前没有可用模型。", "配置或启动至少一个允许的模型", details)
     return StatusItem("model_manager", "本地模型 API", "ready", f"本地模型 API 已就绪，可选 {len(model_ids)} 个模型。", "无需处理", details)
 
 

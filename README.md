@@ -19,12 +19,9 @@
 
 ## v0.2.3 DGX Spark 27B 推理后端
 
-`v0.2.3` 将唯一认证模型切换为 DGX Spark 上的 `qwen3.6-27b-fp8`。Mac 仍只暴露本机 `model-manager`（默认 `127.0.0.1:18080`）；管理器把逻辑模型请求代理到 Spark 的 OpenAI-compatible vLLM 端点。
+`v0.2.3` 支持将完整 Web 应用、模型管理器和一个或多个 vLLM worker 部署到 DGX Spark/Linux。模型选择器只显示目录中启用、且当前确实出现在对应 worker `/models` 响应的逻辑模型；不会向浏览器暴露 worker 地址、密钥、上游模型名或权重路径。默认逻辑模型仍为 `qwen3.6-27b-fp8`，模型不可达时新的脱敏保持 fail-closed。
 
-- Web、CLI、模型管理器和识别基准只暴露 `qwen3.6-27b-fp8`。
-- Spark API 默认 `base_url` 为 `http://192.168.99.1:8000/v1`，`api_key` 为 `local-placeholder`；可用 `LEGAL_REDACTOR_MODEL_WORKER_BASE_URL` 和 `LEGAL_REDACTOR_MODEL_WORKER_API_KEY` 覆盖。
-- Mac 不再加载或切换本地 MLX 权重；模型不可达时保持 fail-closed，不生成新的脱敏 artifact。
-- 全国数据库自动识别省级和地级行政区；河北数据库继续自动识别至区县、县级市、乡镇和街道。
+详细 Linux 部署、SSH 隧道、案件根目录及加密密钥迁移、和 Linux `.doc` 限制见 [`docs/deploy/dgx-spark.md`](docs/deploy/dgx-spark.md)。
 
 ## v0.2.1 全文生成稳定性与架构保护
 
@@ -241,9 +238,11 @@ Hermes 工具调用只传协作 thread id 和法律文书草稿；本地工作�
 
 管理器只向 Web/CLI 暴露经过全文实体登记协议验证的模型。当前唯一认证模型为逻辑 ID `qwen3.6-27b-fp8`；浏览器和 CLI 不接受任意远程模型名或权重路径。新增模型必须先通过真实公开全文的两轮 JSON 登记、原文一致性、性能与 fail-closed 验证，再加入认证列表。
 
-管理器本身通过 `scripts/start_model_manager.sh` 启动或复用。DGX Spark 的 OpenAI-compatible API 默认 `base_url=http://192.168.99.1:8000/v1`、`api_key=local-placeholder`，必须由 Spark 侧预先启动；Mac 管理器不会拥有、切换或关闭该远程进程。可通过以下环境变量覆盖本机管理器和 Spark API 配置：
+管理器本身通过 `scripts/start_model_manager.sh` 启动或复用。生产环境设置 `LEGAL_REDACTOR_MODEL_CATALOG=/etc/legal-redactor/models.json`，并以 `config/models.example.json` 为模板：目录明确映射逻辑 ID、允许的上游 ID 和 worker；`/v1/models` 只显示启用且实时发现的交集。API key 只由目录 `api_key_env` 指向的环境变量提供。未设置目录时，仍兼容原有的单 Qwen 环境变量：
 
 ```bash
+LEGAL_REDACTOR_MODEL_CATALOG=/etc/legal-redactor/models.json
+# legacy single-Qwen compatibility only:
 LEGAL_REDACTOR_MODEL_MANAGER_HOST=127.0.0.1
 LEGAL_REDACTOR_MODEL_MANAGER_PORT=18080
 LEGAL_REDACTOR_MODEL_WORKER_BASE_URL=http://192.168.99.1:8000/v1

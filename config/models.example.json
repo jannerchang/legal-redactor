@@ -1,0 +1,36 @@
+{
+  "schema_version": "legal-redactor-model-catalog/v1",
+  "default_model_id": "qwen3.6-27b-fp8",
+  "discovery_ttl_seconds": 5,
+  "workers": [
+    {
+      "id": "qwen-vllm",
+      "base_url": "http://127.0.0.1:8000/v1",
+      "api_key_env": "LEGAL_REDACTOR_QWEN_WORKER_API_KEY",
+      "discovery_timeout_seconds": 2,
+      "request_timeout_seconds": 660,
+      "models": [
+        {
+          "id": "qwen3.6-27b-fp8",
+          "upstream_id": "qwen3.6-27b-fp8",
+          "label": "Qwen3.6 27B FP8（DGX Spark；全文默认）",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "second-example-worker",
+      "base_url": "http://127.0.0.1:8001/v1",
+      "discovery_timeout_seconds": 2,
+      "request_timeout_seconds": 660,
+      "models": [
+        {
+          "id": "second-example-model",
+          "upstream_id": "second-example-upstream-id",
+          "label": "第二个示例模型（需自行验证后启用）",
+          "enabled": false
+        }
+      ]
+    }
+  ]
+}

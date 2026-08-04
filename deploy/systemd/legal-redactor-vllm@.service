@@ -1,0 +1,16 @@
+[Unit]
+Description=Legal Redactor vLLM worker (%i)
+After=network.target
+
+[Service]
+Type=simple
+User=legal-redactor
+WorkingDirectory=/opt/legal-redactor
+EnvironmentFile=/etc/legal-redactor/vllm-%i.env
+ExecStart=/opt/legal-redactor/scripts/start_vllm_worker.sh
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

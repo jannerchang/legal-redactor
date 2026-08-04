@@ -146,10 +146,18 @@ def _available_model_options() -> list[dict[str, str]]:
         if not isinstance(item, dict):
             continue
         model_id = str(item.get("id") or "").strip()
-        if not model_id:
-            continue
-        options.append({"id": model_id, "label": str(item.get("name") or model_id)})
+        if model_id:
+            options.append({"id": model_id, "label": str(item.get("name") or model_id)})
     return options
+
+
+def _available_model_default() -> str | None:
+    try:
+        payload = _model_manager_json("/v1/models", timeout=0.4)
+    except (OSError, ValueError, http.client.HTTPException, json.JSONDecodeError):
+        return None
+    value = str(payload.get("default_model_id") or "").strip()
+    return value or None
 
 
 

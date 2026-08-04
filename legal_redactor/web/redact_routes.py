@@ -66,12 +66,14 @@ def index() -> str:
     sample_info = ""
     status_panel = status_ops._render_status_panel(status_ops._status_payload())
     default_root_str = str(default_case_root())
+    model_options = status_ops._available_model_options()
+    manager_default_model_id = status_ops._available_model_default()
     return render_home_page(
         status_panel,
         sample_info,
         default_root_str,
-        status_ops._available_model_options(),
-        DEFAULT_MODEL_ID,
+        model_options,
+        manager_default_model_id or DEFAULT_MODEL_ID,
     )
 
 
