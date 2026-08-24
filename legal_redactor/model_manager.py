@@ -501,9 +501,14 @@ class CatalogModelManager:
         endpoint: str,
         payload: dict[str, Any] | None,
     ) -> tuple[int, bytes, str]:
+        if os.environ.get("LEGAL_REDACTOR_WORKER_TRANSPORT") == "curl":
+            return self._request_worker_with_curl(worker, method, endpoint, payload)
+
         from urllib.parse import urlsplit
 
         parsed = urlsplit(worker.base_url)
+        if parsed.hostname is None:
+            raise ValueError("Model worker URL is invalid")
         connection_class = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
         connection = connection_class(parsed.hostname, parsed.port, timeout=(
             worker.discovery_timeout_seconds if method == "GET" else worker.request_timeout_seconds
@@ -525,6 +530,71 @@ class CatalogModelManager:
             return response.status, response.read(), "application/json"
         finally:
             connection.close()
+
+    def _request_worker_with_curl(
+        self,
+        worker: CatalogWorker,
+        method: str,
+        endpoint: str,
+        payload: dict[str, Any] | None,
+    ) -> tuple[int, bytes, str]:
+        timeout = worker.discovery_timeout_seconds if method == "GET" else worker.request_timeout_seconds
+        command = [
+            "/usr/bin/curl",
+            "--noproxy",
+            "*",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            str(timeout),
+            "--request",
+            method,
+            "--write-out",
+            "\n%{http_code}",
+        ]
+        stdin = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+        header_fd: int | None = None
+        if worker.api_key_env:
+            api_key = self._environ.get(worker.api_key_env, "")
+            if worker.id == "legacy-qwen-worker" and not api_key:
+                api_key = DEFAULT_WORKER_API_KEY
+            if api_key:
+                header_fd, write_fd = os.pipe()
+                try:
+                    os.write(write_fd, f"Authorization: Bearer {api_key}\n".encode("utf-8"))
+                finally:
+                    os.close(write_fd)
+                command.extend(["--header", f"@/dev/fd/{header_fd}"])
+        if stdin is not None:
+            command.extend([
+                "--header",
+                "Content-Type: application/json",
+                "--data-binary",
+                "@-",
+            ])
+        command.append(f"{worker.base_url.rstrip('/')}{endpoint}")
+        try:
+            completed = subprocess.run(
+                command,
+                input=stdin,
+                capture_output=True,
+                check=False,
+                timeout=timeout + 5,
+                pass_fds=(header_fd,) if header_fd is not None else (),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise OSError("Model worker is unavailable") from exc
+        finally:
+            if header_fd is not None:
+                os.close(header_fd)
+        if completed.returncode != 0:
+            raise OSError("Model worker is unavailable")
+        try:
+            body, status_text = completed.stdout.rsplit(b"\n", 1)
+            status = int(status_text)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Model worker returned an invalid response") from exc
+        return status, body, "application/json"
 
 
 def create_model_manager_app(manager: Any) -> FastAPI:

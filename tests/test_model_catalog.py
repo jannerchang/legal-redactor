@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import time
 
 import pytest
@@ -76,6 +78,62 @@ def test_catalog_router_intersects_allowlist_tolerates_worker_failure_and_routes
     assert status == 503
     assert json.loads(body)["error"]["code"] == "model_unavailable"
     assert "other-worker" not in body.decode()
+
+
+def test_catalog_curl_transport_keeps_payload_and_api_key_out_of_argv(monkeypatch) -> None:
+    catalog = _catalog()
+    catalog["workers"][0]["api_key_env"] = "WORKER_TOKEN"
+    manager = CatalogModelManager(parse_model_catalog(catalog), environ={"WORKER_TOKEN": "secret-token"})
+    worker = manager._catalog.workers[0]
+    calls: list[dict] = []
+
+    def run(command, *, input, capture_output, check, timeout, pass_fds):
+        calls.append(
+            {
+                "command": command,
+                "input": input,
+                "headers": os.read(pass_fds[0], 4096) if pass_fds else b"",
+            }
+        )
+        assert capture_output is True
+        assert check is False
+        assert timeout == 7
+        return subprocess.CompletedProcess(command, 0, b'{"choices":[]}\n200', b"")
+
+    monkeypatch.setattr("legal_redactor.model_manager.subprocess.run", run)
+    document_text = "原告张三的私密文书内容"
+
+    status, body, content_type = manager._request_worker_with_curl(
+        worker,
+        "POST",
+        "/chat/completions",
+        {"model": "qwen-upstream", "messages": [{"role": "user", "content": document_text}]},
+    )
+
+    assert status == 200
+    assert body == b'{"choices":[]}'
+    assert content_type == "application/json"
+    command_text = " ".join(calls[0]["command"])
+    assert calls[0]["command"][:4] == ["/usr/bin/curl", "--noproxy", "*", "--silent"]
+    assert calls[0]["command"][-1] == "http://127.0.0.1:8000/v1/chat/completions"
+    assert calls[0]["input"] is not None and document_text.encode() in calls[0]["input"]
+    assert calls[0]["headers"] == b"Authorization: Bearer secret-token\n"
+    assert document_text not in command_text
+    assert "secret-token" not in command_text
+    assert "@-" in calls[0]["command"]
+
+
+def test_catalog_curl_timeout_is_reported_as_unavailable(monkeypatch) -> None:
+    manager = CatalogModelManager(parse_model_catalog(_catalog()))
+    worker = manager._catalog.workers[0]
+
+    def run(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr("legal_redactor.model_manager.subprocess.run", run)
+
+    with pytest.raises(OSError, match="unavailable"):
+        manager._request_worker_with_curl(worker, "GET", "/models", None)
 
 
 def test_catalog_discovery_queries_workers_concurrently(monkeypatch) -> None:
