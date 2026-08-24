@@ -1,93 +1,40 @@
 from __future__ import annotations
 
-import asyncio
-import http.client
 import html
-import json
-import os
 import re
-import secrets
-import subprocess
-import urllib.error
-import urllib.parse
-import urllib.request
-import base64
-import tempfile
-from dataclasses import dataclass, replace
-from datetime import datetime
-from io import BytesIO
-from pathlib import Path, PurePosixPath
-from typing import Any
-from zipfile import BadZipFile
-
-from . import deps
-from .deps import (
-    CN_ORDINALS,
-    DEFAULT_MODEL_ID,
-    EXCEL_INPUT_SUFFIXES,
-    ExcelFormulaLeakError,
-    File,
-    Form,
-    HTMLResponse,
-    JSONResponse,
-    MappingEntry,
-    PipelineConfig,
-    RecognitionRunStats,
-    RedactedDocument,
-    RedactionMap,
-    Request,
-    TypeCounters,
-    UploadFile,
-    XLSX_MEDIA_TYPE,
-    _filter_noise_entity_mappings,
-    _page,
-    derived_organization_alias_cores,
-    extract_workbook_text,
-    is_noise_entity_text,
-    preview_restore,
-    redact_workbook,
-    redaction_map_from_json,
-    redaction_map_to_json,
-    render_batch_redaction_result_page,
-    render_home_page,
-    render_redaction_result_page,
-    render_status_panel,
-    restore_docx,
-    sort_mapping_entries,
-    MAPPING_REVIEW_CATEGORY_LABELS,
-    RESTORE_RISK_REASON_LABELS,
-)
+from pathlib import Path
 
 from ..cases import (
     CaseError,
-    InvalidDiscordThreadError,
     InvalidWorkflowInputError,
-    case_dir,
-    create_or_update_manifest,
     case_root_from_source_dir,
+    case_thread_binding_status,
     case_workflow_public,
-    case_workflow_state,
     default_case_root,
-    load_manifest,
     manifest_fields_for_case_dir,
-    parse_discord_thread_id,
     persist_case_redaction,
     raise_for_forged_workflow_fields,
-    record_hermes_thread_request,
-    suggest_case_location_from_filenames,
-    case_location_search_roots,
-    case_thread_binding_status,
-    validate_case_folder_name,
     workflow_state_message,
+)
+from .deps import (
+    HTMLResponse,
+    JSONResponse,
+    RedactedDocument,
+    RedactionMap,
+    _page,
 )
 
 
-
-
-def _redaction_failure_body(exc: Exception) -> str:
+def _redaction_failure_body(exc: Exception, ocr_paths: dict[str, str] | None = None) -> str:
     suggestion = "建议：确认所选 API 模型仍可用后重试。"
-    return f"<p>{html.escape(str(exc))}</p><p>{html.escape(suggestion)}</p>"
-
+    parts = [f"<p>{html.escape(str(exc))}</p>"]
+    if ocr_paths:
+        items = "".join(
+            f"<li>{html.escape(name)}：{html.escape(path)}</li>" for name, path in ocr_paths.items()
+        )
+        parts.append(f"<p>OCR 原文已保存：</p><ul>{items}</ul>")
+    parts.append(f"<p>{html.escape(suggestion)}</p>")
+    return "".join(parts)
 
 
 def _reject_forged_workflow_fields(body: dict) -> JSONResponse | None:
@@ -104,7 +51,6 @@ def _reject_forged_workflow_fields(body: dict) -> JSONResponse | None:
             status_code=400,
         )
     return None
-
 
 
 def _reject_forged_workflow_form_data(form: dict) -> HTMLResponse | None:
@@ -124,8 +70,9 @@ def _reject_forged_workflow_form_data(form: dict) -> HTMLResponse | None:
     return None
 
 
-
-def _case_error_response(message: str, *, code: str = "case_error", status_code: int = 400) -> JSONResponse:
+def _case_error_response(
+    message: str, *, code: str = "case_error", status_code: int = 400
+) -> JSONResponse:
     return JSONResponse(
         {
             "status": "error",
@@ -137,7 +84,6 @@ def _case_error_response(message: str, *, code: str = "case_error", status_code:
     )
 
 
-
 def _waiting_hermes_response() -> JSONResponse:
     return JSONResponse(
         {
@@ -147,7 +93,6 @@ def _waiting_hermes_response() -> JSONResponse:
         },
         status_code=202,
     )
-
 
 
 def _render_case_workflow_panel(
@@ -217,7 +162,6 @@ def _render_case_workflow_panel(
     """
 
 
-
 def _workflow_state_label(state: str) -> str:
     return {
         "not_saved": "未保存",
@@ -229,11 +173,9 @@ def _workflow_state_label(state: str) -> str:
     }.get(state, state)
 
 
-
 def _should_apply_auto_prefill(current_value: str, previous_auto_value: str) -> bool:
     current = current_value.strip()
     return not current or current == previous_auto_value
-
 
 
 def _persist_optional_case_redaction(
@@ -264,7 +206,6 @@ def _persist_optional_case_redaction(
     )
 
 
-
 def _apply_requested_thread_preflight(result: dict[str, object], requested_thread: str) -> None:
     try:
         binding = case_thread_binding_status(
@@ -293,7 +234,6 @@ def _apply_requested_thread_preflight(result: dict[str, object], requested_threa
         )
 
 
-
 def _safe_public_error_message(message: str) -> str:
     text = str(message)
     path_pattern = re.compile(
@@ -305,7 +245,6 @@ def _safe_public_error_message(message: str) -> str:
         r")"
     )
     return path_pattern.sub("<local-path>", text)
-
 
 
 def _case_manifest_fields(case_dir_path: Path) -> dict[str, str]:

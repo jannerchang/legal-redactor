@@ -36,6 +36,9 @@ tests/*
 !tests/test_postprocess.py
 !tests/test_detectors.py
 !tests/test_model_manager.py
+!tests/test_model_catalog.py
+!tests/test_ocr.py
+!tests/test_web_model_selector.py
 !tests/test_llm_config.py
 !tests/test_start_model_manager.py
 !tests/test_start_vllm_worker.py

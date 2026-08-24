@@ -1,13 +1,17 @@
 """HTTP handlers for analyze / redact / apply-map flows."""
+
 from __future__ import annotations
 
 import asyncio
 import html
 import json
 from dataclasses import replace
-from typing import Any
 
+from ..cases import CaseError, default_case_root
 from . import deps
+from . import status_ops as status_ops
+from . import workflow as workflow
+from .case_location import _is_default_case_root_value, _resolve_case_location
 from .deps import (
     DEFAULT_MODEL_ID,
     ExcelFormulaLeakError,
@@ -15,7 +19,6 @@ from .deps import (
     Form,
     MappingEntry,
     PipelineConfig,
-    RecognitionRunStats,
     RedactedDocument,
     RedactionMap,
     Request,
@@ -23,13 +26,9 @@ from .deps import (
     UploadFile,
     _page,
     redaction_map_from_json,
-    redaction_map_to_json,
     render_home_page,
     sort_mapping_entries,
 )
-from ..cases import CaseError, default_case_root
-from .models import InputDocument
-from . import status_ops as status_ops
 from .documents import (
     _apply_map_to_documents,
     _documents_from_bundle_json,
@@ -46,21 +45,19 @@ from .mapping_ops import (
     _sanitize_redaction_map,
     _simple_mask,
 )
-from . import workflow as workflow
-from .case_location import _is_default_case_root_value, _resolve_case_location
-from .redact_render import (
-    _render_audit_dashboard,
-    _render_batch_redaction_result,
-    _render_redaction_result,
-    _recognition_stats_from_analysis,
-)
+from .models import InputDocument
 
 # Re-export render helpers so ``web_app`` and tests can import from redact_routes
 # or the facade without churn. Prefer ``redact_render`` for new code.
 from .redact_render import (  # noqa: F401
     _recognition_reason_label,
+    _recognition_stats_from_analysis,
+    _render_audit_dashboard,
+    _render_batch_redaction_result,
     _render_recognition_stats,
+    _render_redaction_result,
 )
+
 
 def index() -> str:
     sample_info = ""
@@ -89,6 +86,7 @@ async def analyze_page(
         documents = await _read_input_documents(text, file, files)
     except ValueError as exc:
         return _page("上传失败", str(exc))
+    ocr_paths = deps.take_ocr_output_paths()
 
     profile = "standard"
     try:
@@ -99,7 +97,7 @@ async def analyze_page(
             recognition_mode=recognition_mode,
         )
     except deps.RecognitionUnavailableError as exc:
-        return _page("识别不可用", workflow._redaction_failure_body(exc))
+        return _page("识别不可用", workflow._redaction_failure_body(exc, ocr_paths=ocr_paths))
     pipeline = deps.RedactionPipeline(config=config)
 
     # 执行语义审计（后台线程，避免阻塞 /health 等轻量请求）
@@ -107,7 +105,7 @@ async def analyze_page(
     try:
         analysis = await asyncio.to_thread(pipeline.analyze, raw_text)
     except deps.RecognitionUnavailableError as exc:
-        return _page("识别失败", workflow._redaction_failure_body(exc))
+        return _page("识别失败", workflow._redaction_failure_body(exc, ocr_paths=ocr_paths))
 
     analysis.setdefault("warnings", [])
     analysis["warnings"] = [*warnings, *analysis.get("warnings", [])]
@@ -209,19 +207,31 @@ async def redact_confirmed_page(request: Request) -> str:
             continue
         custom = (form.get(f"group_{gid}_mask") or "").strip()
         group_mask = custom or _simple_mask(full, counters)
-        prev_mappings_dicts.append({
-            "type": "manual", "original": full, "masked": group_mask,
-            "role": g.get("role"), "source": "user_confirmed",
-            "confidence": 1.0, "restore_by_default": True,
-        })
+        prev_mappings_dicts.append(
+            {
+                "type": "manual",
+                "original": full,
+                "masked": group_mask,
+                "role": g.get("role"),
+                "source": "user_confirmed",
+                "confidence": 1.0,
+                "restore_by_default": True,
+            }
+        )
         for alias in g.get("aliases", []):
             alias = alias.strip()
             if alias and alias != full:
-                prev_mappings_dicts.append({
-                    "type": "manual", "original": alias, "masked": group_mask,
-                    "role": g.get("role"), "source": "user_confirmed_alias",
-                    "confidence": 1.0, "restore_by_default": True,
-                })
+                prev_mappings_dicts.append(
+                    {
+                        "type": "manual",
+                        "original": alias,
+                        "masked": group_mask,
+                        "role": g.get("role"),
+                        "source": "user_confirmed_alias",
+                        "confidence": 1.0,
+                        "restore_by_default": True,
+                    }
+                )
 
     # 地名使用独立掩码（强制用地点掩码，即使无后缀）
     for idx, loc in enumerate(analysis.get("locations", [])):
@@ -234,11 +244,17 @@ async def redact_confirmed_page(request: Request) -> str:
         loc_masked = _simple_mask(loc, counters)
         if "自然人" in loc_masked:
             loc_masked = _guess_location_mask(loc)
-        prev_mappings_dicts.append({
-            "type": "manual", "original": loc, "masked": loc_masked,
-            "role": None, "source": "user_confirmed",
-            "confidence": 1.0, "restore_by_default": True,
-        })
+        prev_mappings_dicts.append(
+            {
+                "type": "manual",
+                "original": loc,
+                "masked": loc_masked,
+                "role": None,
+                "source": "user_confirmed",
+                "confidence": 1.0,
+                "restore_by_default": True,
+            }
+        )
 
     # 合并去重（同一原文只保留一条）
     merged: dict[str, dict] = {}
@@ -266,10 +282,13 @@ async def redact_confirmed_page(request: Request) -> str:
     )
 
     # 当前轮次的映射数据（传给下一轮）
-    current_map_json = json.dumps({
-        "mappings": all_mapping_dicts,
-        "confirmed_texts": list(all_confirmed),
-    }, ensure_ascii=False)
+    current_map_json = json.dumps(
+        {
+            "mappings": all_mapping_dicts,
+            "confirmed_texts": list(all_confirmed),
+        },
+        ensure_ascii=False,
+    )
     deselected_json = json.dumps(list(all_deselected_texts), ensure_ascii=False)
 
     # ── 批量文档：直接展示最终结果（不支持多轮） ──
@@ -279,12 +298,14 @@ async def redact_confirmed_page(request: Request) -> str:
         for d in docs_data:
             rt = pipeline.apply_redaction_map(d["text"], redaction_map)
             lks = pipeline.scan_high_risk_leaks(rt)
-            redacted_docs.append(RedactedDocument(
-                source_file=d.get("source_file", ""),
-                original_text=d["text"],
-                redacted_text=rt,
-                leaks=lks,
-            ))
+            redacted_docs.append(
+                RedactedDocument(
+                    source_file=d.get("source_file", ""),
+                    original_text=d["text"],
+                    redacted_text=rt,
+                    leaks=lks,
+                )
+            )
             all_leaks.extend(lks)
         return _render_batch_redaction_result(
             title="脱敏完成",
@@ -337,7 +358,9 @@ async def redact_confirmed_page(request: Request) -> str:
         all_texts = {full, *aliases}
         if all(t in all_confirmed or t in all_deselected_texts for t in all_texts if t):
             continue
-        g["aliases"] = [a for a in aliases if a not in all_confirmed and a not in all_deselected_texts]
+        g["aliases"] = [
+            a for a in aliases if a not in all_confirmed and a not in all_deselected_texts
+        ]
         new_groups.append(g)
 
     new_locations = [
@@ -402,6 +425,7 @@ async def redact_page(
         documents = await _read_input_documents(text, file, files, case_folder_files)
     except ValueError as exc:
         return _page("上传失败", str(exc))
+    ocr_paths = deps.take_ocr_output_paths()
 
     base_redaction_map = None
     if base_map_json.strip() or (base_map_file and base_map_file.filename):
@@ -419,15 +443,23 @@ async def redact_page(
             recognition_mode=recognition_mode,
         )
     except deps.RecognitionUnavailableError as exc:
-        return _page("脱敏失败", workflow._redaction_failure_body(exc))
+        return _page("脱敏失败", workflow._redaction_failure_body(exc, ocr_paths=ocr_paths))
     pipeline = deps.RedactionPipeline(config=config)
     source_files = [item.source_file for item in documents]
-    inferred_case_location = _resolve_case_location(upload_source_dir, source_files, upload_relative_paths)
+    inferred_case_location = _resolve_case_location(
+        upload_source_dir, source_files, upload_relative_paths
+    )
     inferred_source_dir = str(inferred_case_location.get("matched_dir") or "")
     manual_case_root = "" if _is_default_case_root_value(case_root) else case_root.strip()
-    effective_case_folder = case_folder.strip() or str(inferred_case_location.get("case_folder") or "")
-    effective_case_root = manual_case_root or str(inferred_case_location.get("case_root") or "") or case_root.strip()
-    effective_discord_thread_url = discord_thread_url.strip() or str(inferred_case_location.get("discord_thread_url") or "")
+    effective_case_folder = case_folder.strip() or str(
+        inferred_case_location.get("case_folder") or ""
+    )
+    effective_case_root = (
+        manual_case_root or str(inferred_case_location.get("case_root") or "") or case_root.strip()
+    )
+    effective_discord_thread_url = discord_thread_url.strip() or str(
+        inferred_case_location.get("discord_thread_url") or ""
+    )
     try:
         if len(documents) > 1:
             result = await asyncio.to_thread(
@@ -443,7 +475,7 @@ async def redact_page(
                 base_redaction_map=base_redaction_map,
             )
     except Exception as exc:
-        return _page("脱敏失败", workflow._redaction_failure_body(exc))
+        return _page("脱敏失败", workflow._redaction_failure_body(exc, ocr_paths=ocr_paths))
     result = replace(result, redaction_map=_sanitize_redaction_map(result.redaction_map))
     try:
         if len(documents) > 1:
@@ -460,7 +492,9 @@ async def redact_page(
             warnings = [*fallback_warnings, *result.warnings, *_excel_warnings(documents)]
     except ExcelFormulaLeakError as exc:
         locations = "".join(f"<li>{html.escape(location)}</li>" for location in exc.locations)
-        return _page("Excel 源格式输出失败", f"<p>公式包含待替换内容，已阻止导出。</p><ul>{locations}</ul>")
+        return _page(
+            "Excel 源格式输出失败", f"<p>公式包含待替换内容，已阻止导出。</p><ul>{locations}</ul>"
+        )
     except ValueError as exc:
         return _page("Excel 源格式输出失败", html.escape(str(exc)))
     warnings = [*fallback_warnings, *result.warnings] if len(documents) > 1 else warnings
@@ -509,7 +543,9 @@ async def redact_page(
         )
     except ExcelFormulaLeakError as exc:
         locations = "".join(f"<li>{html.escape(location)}</li>" for location in exc.locations)
-        return _page("Excel 源格式输出失败", f"<p>公式包含待替换内容，已阻止导出。</p><ul>{locations}</ul>")
+        return _page(
+            "Excel 源格式输出失败", f"<p>公式包含待替换内容，已阻止导出。</p><ul>{locations}</ul>"
+        )
     except ValueError as exc:
         return _page("Excel 源格式输出失败", html.escape(str(exc)))
     try:
@@ -560,17 +596,39 @@ async def apply_map_page(
         try:
             documents = _documents_from_bundle_json(original_bundle_json)
             redacted_documents = _apply_map_to_documents(pipeline, documents, redaction_map)
-            augmented = [_render_output_document(source, document, redaction_map, pipeline) for source, document in zip(documents, redacted_documents)]
+            augmented = [
+                _render_output_document(source, document, redaction_map, pipeline)
+                for source, document in zip(documents, redacted_documents)
+            ]
         except ExcelFormulaLeakError as exc:
             locations = "".join(f"<li>{html.escape(location)}</li>" for location in exc.locations)
-            return _page("Excel 源格式输出失败", f"<p>公式包含待替换内容，已阻止导出。</p><ul>{locations}</ul>")
+            return _page(
+                "Excel 源格式输出失败",
+                f"<p>公式包含待替换内容，已阻止导出。</p><ul>{locations}</ul>",
+            )
         except ValueError as exc:
             return _page("Excel 源文件状态无效，请重新上传", html.escape(str(exc)))
         leaks = [lk for document in augmented for lk in document.leaks]
-        return _render_batch_redaction_result("应用映射表结果", augmented, redaction_map, [], leaks, ["已重新应用您上传/修改后的映射表。"], source_documents=documents)
+        return _render_batch_redaction_result(
+            "应用映射表结果",
+            augmented,
+            redaction_map,
+            [],
+            leaks,
+            ["已重新应用您上传/修改后的映射表。"],
+            source_documents=documents,
+        )
     redacted_text = pipeline.apply_redaction_map(original_text, redaction_map)
     leaks = pipeline.scan_high_risk_leaks(redacted_text)
-    return _render_redaction_result("应用映射表结果", original_text, redacted_text, redaction_map, [], leaks, ["已重新应用您上传/修改后的映射表。"])
+    return _render_redaction_result(
+        "应用映射表结果",
+        original_text,
+        redacted_text,
+        redaction_map,
+        [],
+        leaks,
+        ["已重新应用您上传/修改后的映射表。"],
+    )
 
 
 async def apply_edited_map_page(request: Request) -> str:
@@ -607,13 +665,22 @@ async def apply_edited_map_page(request: Request) -> str:
 
     redaction_map = _sanitize_redaction_map(
         _redaction_map_from_rows(
-            version=map_version, created_at=map_created_at, mode=map_mode,
-            source_file=map_source_file, map_type=map_type, map_original=map_original,
-            map_masked=map_masked, map_role=map_role, map_source=map_source,
-            map_confidence=map_confidence, map_reason=map_reason,
+            version=map_version,
+            created_at=map_created_at,
+            mode=map_mode,
+            source_file=map_source_file,
+            map_type=map_type,
+            map_original=map_original,
+            map_masked=map_masked,
+            map_role=map_role,
+            map_source=map_source,
+            map_confidence=map_confidence,
+            map_reason=map_reason,
             map_restore_by_default=map_restore_by_default,
-            map_entity_id=map_entity_id, map_do_not_merge=map_do_not_merge,
-            map_restore_original=map_restore_original, row_delete=row_delete,
+            map_entity_id=map_entity_id,
+            map_do_not_merge=map_do_not_merge,
+            map_restore_original=map_restore_original,
+            row_delete=row_delete,
         )
     )
     warnings = ["已手动调整映射表。"]
@@ -631,15 +698,46 @@ async def apply_edited_map_page(request: Request) -> str:
     if documents:
         try:
             redacted_documents = _apply_map_to_documents(pipeline, documents, redaction_map)
-            augmented = [_render_output_document(source, document, redaction_map, pipeline) for source, document in zip(documents, redacted_documents)]
+            augmented = [
+                _render_output_document(source, document, redaction_map, pipeline)
+                for source, document in zip(documents, redacted_documents)
+            ]
         except ExcelFormulaLeakError as exc:
             locations = "".join(f"<li>{html.escape(location)}</li>" for location in exc.locations)
-            return _page("Excel 源格式输出失败", f"<p>公式包含待替换内容，已阻止导出。</p><ul>{locations}</ul>")
+            return _page(
+                "Excel 源格式输出失败",
+                f"<p>公式包含待替换内容，已阻止导出。</p><ul>{locations}</ul>",
+            )
         except ValueError as exc:
             return _page("Excel 源文件状态无效，请重新上传", html.escape(str(exc)))
         leaks = [lk for document in augmented for lk in document.leaks]
-        return _render_batch_redaction_result("编辑映射后结果", augmented, redaction_map, [], leaks, warnings, save_dir=save_dir, discord_thread_url=discord_thread_url, case_root=case_root, case_folder=case_folder, source_dir=source_dir, source_documents=documents)
+        return _render_batch_redaction_result(
+            "编辑映射后结果",
+            augmented,
+            redaction_map,
+            [],
+            leaks,
+            warnings,
+            save_dir=save_dir,
+            discord_thread_url=discord_thread_url,
+            case_root=case_root,
+            case_folder=case_folder,
+            source_dir=source_dir,
+            source_documents=documents,
+        )
     redacted_text = pipeline.apply_redaction_map(original_text, redaction_map)
     leaks = pipeline.scan_high_risk_leaks(redacted_text)
-    return _render_redaction_result("编辑映射后结果", original_text, redacted_text, redaction_map, [], leaks, warnings, save_dir=save_dir, discord_thread_url=discord_thread_url, case_root=case_root, case_folder=case_folder, source_dir=source_dir)
-
+    return _render_redaction_result(
+        "编辑映射后结果",
+        original_text,
+        redacted_text,
+        redaction_map,
+        [],
+        leaks,
+        warnings,
+        save_dir=save_dir,
+        discord_thread_url=discord_thread_url,
+        case_root=case_root,
+        case_folder=case_folder,
+        source_dir=source_dir,
+    )

@@ -138,24 +138,49 @@ async def _read_input_documents(
         item for item in (case_folder_files or [])
         if item.filename and _is_supported_folder_upload_filename(item.filename)
     )
-    for item in target_files:
-        name = str(item.filename)
-        data = await item.read()
-        suffix = _suffix_for_filename(name)
-        try:
-            if suffix in EXCEL_INPUT_SUFFIXES:
-                content = extract_workbook_text(data, name)
-                documents.append(InputDocument(name, content, data, suffix))
-            else:
-                documents.append(InputDocument(name, _read_upload_text_from_bytes(data, name)))
-        except ValueError:
-            raise
-        except Exception as exc:
-            raise ValueError(f"读取文件 {name} 失败: {exc}") from exc
+    uploads = [(item, str(item.filename), await item.read()) for item in target_files]
+    try:
+        documents.extend(await asyncio.to_thread(_read_uploaded_documents, uploads))
+    except deps.OCRUnavailableError as exc:
+        raise ValueError(f"扫描 PDF OCR 失败：{exc}") from exc
     if not documents:
         raise ValueError("未提供任何待脱敏的文本或文件")
     return documents
 
+
+def _read_uploaded_documents(
+    uploads: list[tuple[UploadFile, str, bytes]],
+) -> list[InputDocument]:
+    documents: list[InputDocument] = []
+    pdf_page_layers = {
+        index: deps.pdf_page_texts(data, name)[0]
+        for index, (_, name, data) in enumerate(uploads)
+        if _suffix_for_filename(name) == ".pdf"
+    }
+    needs_ocr = any(
+        len(text) < 20
+        for texts in pdf_page_layers.values()
+        for text in texts
+    )
+    with deps.ocr_runtime(needs_ocr):
+        for index, (_, name, data) in enumerate(uploads):
+            suffix = _suffix_for_filename(name)
+            try:
+                if suffix in EXCEL_INPUT_SUFFIXES:
+                    content = extract_workbook_text(data, name)
+                    documents.append(InputDocument(name, content, data, suffix))
+                elif suffix == ".pdf":
+                    documents.append(InputDocument(
+                        name,
+                        deps.extract_pdf_text(data, name, page_texts=pdf_page_layers[index]),
+                    ))
+                else:
+                    documents.append(InputDocument(name, _read_upload_text_from_bytes(data, name)))
+            except ValueError:
+                raise
+            except Exception as exc:
+                raise ValueError(f"读取文件 {name} 失败: {exc}") from exc
+    return documents
 
 
 def _decode_text_bytes(data: bytes, filename: str) -> str:
@@ -267,21 +292,19 @@ def _read_upload_text_from_bytes(data: bytes, filename: str) -> str:
     if suffix == ".doc":
         return _legacy_doc_bytes_to_text(data, filename)
     if suffix == ".pdf":
-        try:
-            from pypdf import PdfReader
-        except ImportError as exc:
-            raise ValueError("读取 pdf 需要安装 pypdf：pip install pypdf") from exc
-        try:
-            reader = PdfReader(BytesIO(data))
-            return "\n".join(page.extract_text() or "" for page in reader.pages)
-        except Exception as exc:
-            raise ValueError(f"读取文件 {filename} 失败: PDF 格式无效或文件已损坏") from exc
+        return deps.extract_pdf_text(data, filename)
     return ""
 
 
 
 async def _read_upload_text(file: UploadFile) -> str:
     data = await file.read()
+    if _suffix_for_filename(file.filename) == ".pdf":
+        documents = await asyncio.to_thread(
+            _read_uploaded_documents,
+            [(file, str(file.filename), data)],
+        )
+        return documents[0].text
     return _read_upload_text_from_bytes(data, file.filename)
 
 
