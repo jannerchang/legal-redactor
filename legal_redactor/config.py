@@ -181,7 +181,7 @@ class LLMAPIConfig:
     output_format: str = "json"
     timeout_seconds: int = 120
     full_document_max_chars: int = 120000
-    full_document_max_output_tokens: int = 1024
+    full_document_max_output_tokens: int = 8192
     full_document_timeout_seconds: int = 600
     full_document_retry_count: int = 1
     model_manager_host: str = field(default_factory=lambda: os.environ.get("LEGAL_REDACTOR_MODEL_MANAGER_HOST", DEFAULT_MODEL_MANAGER_HOST))

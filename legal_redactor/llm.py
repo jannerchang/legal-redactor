@@ -4,7 +4,8 @@ import http.client
 import json
 import re
 import time
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from json import JSONDecodeError
 
 from ._logging import get_logger
@@ -16,14 +17,17 @@ from .entity_registry import (
     validate_registry_against_text,
 )
 
-
-
-
 _logger = get_logger("llm")
 
 
-
 _AUDIT_MAX_TOKENS = 4096
+# Spark DEFAULT_THINKING=max still merges leftover kwargs. Send the same
+# no-thinking set used by the judicial workstation; do not send thinking_token_budget.
+_NO_THINKING_KWARGS = {
+    "thinking": False,
+    "enable_thinking": False,
+    "reasoning_effort": "none",
+}
 _CONTRACT_NOISE_RE = re.compile(r"合同[一二三四五六七八九十百零\d]+")
 _FALSE_ORG_CLAUSE_RE = re.compile(r"否认其与[^。！？\n，,、；;]{2,24}系关联公司")
 _ORG_ACTION_CLAUSE_RE = re.compile(
@@ -65,7 +69,20 @@ _COMPANY_LEGAL_SUFFIXES = (
     "公司",
     "集团",
 )
-_SHORT_ORG_TAIL_SEPARATORS = ("发送", "通知", "告知", "提交", "出具", "系", "为", "以", "代表", "转账至", "汇款至", "支付至")
+_SHORT_ORG_TAIL_SEPARATORS = (
+    "发送",
+    "通知",
+    "告知",
+    "提交",
+    "出具",
+    "系",
+    "为",
+    "以",
+    "代表",
+    "转账至",
+    "汇款至",
+    "支付至",
+)
 _BANK_OR_FIRM_SUFFIXES = ("银行", "分行", "支行", "律所")
 _NAMED_BUSINESS_OUTLET_SUFFIXES = (
     "经营部",
@@ -85,7 +102,6 @@ _PROJECT_SUFFIXES = (
     "蓝庭",
     "公寓",
     "广场",
-
     "大厦",
     "产业园",
     "商业综合体",
@@ -110,18 +126,13 @@ _GENERIC_PROJECT_RE = re.compile(
 )
 
 
-
-
 def is_noise_entity_text(text: str) -> bool:
     return _is_noise_entity_text(text)
 
 
 def _is_clause_wrapped_org(text: str) -> bool:
     stripped = text.strip()
-    if not any(
-        stripped.endswith(suffix)
-        for suffix in (*_COMPANY_LEGAL_SUFFIXES, "银行")
-    ):
+    if not any(stripped.endswith(suffix) for suffix in (*_COMPANY_LEGAL_SUFFIXES, "银行")):
         return False
     if (
         "代表" in stripped
@@ -170,14 +181,20 @@ def is_noise_project_text(text: str) -> bool:
         return True
     if _DOCUMENT_SHAPED_PROJECT_RE.fullmatch(stripped):
         return True
-    if stripped in {"建设工程", "工程", "项目", "施工工程", "装修工程", "装饰工程", "安装工程", "整体工程"}:
+    if stripped in {
+        "建设工程",
+        "工程",
+        "项目",
+        "施工工程",
+        "装修工程",
+        "装饰工程",
+        "安装工程",
+        "整体工程",
+    }:
         return True
     if _GENERIC_PROJECT_RE.fullmatch(stripped):
         return True
     return False
-
-
-
 
 
 _ENTITY_BOUNDARY_WRAPPERS = " \t\r\n：:，,。；;、\"'“”‘’（）()[]【】"
@@ -285,8 +302,6 @@ def _is_valid_company_variant(text: str) -> bool:
     return 2 <= len(stripped) <= 8
 
 
-
-
 @dataclass(frozen=True)
 class ModelCallMetadata:
     call_count: int = 0
@@ -311,6 +326,7 @@ class FullDocumentRegistryExtraction:
     status: str = "success"
     reason: str | None = None
     metadata: ModelCallMetadata = dataclass_field(default_factory=ModelCallMetadata)
+
 
 @dataclass
 class LegalEntityAuditor:
@@ -427,7 +443,9 @@ class LegalEntityAuditor:
                     stop="\n",
                 )
             except Exception as exc:
-                attempt_duration_ms = max(0, int(round((time.monotonic() - attempt_started) * 1000)))
+                attempt_duration_ms = max(
+                    0, int(round((time.monotonic() - attempt_started) * 1000))
+                )
                 reason = self._safe_exception_reason(exc)
                 http_status = self._exception_http_status(exc)
                 total_metadata = self._merge_call_metadata(
@@ -472,13 +490,19 @@ class LegalEntityAuditor:
                 attempt_number,
                 attempts,
                 phase,
-                response.metadata.http_status if response.metadata.http_status is not None else "无",
+                response.metadata.http_status
+                if response.metadata.http_status is not None
+                else "无",
                 response.metadata.duration_ms / 1000,
-                response.metadata.completion_token_count if response.metadata.completion_token_count is not None else "未知",
+                response.metadata.completion_token_count
+                if response.metadata.completion_token_count is not None
+                else "未知",
                 response.metadata.finish_reason or "未知",
             )
             completed_payload = self._first_complete_json_object(response.response_text)
-            payload = completed_payload or self._repair_full_document_registry_payload(response.response_text)
+            payload = completed_payload or self._repair_full_document_registry_payload(
+                response.response_text
+            )
             parsed = parse_full_document_registry(payload or response.response_text)
             if response.metadata.finish_reason == "length" and completed_payload is None:
                 last_reason = "output_token_limit"
@@ -547,9 +571,9 @@ class LegalEntityAuditor:
                 status="success",
                 metadata=total_metadata,
             )
-        return FullDocumentRegistryExtraction(status="fallback", reason=last_reason, metadata=total_metadata)
-
-
+        return FullDocumentRegistryExtraction(
+            status="fallback", reason=last_reason, metadata=total_metadata
+        )
 
     def _call_model_manager(self, prompt: str, *, max_tokens: int = _AUDIT_MAX_TOKENS) -> dict:
         """Compatibility wrapper for direct transport tests and diagnostics."""
@@ -577,7 +601,11 @@ class LegalEntityAuditor:
                 "stream": False,
                 "temperature": self.config.temperature,
                 "max_tokens": max_tokens,
-                "chat_template_kwargs": {"enable_thinking": False},
+                "chat_template_kwargs": _NO_THINKING_KWARGS,
+                "thinking": False,
+                "enable_thinking": False,
+                "reasoning_effort": "none",
+                "include_reasoning": False,
                 **({"stop": stop} if stop is not None else {}),
             },
             ensure_ascii=False,
@@ -666,7 +694,6 @@ class LegalEntityAuditor:
                         return None
                     return candidate if isinstance(parsed, dict) else None
         return None
-
 
     @classmethod
     def _repair_full_document_registry_payload(cls, value: str) -> str | None:
@@ -873,17 +900,19 @@ class LegalEntityAuditor:
             prefix += '"'
         return prefix + "".join(reversed(stack))
 
-
-
     @staticmethod
     def _usage_int(usage: object, key: str) -> int | None:
         if not isinstance(usage, dict):
             return None
         value = usage.get(key)
-        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+        return (
+            value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+        )
 
     @staticmethod
-    def _merge_call_metadata(left: ModelCallMetadata, right: ModelCallMetadata) -> ModelCallMetadata:
+    def _merge_call_metadata(
+        left: ModelCallMetadata, right: ModelCallMetadata
+    ) -> ModelCallMetadata:
         def add_optional(a: int | None, b: int | None) -> int | None:
             if a is None and b is None:
                 return None
@@ -894,9 +923,13 @@ class LegalEntityAuditor:
             retry_count=left.retry_count + right.retry_count,
             duration_ms=left.duration_ms + right.duration_ms,
             prompt_token_count=add_optional(left.prompt_token_count, right.prompt_token_count),
-            completion_token_count=add_optional(left.completion_token_count, right.completion_token_count),
+            completion_token_count=add_optional(
+                left.completion_token_count, right.completion_token_count
+            ),
             total_token_count=add_optional(left.total_token_count, right.total_token_count),
-            finish_reason=right.finish_reason if right.finish_reason is not None else left.finish_reason,
+            finish_reason=right.finish_reason
+            if right.finish_reason is not None
+            else left.finish_reason,
             http_status=right.http_status if right.http_status is not None else left.http_status,
         )
 
@@ -924,8 +957,8 @@ class LegalEntityAuditor:
             "same_entities 只列原文用又名、曾用名、简称、以下简称或同一人明确确认的两个不同名称。"
             "same_entities 两项文字必须不同，禁止名称与自身配对；不同诉讼角色、同段出现、姓名相似或模型推断都不构成同一主体；张三与李四这类不同完整人名禁止合并。"
             "不要证据、解释、Markdown、换行或其他字段。输出最后一个 } 后立即停止。\n"
-            "格式：{\"persons\":[\"张三\"],\"organizations\":[\"星河建设有限公司\",\"星河公司\"],"
-            "\"locations\":[\"北京市\",\"南山区\"],\"same_entities\":[[\"星河建设有限公司\",\"星河公司\"]]}\n"
+            '格式：{"persons":["张三"],"organizations":["星河建设有限公司","星河公司"],'
+            '"locations":["北京市","南山区"],"same_entities":[["星河建设有限公司","星河公司"]]}\n'
             f"=== 文书全文 ===\n{text}\n"
         )
 
@@ -952,7 +985,6 @@ class LegalEntityAuditor:
             "法院、中院名称只登记其中省级、地级市或市辖区地点，不登记整个法院名称；地点必须登记原文出现的省级、地级市和市辖区名称，"
             "包括省、自治区、特别行政区、市、自治州、盟、地区以及以‘区’结尾的县级行政区；"
             "禁止登记县、旗、乡镇、街道、村、社区或详细地址。没有某类实体或映射时使用空数组。"
-
             "不要证据、entity_id、type、confidence、解释、Markdown、脱敏稿、换行或其他字段。"
             "输出最后一个 } 后立即停止。\n"
             "输出格式："
@@ -995,13 +1027,13 @@ class LegalEntityAuditor:
             "禁止把纯数字、普通指代、职务称谓、审判人员、法官助理、书记员、项目、合同、协议、价款、案件、电话、身份证号、银行账号、"
             "详细地址或其他编号登记为实体；‘地产公司’等通用类别名称也不是具体机构。法院、中院名称只登记其中省级、地级市或市辖区地点，不登记整个法院名称。"
             "地点必须登记原文出现的省级、地级市和以‘区’结尾的市辖区名称；禁止登记县、旗、乡镇、街道、村或社区。"
-
             "same_entities 每项必须恰好包含两个不同名称，禁止名称与自身配对，且原文必须用又名、曾用名、简称、以下简称或同一人明确确认其为同一主体。"
             "不同诉讼角色、同段出现、姓名相似或模型推断都不构成同一主体；不同完整人名禁止合并。"
             "不要重复字段、重复对象、证据、解释、Markdown、换行或其他字段。输出第一个完整对象后立即停止。\n"
             f"=== 第一轮已登记名称（禁止再次输出）===\n{known_json}\n"
             f"=== 文书全文 ===\n{text}\n"
         )
+
     def _build_full_document_supplement_repair_prompt(
         self,
         text: str,

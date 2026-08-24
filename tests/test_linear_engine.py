@@ -1,25 +1,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-
-import pytest
 from unittest.mock import patch
 
-from legal_redactor.counters import TypeCounters
+import pytest
+
 from legal_redactor.candidate_collector import (
     CandidateCollectionContext,
     CandidateCollector,
 )
 from legal_redactor.candidate_resolution import resolve_candidate_overlaps
+from legal_redactor.config import PipelineConfig
+from legal_redactor.counters import TypeCounters
 from legal_redactor.linear_engine import LinearRuleEngine
+from legal_redactor.location_utils import (
+    get_location_core,
+    location_suffix,
+    strip_leading_locations,
+)
+from legal_redactor.models import Candidate, MappingEntry, sort_mapping_entries
 from legal_redactor.org_masking import (
     derived_organization_alias_cores,
     explicit_organization_aliases,
     has_explicit_bare_brand_alias,
 )
-from legal_redactor.location_utils import get_location_core, location_suffix, strip_leading_locations
-from legal_redactor.models import Candidate, MappingEntry, sort_mapping_entries
-from legal_redactor.config import PipelineConfig
 from legal_redactor.pipeline import RedactionPipeline
 
 
@@ -87,10 +91,7 @@ def test_strip_leading_locations_removes_multiple_known_prefixes() -> None:
 
 def test_company_mask_omits_city_prefix_and_does_not_invent_country_place_prefix():
     engine = _engine()
-    engine.source_text = (
-        "石家庄融创贵和房地产开发有限公司与"
-        "中国建筑第二工程局有限公司签订合同。"
-    )
+    engine.source_text = "石家庄融创贵和房地产开发有限公司与中国建筑第二工程局有限公司签订合同。"
     for value in ("石家庄融创贵和房地产开发有限公司", "中国建筑第二工程局有限公司"):
         engine.accept_organization(
             Candidate(
@@ -109,8 +110,6 @@ def test_company_mask_omits_city_prefix_and_does_not_invent_country_place_prefix
 
     assert by_original["石家庄融创贵和房地产开发有限公司"] == "甲房地产开发公司"
     assert by_original["中国建筑第二工程局有限公司"] == "乙公司"
-
-
 
 
 def test_derived_organization_alias_cores_includes_brand_and_number_aliases() -> None:
@@ -360,7 +359,6 @@ def test_resolve_candidate_overlaps_prefers_full_document_exact_person_boundary(
     ]
 
 
-
 def test_collect_keeps_higher_confidence_for_same_span() -> None:
     lower = Candidate(
         type="organization",
@@ -445,8 +443,6 @@ def test_resolve_candidate_overlaps_prefers_clean_nested_org_alias() -> None:
     assert resolved[0].text == "拓欧公司"
 
 
-
-
 def test_engine_masks_named_factory_and_preserves_ocr_spaced_company_surface() -> None:
     text = "平山县永鸿金属制品厂与赛 城投资公司签订合同。"
     candidates = [
@@ -498,7 +494,9 @@ def test_engine_accepts_precollected_candidates_and_calibrates_before_overlap() 
     }
 
     # Without calibrate-before-overlap the long org span would win and drop 星河公司.
-    assert [item.text for item in resolve_candidate_overlaps([noisy, competing])] == ["某人无权代表星河公司"]
+    assert [item.text for item in resolve_candidate_overlaps([noisy, competing])] == [
+        "某人无权代表星河公司"
+    ]
 
     mappings = _engine().discover(text, [noisy, competing], analysis)
     by_original = {mapping.original: mapping for mapping in mappings}
@@ -557,16 +555,20 @@ def test_full_document_failure_stops_without_sentence_or_rule_fallback() -> None
             "collect",
             wraps=CandidateCollector().collect,
         ) as collect,
+        pytest.raises(RecognitionUnavailableError, match="http_503"),
     ):
-        with pytest.raises(RecognitionUnavailableError, match="http_503"):
-            RedactionPipeline(config=config).redact("原告张三，电话13800138000。")
+        RedactionPipeline(config=config).redact("原告张三，电话13800138000。")
 
     assert collect.call_count == 1
     assert collect.call_args.args[0].registry_materialization is None
 
 
 def test_batch_full_document_failure_returns_no_partial_result() -> None:
-    from legal_redactor.entity_registry import FullDocumentEntityRegistry, RegistryEntity, RegistryValidationResult
+    from legal_redactor.entity_registry import (
+        FullDocumentEntityRegistry,
+        RegistryEntity,
+        RegistryValidationResult,
+    )
     from legal_redactor.llm import FullDocumentRegistryExtraction
     from legal_redactor.pipeline import RecognitionUnavailableError
 
@@ -583,20 +585,24 @@ def test_batch_full_document_failure_returns_no_partial_result() -> None:
         enable_hebei_admin_db=False,
         enable_china_admin_db=False,
     )
-    with patch(
-        "legal_redactor.llm.LegalEntityAuditor.extract_full_document_registry",
-        side_effect=[success, failure],
+    with (
+        patch(
+            "legal_redactor.llm.LegalEntityAuditor.extract_full_document_registry",
+            side_effect=[success, failure],
+        ),
+        pytest.raises(RecognitionUnavailableError, match="timeout"),
     ):
-        with pytest.raises(RecognitionUnavailableError, match="timeout"):
-            RedactionPipeline(config=config).redact_many(
-                [("a.txt", "原告张三。"), ("b.txt", "被告李四。")]
-            )
-
-
+        RedactionPipeline(config=config).redact_many(
+            [("a.txt", "原告张三。"), ("b.txt", "被告李四。")]
+        )
 
 
 def test_full_document_registry_redacts_complete_document_end_to_end() -> None:
-    from legal_redactor.entity_registry import FullDocumentEntityRegistry, RegistryEntity, RegistryValidationResult
+    from legal_redactor.entity_registry import (
+        FullDocumentEntityRegistry,
+        RegistryEntity,
+        RegistryValidationResult,
+    )
     from legal_redactor.llm import FullDocumentRegistryExtraction
 
     text = "河北省某人民法院民事判决书。原告张三，电话13800138000。被告星河建设有限公司。张三诉称双方签订施工合同。"
@@ -638,7 +644,11 @@ def test_full_document_registry_redacts_complete_document_end_to_end() -> None:
 
 
 def test_full_document_registry_covers_entities_after_court_reasoning_boundary() -> None:
-    from legal_redactor.entity_registry import FullDocumentEntityRegistry, RegistryEntity, RegistryValidationResult
+    from legal_redactor.entity_registry import (
+        FullDocumentEntityRegistry,
+        RegistryEntity,
+        RegistryValidationResult,
+    )
     from legal_redactor.llm import FullDocumentRegistryExtraction
 
     text = "原告张三诉称合同无效。本院认为，被告李四应返还款项。"
@@ -676,7 +686,10 @@ def test_full_document_registry_covers_entities_after_court_reasoning_boundary()
 
 
 def test_false_same_entities_person_claim_keeps_opposing_parties_separate() -> None:
-    from legal_redactor.entity_registry import parse_full_document_registry, validate_registry_against_text
+    from legal_redactor.entity_registry import (
+        parse_full_document_registry,
+        validate_registry_against_text,
+    )
     from legal_redactor.llm import FullDocumentRegistryExtraction
 
     text = "原告张三诉称合同无效。本院认为，被告李四应返还款项。"
@@ -718,8 +731,6 @@ def test_manager_transport_posts_logical_model_and_parses_completion(monkeypatch
     import json
 
     from legal_redactor.config import LLMAPIConfig
-
-
     from legal_redactor.llm import LegalEntityAuditor
 
     requests: list[tuple[str, str, int, dict]] = []
@@ -729,9 +740,9 @@ def test_manager_transport_posts_logical_model_and_parses_completion(monkeypatch
 
         @staticmethod
         def read() -> bytes:
-            return json.dumps(
-                {"choices": [{"message": {"content": '{"locations":[]}'}}]}
-            ).encode("utf-8")
+            return json.dumps({"choices": [{"message": {"content": '{"locations":[]}'}}]}).encode(
+                "utf-8"
+            )
 
     class FakeConnection:
         def __init__(self, host: str, port: int, *, timeout: int) -> None:
@@ -750,7 +761,12 @@ def test_manager_transport_posts_logical_model_and_parses_completion(monkeypatch
 
     monkeypatch.setattr("legal_redactor.llm.http.client.HTTPConnection", FakeConnection)
     auditor = LegalEntityAuditor(
-        LLMAPIConfig(model="bonsai-27b", model_manager_host="manager.example.test", model_manager_port=18080, timeout_seconds=9)
+        LLMAPIConfig(
+            model="bonsai-27b",
+            model_manager_host="manager.example.test",
+            model_manager_port=18080,
+            timeout_seconds=9,
+        )
     )
 
     payload = auditor._call_model_manager("return JSON", max_tokens=321)
@@ -768,15 +784,20 @@ def test_manager_transport_posts_logical_model_and_parses_completion(monkeypatch
                     "stream": False,
                     "temperature": 0.0,
                     "max_tokens": 321,
-                    "chat_template_kwargs": {"enable_thinking": False},
+                    "chat_template_kwargs": {
+                        "thinking": False,
+                        "enable_thinking": False,
+                        "reasoning_effort": "none",
+                    },
+                    "thinking": False,
+                    "enable_thinking": False,
+                    "reasoning_effort": "none",
+                    "include_reasoning": False,
                 },
                 "headers": {"Content-Type": "application/json"},
             },
         ),
     ]
-
-
-
 
 
 def test_mapping_sort_groups_entity_types_for_review() -> None:
@@ -795,17 +816,9 @@ def test_mapping_sort_groups_entity_types_for_review() -> None:
     ]
 
 
-
-
-
-
-
 def test_sentence_window_mode_is_rejected_before_recognition() -> None:
     with pytest.raises(ValueError, match="unsupported recognition mode"):
         PipelineConfig.balanced_llm(recognition_mode="sentence_windows")
-
-
-
 
 
 def test_apply_mappings_skips_bare_alias_inside_unmapped_company_name() -> None:
@@ -818,7 +831,9 @@ def test_apply_mappings_skips_bare_alias_inside_unmapped_company_name() -> None:
         MappingEntry("organization", "华药", "甲公司", None, "test", 1.0, True),
     ]
 
-    redacted = RedactionPipeline(config=PipelineConfig.mapping_only()).apply_mappings(text, mappings)
+    redacted = RedactionPipeline(config=PipelineConfig.mapping_only()).apply_mappings(
+        text, mappings
+    )
 
     assert "甲公司认可事实" in redacted
     assert "华药生物公司" in redacted
@@ -829,8 +844,7 @@ def test_apply_mappings_skips_bare_alias_inside_unmapped_company_name() -> None:
 def test_accept_organization_reuses_brand_across_different_location_prefixes() -> None:
     engine = _engine()
     engine.source_text = (
-        "原告江苏载道电力工程有限公司，后更名为淮安载道电力工程有限公司。"
-        "载道公司亦参与诉讼。"
+        "原告江苏载道电力工程有限公司，后更名为淮安载道电力工程有限公司。载道公司亦参与诉讼。"
     )
     names = [
         "江苏载道电力工程有限公司",
@@ -931,10 +945,30 @@ def test_merge_organization_alias_mappings_keeps_different_company_short_names_s
     from legal_redactor.postprocess import _merge_organization_alias_mappings
 
     mappings = [
-        MappingEntry("organization", "河北星河建设有限公司", "甲省甲公司", None, "linear:linear_llm_exact", 0.95, True),
-        MappingEntry("organization", "星河建设公司", "甲公司", None, "linear:linear_llm_exact", 0.95, True),
-        MappingEntry("organization", "北京星河科技有限公司", "乙省乙科技公司", None, "linear:linear_llm_exact", 0.95, True),
-        MappingEntry("organization", "星河科技公司", "乙公司", None, "linear:linear_llm_exact", 0.95, True),
+        MappingEntry(
+            "organization",
+            "河北星河建设有限公司",
+            "甲省甲公司",
+            None,
+            "linear:linear_llm_exact",
+            0.95,
+            True,
+        ),
+        MappingEntry(
+            "organization", "星河建设公司", "甲公司", None, "linear:linear_llm_exact", 0.95, True
+        ),
+        MappingEntry(
+            "organization",
+            "北京星河科技有限公司",
+            "乙省乙科技公司",
+            None,
+            "linear:linear_llm_exact",
+            0.95,
+            True,
+        ),
+        MappingEntry(
+            "organization", "星河科技公司", "乙公司", None, "linear:linear_llm_exact", 0.95, True
+        ),
     ]
 
     merged = _merge_organization_alias_mappings(mappings)
