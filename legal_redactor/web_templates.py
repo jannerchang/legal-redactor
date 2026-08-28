@@ -732,9 +732,10 @@ def _page(title: str, body: str) -> str:
 	        buttonEl.disabled = true;
 	        buttonEl.textContent = '正在检查绑定...';
 	        if (statusEl) statusEl.textContent = '正在检查是否已绑定 Discord 帖子...';
+	        var folderEl = document.getElementById(buttonEl.dataset.caseFolderId || '');
 	        var payload = {{
 	          case_root: buttonEl.dataset.caseRoot || '',
-	          case_folder: buttonEl.dataset.caseFolder || '',
+	          case_folder: (folderEl && folderEl.value.trim()) || buttonEl.dataset.caseFolder || '',
 		          source_dir: buttonEl.dataset.sourceDir || '',
 		          case_cause: causeEl ? causeEl.value : '',
 		          filename: buttonEl.dataset.filename || 'redacted.txt',
@@ -795,79 +796,108 @@ def _page(title: str, body: str) -> str:
         createDiscordThread(btn);
       }});
 
-
-      // 全局拦截下载链接点击，使用 showSaveFilePicker 选择自定义路径
-      document.addEventListener('click', async function(e) {{
-        var target = e.target;
-        while (target && target.tagName !== 'A') {{
-          target = target.parentElement;
+      async function bindDiscordThread(buttonEl) {{
+        var folderEl = document.getElementById(buttonEl.dataset.caseFolderId || 'case-folder-input');
+        var urlEl = document.getElementById(buttonEl.dataset.threadUrlId || 'discord-thread-url-input');
+        var rootEl = document.getElementById('case-root-input');
+        var sourceEl = document.getElementById('upload-source-dir-input');
+        var statusEl = document.getElementById(buttonEl.dataset.statusId || '');
+        var linkEl = document.getElementById(buttonEl.dataset.linkId || '');
+        var caseFolder = folderEl ? folderEl.value.trim() : '';
+        var threadUrl = urlEl ? urlEl.value.trim() : '';
+        if (!caseFolder) {{
+          toast('请填写案件文件夹名', 'warn');
+          return;
         }}
-        if (target && target.hasAttribute('download')) {{
-          if (target.dataset.noIntercept === 'true') {{
-            return;
+        if (!threadUrl) {{
+          toast('请填写 Discord 帖子链接', 'warn');
+          return;
+        }}
+        var origText = buttonEl.textContent || buttonEl.innerText;
+        buttonEl.disabled = true;
+        buttonEl.textContent = '正在绑定...';
+        if (statusEl) statusEl.textContent = '正在绑定 Discord 帖子...';
+        try {{
+          var resp = await fetch('/api/discord/bind-thread', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{
+              case_folder: caseFolder,
+              discord_thread_url: threadUrl,
+              case_root: buttonEl.dataset.caseRoot || (rootEl ? rootEl.value : ''),
+              source_dir: buttonEl.dataset.sourceDir || (sourceEl ? sourceEl.value : '')
+            }})
+          }});
+          var res = await resp.json();
+          if (resp.ok && res.status === 'bound') {{
+            toast(res.message || '已绑定 Discord 帖子');
+            if (statusEl) statusEl.textContent = res.message || '已绑定 Discord 帖子';
+            document.querySelectorAll('input[name=discord_thread_url], #discord-thread-url-input').forEach(function(inp) {{
+              inp.value = res.thread_url || threadUrl;
+            }});
+            document.querySelectorAll('input[name=case_folder], #case-folder-input').forEach(function(inp) {{
+              if (!inp.value.trim()) inp.value = res.case_folder || caseFolder;
+            }});
+            if (linkEl && res.thread_url) {{
+              linkEl.href = res.thread_url;
+              linkEl.style.display = 'inline';
+            }}
+          }} else {{
+            toast(res.message || '绑定失败', 'warn');
+            if (statusEl) statusEl.textContent = res.message || '绑定失败';
           }}
-          if ('showSaveFilePicker' in window) {{
-            e.preventDefault();
-            var filename = target.getAttribute('download');
-            var href = target.getAttribute('href');
-            var contentText = "";
-            var mimeType = "text/plain";
+        }} catch (err) {{
+          toast('绑定失败：' + err.message, 'warn');
+          if (statusEl) statusEl.textContent = '绑定失败：' + err.message;
+        }} finally {{
+          buttonEl.disabled = false;
+          buttonEl.textContent = origText;
+        }}
+      }}
+      document.addEventListener('click', function(e) {{
+        var btn = e.target && e.target.closest ? e.target.closest('.discord-bind-thread-button') : null;
+        if (!btn) return;
+        bindDiscordThread(btn);
+      }});
 
-            if (href.indexOf('data:') === 0) {{
-              var commaIdx = href.indexOf(',');
-              if (commaIdx >= 0) {{
-                var header = href.substring(0, commaIdx);
-                var mimeMatch = header.match(/data:([^;]+)/);
-                if (mimeMatch) {{
-                  mimeType = mimeMatch[1];
-                }}
-                contentText = decodeURIComponent(href.substring(commaIdx + 1));
-              }}
-            }} else {{
-              try {{
-                var resp = await fetch(href);
-                contentText = await resp.text();
-              }} catch(err) {{
-                console.error(err);
-                window.location.href = href;
-                return;
-              }}
-            }}
 
-            // 规范化 MIME 类型，防止带有 ;charset= 等参数触发浏览器原生异常
-            var cleanMimeType = mimeType.split(';')[0].trim();
-            if (cleanMimeType !== 'application/json' && cleanMimeType !== 'text/plain') {{
-              cleanMimeType = filename.endsWith('.json') ? 'application/json' : 'text/plain';
-            }}
+      // 全局拦截下载链接点击；支持的浏览器会弹出系统“另存为”面板选择文件夹。
+      document.addEventListener('click', async function(e) {{
+        var target = e.target && e.target.closest ? e.target.closest('a[download]') : null;
+        if (!target || !('showSaveFilePicker' in window)) return;
 
-            try {{
-              const options = {{
-                suggestedName: filename,
-                types: [{{
-                  description: cleanMimeType === 'application/json' ? 'JSON 映射表' : '文本文档',
-                  accept: {{
-                    [cleanMimeType]: [cleanMimeType === 'application/json' ? '.json' : '.txt']
-                  }}
-                }}]
-              }};
-              const handle = await window.showSaveFilePicker(options);
-              const writable = await handle.createWritable();
-              await writable.write(new Blob([contentText], {{type: cleanMimeType + ';charset=utf-8'}}));
-              await writable.close();
-              toast('保存成功！');
-            }} catch (err) {{
-              if (err.name !== 'AbortError') {{
-                console.error('File System Access API error:', err);
-                // 降级为原生下载
-                var tempLink = document.createElement('a');
-                tempLink.href = href;
-                tempLink.download = filename;
-                tempLink.dataset.noIntercept = 'true';
-                document.body.appendChild(tempLink);
-                tempLink.click();
-                document.body.removeChild(tempLink);
-              }}
-            }}
+        e.preventDefault();
+        var filename = target.getAttribute('download') || 'download';
+        var href = target.getAttribute('href');
+        try {{
+          var blob;
+          if (href.indexOf('data:') === 0) {{
+            blob = await (await fetch(href)).blob();
+          }} else {{
+            var resp = await fetch(href);
+            if (!resp.ok) throw new Error('下载失败：HTTP ' + resp.status);
+            blob = await resp.blob();
+          }}
+
+          var mimeType = (blob.type || 'application/octet-stream').split(';')[0].trim();
+          var dot = filename.lastIndexOf('.');
+          var extension = dot >= 0 ? filename.substring(dot) : '';
+          var options = {{ suggestedName: filename }};
+          if (extension) {{
+            options.types = [{{
+              description: '下载文件',
+              accept: {{ [mimeType]: [extension] }}
+            }}];
+          }}
+          var handle = await window.showSaveFilePicker(options);
+          var writable = await handle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+          toast('保存成功！');
+        }} catch (err) {{
+          if (err.name !== 'AbortError') {{
+            console.error('保存文件失败:', err);
+            toast('无法打开保存面板，请检查浏览器权限', 'warn');
           }}
         }}
       }});
@@ -982,7 +1012,9 @@ def render_home_page(
               <label>案件文件夹名</label>
               <input type="text" id="case-folder-input" name="case_folder" placeholder="自动识别；仅在无法识别时填写">
               <label>Discord 帖子链接</label>
-              <input type="url" id="discord-thread-url-input" name="discord_thread_url" placeholder="可留空，脱敏完成后可请求 Hermes 新建并回写 Discord 链接">
+              <input type="url" id="discord-thread-url-input" name="discord_thread_url" placeholder="已有帖子可填写；也可脱敏后手动绑定或请求 Hermes 新建">
+              <button type="button" class="btn btn-secondary discord-bind-thread-button" data-case-folder-id="case-folder-input" data-thread-url-id="discord-thread-url-input" data-status-id="home-discord-bind-status">手动绑定帖子到案件</button>
+              <span id="home-discord-bind-status" class="hint"></span>
               <label>案件库根目录</label>
               <input type="text" id="case-root-input" name="case_root" value="{html.escape(default_root_str)}" data-auto-value="{html.escape(default_root_str, quote=True)}">
               <label>原文件所在目录</label>
@@ -1067,7 +1099,7 @@ def render_redaction_result_page(
         f"""
         <nav><a href="/">返回首页</a></nav>
         <div class="downloads">
-          <a download="{html.escape(redacted_filename)}" href="{redacted_url}" class="btn" data-no-intercept="true">{'下载脱敏 Excel' if redacted_filename.lower().endswith('.xlsx') else '下载脱敏文本'}</a>
+          <a download="{html.escape(redacted_filename)}" href="{redacted_url}" class="btn">{'下载脱敏 Excel' if redacted_filename.lower().endswith('.xlsx') else '下载脱敏文本'}</a>
           <a download="redaction_map.json" href="{map_url}" class="btn btn-secondary" onclick="prepareCurrentMapDownload(this)">下载 redaction_map</a>
           <a href="{debug_url}" download="debug_trace.json" class="debug-link">诊断文件</a>
           <button type="button" class="btn btn-secondary btn-sm" onclick="var t=document.getElementById('redacted-output');if(t)navigator.clipboard.writeText(t.value).then(function(){{toast('已复制')}})">复制脱敏文本</button>

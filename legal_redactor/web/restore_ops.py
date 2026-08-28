@@ -173,7 +173,7 @@ def _render_docx_restore_result(
     return _page("Word 还原完成", f"""
         <nav><a href="/">返回首页</a></nav>
         <div class="downloads">
-          <a download="{html.escape(restored_filename)}" href="{restored_url}" class="btn" data-no-intercept="true">下载还原 Word</a>
+          <a download="{html.escape(restored_filename)}" href="{restored_url}" class="btn">下载还原 Word</a>
         </div>
         <section class="info-card">
           <h2>还原完成</h2>

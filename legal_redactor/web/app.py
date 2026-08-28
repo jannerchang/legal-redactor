@@ -39,6 +39,7 @@ def register_routes(application: FastAPI | None = None) -> FastAPI:
     application.add_api_route("/api/suggest-case-location", _MODULE["case_location"].suggest_case_location, methods=["POST"])
     application.add_api_route("/api/discord/send-redacted", _MODULE["discord_ops"].send_redacted_to_discord, methods=["POST"])
     application.add_api_route("/api/discord/create-thread", _MODULE["discord_ops"].create_discord_thread, methods=["POST"])
+    application.add_api_route("/api/discord/bind-thread", _MODULE["discord_ops"].bind_discord_thread, methods=["POST"])
     application.add_api_route("/api/discord/attach-bound-thread", _MODULE["discord_ops"].attach_to_bound_discord_thread, methods=["POST"])
     application.add_api_route("/api/mapping/suggest-entry", _MODULE["mapping_ops"].suggest_mapping_entry, methods=["POST"])
     application.add_api_route("/", _MODULE["redact_routes"].index, methods=["GET"], response_class=HTMLResponse)

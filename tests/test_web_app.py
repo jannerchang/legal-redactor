@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import io
 import json
+import ssl
 import subprocess
 import tempfile
 import unittest
@@ -38,6 +39,7 @@ try:
         attach_to_bound_discord_thread,
         app,
         create_discord_thread,
+        bind_discord_thread,
         health,
         index,
     )
@@ -64,6 +66,7 @@ except RuntimeError as exc:  # Web deps are optional for non-Web unit runs.
     attach_to_bound_discord_thread = None
     app = None
     create_discord_thread = None
+    bind_discord_thread = None
     health = None
     _safe_public_error_message = None
     index = None
@@ -1865,6 +1868,84 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertEqual(data["thread_url"], thread_url)
         self.assertEqual(manifest.discord_thread_url, thread_url)
 
+    def test_bind_discord_thread_writes_manifest(self) -> None:
+        import asyncio
+
+        thread_url = "https://discord.com/channels/1/2/3"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            response = asyncio.run(
+                bind_discord_thread(
+                    MockJsonRequest(
+                        {
+                            "case_root": tmpdir,
+                            "case_folder": "2026 5987",
+                            "discord_thread_url": thread_url,
+                        }
+                    )
+                )
+            )
+            manifest = load_manifest(os.path.join(tmpdir, "2026 5987"))
+
+        data = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["status"], "bound")
+        self.assertEqual(data["workflow_state"], "bound_thread")
+        self.assertEqual(data["thread_url"], thread_url)
+        self.assertEqual(manifest.discord_thread_url, thread_url)
+        self.assertEqual(manifest.discord_thread_id, "3")
+
+    def test_bind_discord_thread_rejects_duplicate_thread(self) -> None:
+        import asyncio
+
+        thread_url = "https://discord.com/channels/1/2/3"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            create_or_update_manifest(tmpdir, "案件甲", thread_url)
+            response = asyncio.run(
+                bind_discord_thread(
+                    MockJsonRequest(
+                        {
+                            "case_root": tmpdir,
+                            "case_folder": "案件乙",
+                            "discord_thread_url": thread_url,
+                        }
+                    )
+                )
+            )
+
+        data = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(data["code"], "duplicate_thread")
+        self.assertIn("其他案件", data["message"])
+
+    def test_redaction_result_shows_manual_bind_when_unbound(self) -> None:
+        redaction_map = RedactionMap.create(
+            [
+                MappingEntry(
+                    type="person",
+                    original="张三",
+                    masked="【PERSON_001】",
+                    role=None,
+                    source="test",
+                    confidence=1.0,
+                    restore_by_default=True,
+                )
+            ]
+        )
+        html = _render_redaction_result(
+            "脱敏结果",
+            "张三",
+            "【PERSON_001】",
+            redaction_map,
+            [],
+            [],
+            [],
+            case_folder="2026 5987",
+            case_root="/tmp/cases",
+        )
+        self.assertIn("手动绑定帖子", html)
+        self.assertIn("/api/discord/bind-thread", html)
+        self.assertIn("discord-bind-thread-button", html)
+
     def test_create_discord_thread_reuses_pending_hermes_request(self) -> None:
         import asyncio
 
@@ -2251,6 +2332,37 @@ class WebAppUploadTests(unittest.TestCase):
         self.assertNotIn("/Volumes", data["message"])
         self.assertNotIn("secret-token-value", data["message"])
 
+    def test_discord_ssl_error_is_not_reported_as_unreachable(self) -> None:
+        import asyncio
+        from legal_redactor.web.discord_ops import _discord_oserror
+
+        ssl_error = ssl.SSLCertVerificationError("unable to get local issuer certificate")
+        mapped = _discord_oserror("Discord 发送失败", urllib.error.URLError(ssl_error))
+        self.assertIn("TLS 证书校验失败", str(mapped))
+        self.assertNotIn("网络不可达", str(mapped))
+
+        def fail(*args, **kwargs):
+            raise urllib.error.URLError(ssl_error)
+
+        with patch.dict(os.environ, {"LEGAL_REDACTOR_DISCORD_BOT_TOKEN": "bot-token"}):
+            with patch("legal_redactor.web.discord_ops.urllib.request.urlopen", side_effect=fail):
+                response = asyncio.run(
+                    send_redacted_to_discord(
+                        MockJsonRequest(
+                            {
+                                "discord_thread_url": "https://discord.com/channels/1/2/3",
+                                "filename": "redacted.txt",
+                                "content": "脱敏内容",
+                            }
+                        )
+                    )
+                )
+
+        data = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("TLS 证书校验失败", data["message"])
+        self.assertNotIn("网络不可达", data["message"])
+
     def test_attach_bound_discord_thread_rejects_forged_state(self) -> None:
         import asyncio
 
@@ -2282,8 +2394,8 @@ class WebAppUploadTests(unittest.TestCase):
         page = _page("结果", "")
 
         self.assertEqual(decoded, "\ufeff张三")
-        self.assertIn("new Blob([contentText]", page)
-        self.assertIn("charset=utf-8", page)
+        self.assertIn("await (await fetch(href)).blob()", page)
+        self.assertIn("await writable.write(blob)", page)
 
 
     def test_redaction_result_preserves_save_dir_in_edit_form(self) -> None:

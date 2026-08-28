@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import ssl
 import subprocess
 import urllib.error
 import urllib.parse
@@ -223,6 +224,48 @@ async def create_discord_thread(request: Request) -> JSONResponse:
     })
 
 
+async def bind_discord_thread(request: Request) -> JSONResponse:
+    body = await request.json()
+    invalid = _reject_forged_workflow_fields(body)
+    if invalid is not None:
+        return invalid
+    case_folder = str(body.get("case_folder", "")).strip()
+    thread_url = str(body.get("discord_thread_url", "")).strip()
+    source_dir = str(body.get("source_dir", "")).strip() or None
+    if not case_folder:
+        return _case_error_response("缺少案件文件夹名")
+    if not thread_url:
+        return _case_error_response("缺少 Discord 帖子链接")
+    try:
+        source_root = case_root_from_source_dir(source_dir, case_folder) if source_dir else None
+        case_root = str(source_root or str(body.get("case_root", "")).strip() or default_case_root())
+        parse_discord_thread_id(thread_url)
+        binding = case_thread_binding_status(case_root, case_folder, thread_url)
+        if binding.get("conflict"):
+            return _case_error_response(
+                str(binding.get("message") or "绑定冲突"),
+                code=str(binding.get("code") or "case_error"),
+            )
+        manifest = create_or_update_manifest(
+            case_root,
+            case_folder,
+            thread_url,
+            source_dir=source_dir,
+        )
+    except CaseError as exc:
+        return _case_error_response(str(exc), code=getattr(exc, "code", "case_error"))
+    return JSONResponse(
+        {
+            "status": "bound",
+            "workflow_state": "bound_thread",
+            "thread_url": manifest.discord_thread_url,
+            "thread_id": manifest.discord_thread_id,
+            "case_folder": manifest.case_folder,
+            "message": "已绑定 Discord 帖子到案件文件夹",
+        }
+    )
+
+
 
 async def attach_to_bound_discord_thread(request: Request) -> JSONResponse:
     body = await request.json()
@@ -316,36 +359,51 @@ def _discord_create_thread_section(
     map_textarea_id: str,
     message_id: str,
 ) -> str:
-    if discord_thread_url.strip() or not case_folder.strip():
+    if discord_thread_url.strip():
         return ""
     status_id = f"{message_id}-status"
     link_id = f"{message_id}-link"
     cause_id = f"{message_id}-case-cause"
+    bind_folder_id = f"{message_id}-case-folder"
+    bind_url_id = f"{message_id}-thread-url"
     return (
-        f'<section class="local-save-section" style="border-left: 4px solid #5865f2; background: linear-gradient(135deg, var(--surface) 0%, rgba(88, 101, 242, 0.04) 100%); padding: 18px 24px; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 18px; box-shadow: var(--shadow);">'
-        f'<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:15px;">'
-        f'<div style="flex:1;min-width:280px;">'
-        f'<h3 style="margin:0 0 8px 0;font-size:14px;font-weight:600;color:var(--ink);">请求 Hermes 新建案件帖</h3>'
-        f'<p class="hint" style="margin:0;">向 Discord 指令频道发送建帖请求；Hermes 建帖后通过 MCP 写回链接，系统随后发送脱敏附件并写入本地案件库：{html.escape(case_folder)}</p>'
-        f'<textarea id="{html.escape(message_id, quote=True)}" rows="2" placeholder="建帖后发送附件时附言" style="margin-top:10px;max-width:680px;">脱敏文件已生成，请见附件。</textarea>'
-        f'</div>'
-        f'<div style="display:flex;flex-direction:column;gap:8px;align-items:flex-start;min-width:220px;">'
-        f'<button type="button" class="btn discord-create-thread-button" '
-        f'data-case-root="{html.escape(case_root, quote=True)}" '
-        f'data-case-folder="{html.escape(case_folder, quote=True)}" '
-        f'data-source-dir="{html.escape(source_dir, quote=True)}" '
-        f'data-filename="{html.escape(filename, quote=True)}" '
-        f'data-textarea-id="{html.escape(textarea_id, quote=True)}" '
-        f'data-map-textarea-id="{html.escape(map_textarea_id, quote=True)}" '
-        f'data-message-id="{html.escape(message_id, quote=True)}" '
-        f'data-status-id="{html.escape(status_id, quote=True)}" '
-        f'data-case-cause-id="{html.escape(cause_id, quote=True)}" '
-        f'data-link-id="{html.escape(link_id, quote=True)}">'
-        f'请求 Hermes 建帖并绑定</button>'
-        f'<input type="text" id="{html.escape(cause_id, quote=True)}" placeholder="案由（目录只有案号时填写）" style="width:100%;max-width:260px;">'
-        f'<span id="{html.escape(status_id, quote=True)}" class="hint"></span>'
-        f'<a id="{html.escape(link_id, quote=True)}" href="#" target="_blank" style="display:none;font-size:12px;">打开 Discord 帖子</a>'
-        f'</div></div></section>'
+        f'<section class="local-save-section" style="border-left: 4px solid #5865f2; background: linear-gradient(135deg, var(--surface) 0%, rgba(88, 101, 242, 0.04) 100%); padding: 18px 24px; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 18px; box-shadow: var(--shadow);">' 
+        f'<div style="display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:15px;">' 
+        f'<div style="flex:1;min-width:280px;">' 
+        f'<h3 style="margin:0 0 8px 0;font-size:14px;font-weight:600;color:var(--ink);">绑定 Discord 帖子</h3>' 
+        f'<p class="hint" style="margin:0 0 10px 0;">已有帖子可直接填写链接绑定到案件文件夹；没有帖子再请求 Hermes 新建。绑定后可发送脱敏附件。</p>' 
+        f'<label for="{html.escape(bind_folder_id, quote=True)}" style="display:block;font-size:12px;margin:0 0 4px 0;">案件文件夹名</label>' 
+        f'<input type="text" id="{html.escape(bind_folder_id, quote=True)}" value="{html.escape(case_folder, quote=True)}" placeholder="例如 2026 5987 劳动争议纠纷" style="width:100%;max-width:680px;margin-bottom:8px;">' 
+        f'<label for="{html.escape(bind_url_id, quote=True)}" style="display:block;font-size:12px;margin:0 0 4px 0;">Discord 帖子链接</label>' 
+        f'<input type="url" id="{html.escape(bind_url_id, quote=True)}" placeholder="https://discord.com/channels/..." style="width:100%;max-width:680px;margin-bottom:8px;">' 
+        f'<textarea id="{html.escape(message_id, quote=True)}" rows="2" placeholder="建帖或发送附件时附言" style="margin-top:2px;max-width:680px;">脱敏文件已生成，请见附件。</textarea>' 
+        f'</div>' 
+        f'<div style="display:flex;flex-direction:column;gap:8px;align-items:flex-start;min-width:220px;">' 
+        f'<button type="button" class="btn discord-bind-thread-button" ' 
+        f'data-case-root="{html.escape(case_root, quote=True)}" ' 
+        f'data-source-dir="{html.escape(source_dir, quote=True)}" ' 
+        f'data-case-folder-id="{html.escape(bind_folder_id, quote=True)}" ' 
+        f'data-thread-url-id="{html.escape(bind_url_id, quote=True)}" ' 
+        f'data-status-id="{html.escape(status_id, quote=True)}" ' 
+        f'data-link-id="{html.escape(link_id, quote=True)}">' 
+        f'手动绑定帖子</button>' 
+        f'<button type="button" class="btn btn-secondary discord-create-thread-button" ' 
+        f'data-case-root="{html.escape(case_root, quote=True)}" ' 
+        f'data-case-folder="{html.escape(case_folder, quote=True)}" ' 
+        f'data-source-dir="{html.escape(source_dir, quote=True)}" ' 
+        f'data-filename="{html.escape(filename, quote=True)}" ' 
+        f'data-textarea-id="{html.escape(textarea_id, quote=True)}" ' 
+        f'data-map-textarea-id="{html.escape(map_textarea_id, quote=True)}" ' 
+        f'data-message-id="{html.escape(message_id, quote=True)}" ' 
+        f'data-status-id="{html.escape(status_id, quote=True)}" ' 
+        f'data-case-cause-id="{html.escape(cause_id, quote=True)}" ' 
+        f'data-case-folder-id="{html.escape(bind_folder_id, quote=True)}" ' 
+        f'data-link-id="{html.escape(link_id, quote=True)}">' 
+        f'请求 Hermes 建帖并绑定</button>' 
+        f'<input type="text" id="{html.escape(cause_id, quote=True)}" placeholder="案由（目录只有案号时填写）" style="width:100%;max-width:260px;">' 
+        f'<span id="{html.escape(status_id, quote=True)}" class="hint"></span>' 
+        f'<a id="{html.escape(link_id, quote=True)}" href="#" target="_blank" style="display:none;font-size:12px;">打开 Discord 帖子</a>' 
+        f'</div></div></section>' 
     )
 
 
@@ -479,6 +537,26 @@ def _find_discord_thread_for_case(case_folder: str, case_cause: str = "") -> str
 
 
 
+def _https_context() -> ssl.SSLContext:
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def _discord_urlopen(request: urllib.request.Request, timeout: int = 30):
+    return urllib.request.urlopen(request, timeout=timeout, context=_https_context())
+
+
+def _discord_oserror(action: str, exc: BaseException) -> DiscordApiError:
+    reason = getattr(exc, "reason", exc)
+    if isinstance(exc, ssl.SSLError) or isinstance(reason, ssl.SSLError):
+        return DiscordApiError(f"{action}: TLS 证书校验失败")
+    return DiscordApiError(f"{action}: 网络不可达")
+
+
 def _get_discord_json(path: str, token: str) -> dict:
     request = urllib.request.Request(
         f"https://discord.com/api/v10{path}",
@@ -488,13 +566,13 @@ def _get_discord_json(path: str, token: str) -> dict:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with _discord_urlopen(request) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         exc.read()
         raise DiscordApiError(f"Discord 帖子查询失败: HTTP {exc.code}") from exc
     except OSError as exc:
-        raise DiscordApiError("Discord 帖子查询失败: 网络不可达") from exc
+        raise _discord_oserror("Discord 帖子查询失败", exc) from exc
     if not isinstance(data, dict):
         raise DiscordApiError("Discord 帖子查询返回格式错误")
     return data
@@ -538,13 +616,13 @@ def _post_discord_channel_message(channel_id: str, content: str) -> dict[str, st
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with _discord_urlopen(request) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         exc.read()
         raise DiscordApiError(f"Discord 指令发送失败: HTTP {exc.code}") from exc
     except OSError as exc:
-        raise DiscordApiError("Discord 指令发送失败: 网络不可达") from exc
+        raise _discord_oserror("Discord 指令发送失败", exc) from exc
     return {
         "message_id": str(data.get("id", "")),
         "channel_id": str(data.get("channel_id") or channel_id),
@@ -577,13 +655,13 @@ def _post_discord_thread_file(thread_id: str, filename: str, content: str, messa
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with _discord_urlopen(request) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         exc.read()
         raise DiscordApiError(f"Discord 发送失败: HTTP {exc.code}") from exc
     except OSError as exc:
-        raise DiscordApiError("Discord 发送失败: 网络不可达") from exc
+        raise _discord_oserror("Discord 发送失败", exc) from exc
     return {
         "message_id": str(data.get("id", "")),
         "channel_id": str(data.get("channel_id", "")),

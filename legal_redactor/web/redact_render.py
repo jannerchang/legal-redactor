@@ -335,11 +335,11 @@ def _render_batch_redaction_result(
             item = individual_files[index]
             filename = str(item["filename"])
             link = _binary_download(XLSX_MEDIA_TYPE, document.output_bytes)
-            download_html = f'<p><a class="btn" data-no-intercept="true" download="{html.escape(filename, quote=True)}" href="{link}">下载脱敏 Excel</a></p>'
+            download_html = f'<p><a class="btn" download="{html.escape(filename, quote=True)}" href="{link}">下载脱敏 Excel</a></p>'
         else:
             filename = str(individual_files[index]["filename"])
             link = _data_download(filename, "text/plain", document.redacted_text)
-            download_html = f'<p><a class="btn" data-no-intercept="true" download="{html.escape(filename, quote=True)}" href="{link}">下载脱敏文本</a></p>'
+            download_html = f'<p><a class="btn" download="{html.escape(filename, quote=True)}" href="{link}">下载脱敏文本</a></p>'
         doc_sections_parts.append(
             f'<article class="doc-result"><h3>{html.escape(document.source_file)}</h3>{download_html}'
             f'<h4>原文高亮</h4><div class="highlight-box original-highlight selection-add-source">{_highlight_replaced_text(document.original_text, redaction_map.mappings)}</div>'
